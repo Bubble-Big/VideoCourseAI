@@ -1,0 +1,6 @@
+.idea/
+*.iml
+
+# --- Docker runtime data ---
+mysql/data/
+minio/data/
