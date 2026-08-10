@@ -24,13 +24,12 @@ cd client && npm install && npm run dev
 ## 核心链路
 
 `GET /debug/ai?id={id}` → Redisson 分布式锁 `lock:analyze:{id}` → Redis 令牌桶限流 (10次/分钟) → 写 `AnalysisTaskMsg` 到 RocketMQ topic `video-analysis-topic` → 立即返回。
-`VideoAnalysisConsumer` 收到消息 → `CompletableFuture.runAsync()` 提交到 `aiTaskExecutor` (核心4/最大8/队列100) → `AiService.asyncAnalyze()` → `AliyunDeepSeekStrategy`：FFmpeg 提取 MP3 (15min) → ASR (3次重试, 5xx 等 2s) → DeepSeek (无重试!) → 写 DB → 删 Redis 缓存 `media:list:user:{userId}`。
+`VideoAnalysisConsumer` 收到消息 → `CompletableFuture.runAsync()` 提交到 `aiTaskExecutor` (核心4/最大8/队列100) → `AiService.asyncAnalyze()` → `AliyunDeepSeekStrategy`：FFmpeg 提取 MP3 (15min) → ASR (3次重试, 5xx 等 2s) → DeepSeek (3次重试, 5xx 等 2s) → 写 DB → 删 Redis 缓存 `media:list:user:{userId}`。
 前端 3s 轮询 `GET /media/list`，检测 `aiSummary` 含 `##` 即完成。
 
 ## 已知陷阱
 
 - **错误字符串被写入 DB**：`DeepSeekUtils.analyzeContent()` 失败时返回 `"❌ AI 请求失败: ..."` 字符串而非抛异常，被直接写入 `aiSummary`，前端无法识别为失败。
-- **AI 总结无重试**：`DeepSeekUtils` 无 `retryOnConnectionFailure`，单次失败即返回错误。ASR (`AliyunAsrUtils`) 有 3 次重试。
 - **密码明文**：`UserController` 直接比对明文密码。
 - **前端单文件**：全部逻辑在 [App.vue](client/src/App.vue) (~890行)，无路由/Pinia，后端 URL `http://localhost:9090` 硬编码。
 - **API 密钥明文** 在 [application.properties](server/src/main/resources/application.properties) 中已提交 Git。

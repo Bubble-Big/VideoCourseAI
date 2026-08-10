@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 @Component
 public class DeepSeekUtils {
@@ -17,30 +18,8 @@ public class DeepSeekUtils {
     private final String baseUrl;
     private final String model;
 
-    // 配置 HTTP 客户端，超时时间设置长一点，因为 AI 思考需要时间
-
-    private static final OkHttpClient client = new OkHttpClient.Builder()
-            .connectTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(300, TimeUnit.SECONDS)  // 给 AI 5分钟思考时间
-            .writeTimeout(60, TimeUnit.SECONDS)
-            .build();
-
-    public DeepSeekUtils(@Value("${ai.deepseek.api-key}") String apiKey,
-                         @Value("${ai.deepseek.base-url}") String baseUrl,
-                         @Value("${ai.deepseek.model}") String model) {
-        this.apiKey = apiKey;
-        this.baseUrl = baseUrl;
-        this.model = model;
-    }
-
-    /**
-     * 真·AI 深度思考
-     */
-    public String analyzeContent(String content) {
-
-        String url = baseUrl + "/chat/completions";
-        //提示词自由发挥，善于利用AI。
-        String systemPrompt = """
+    /** 系统提示词：定义 AI 角色与输出格式 */
+    private static final String SYSTEM_PROMPT = """
     # Role
     你是一位拥有认知心理学背景的资深信息架构师。你的专长是从杂乱的语音转录文本中提取高价值信息，并进行逻辑重构。
 
@@ -53,8 +32,8 @@ public class DeepSeekUtils {
     # Constraints
     1. **必须**严格遵守下方的输出格式。
     2. 语气保持客观、理性、犀利。
-    3. 如果文本内容过短或无意义，直接输出“无法提取有效信息”。
-    4. 禁止输出任何开场白或结束语（如“好的，我来分析...”），直接输出 Markdown 内容。
+    3. 如果文本内容过短或无意义，直接输出"无法提取有效信息"。
+    4. 禁止输出任何开场白或结束语（如"好的，我来分析..."），直接输出 Markdown 内容。
 
     # Output Format (Markdown)
     请严格按照以下模块输出：
@@ -64,13 +43,13 @@ public class DeepSeekUtils {
 
     ## 深度洞察
     （提取 3-5 个核心观点，每个观点使用三级标题格式，如下所示：）
-                   
+
     ### 1. [这里提炼一个 4-8 字的强观点标题]
     不要复述原话。请用专业的语言解释这个观点背后的逻辑、动因或对观众的启示。分析要犀利，直击本质。
-                   
+
     ### 2. [第二个强观点标题]
     （此处填写对应的深度分析...）
-                   
+
     ### 3. [第三个强观点标题]
     （此处填写对应的深度分析...）(后续标题和分析同理)
 
@@ -82,48 +61,106 @@ public class DeepSeekUtils {
     #标签1 #标签2 #标签3
     """;
 
-        // 3. 组装 JSON 参数
+    private static final OkHttpClient client = new OkHttpClient.Builder()
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(300, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build();
+
+    public DeepSeekUtils(@Value("${ai.deepseek.api-key}") String apiKey,
+                         @Value("${ai.deepseek.base-url}") String baseUrl,
+                         @Value("${ai.deepseek.model}") String model) {
+        this.apiKey = apiKey;
+        this.baseUrl = baseUrl;
+        this.model = model;
+    }
+
+
+    /**
+     * 对 ASR 转录文本进行智能总结。
+     * <p>内部调用 {@link #buildChatRequest} 拼装 prompt，再由 {@link #callWithRetry} 发请求。
+     */
+    public String analyzeContent(String content) {
+        String url = baseUrl + "/chat/completions";
+        return callWithRetry(() -> buildChatRequest(url, content));
+    }
+
+    // ======================== Prompt 拼装（纯数据转换） ========================
+
+    /**
+     * 将 system prompt + 用户文本拼装为 OkHttp Request。
+     * <p>每次调用生成全新的 Request 对象（RequestBody 只能读一次，重试需要重建）。
+     */
+    private Request buildChatRequest(String url, String userContent) {
         JSONObject jsonBody = new JSONObject();
         jsonBody.put("model", model);
         jsonBody.put("stream", false);
 
         JSONArray messages = new JSONArray();
-        messages.add(JSONObject.of("role", "system", "content", systemPrompt));
-        messages.add(JSONObject.of("role", "user", "content", content));
+        messages.add(JSONObject.of("role", "system", "content", SYSTEM_PROMPT));
+        messages.add(JSONObject.of("role", "user", "content", userContent));
         jsonBody.put("messages", messages);
 
-        // 4. 发送请求
         RequestBody body = RequestBody.create(
                 jsonBody.toString(),
                 MediaType.parse("application/json; charset=utf-8")
         );
 
-        Request request = new Request.Builder()
+        return new Request.Builder()
                 .url(url)
                 .addHeader("Authorization", "Bearer " + apiKey)
                 .addHeader("Content-Type", "application/json")
                 .post(body)
                 .build();
+    }
 
-        try (Response response = client.newCall(request).execute()) {
-            if (!response.isSuccessful()) {
-                // 如果报错（比如没余额），这里会把错误原因返回去
-                return "❌ AI 请求失败: " + response.code() + " - " + response.body().string();
+    // ======================== API 调用 + 重试（纯网络通信） ========================
+
+    /**
+     * 执行 OkHttp 请求，3 次重试，5xx 等 2s 重试，4xx 不重试。
+     * <p>通过 {@link Supplier} 获取 Request，重试时调用 Supplier 重新生成全新 Request。
+     */
+    private String callWithRetry(Supplier<Request> requestSupplier) {
+        int maxRetries = 3;
+        String lastError = "";
+
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                Request request = requestSupplier.get();
+                System.out.println("[DeepSeek] 请求中 (第 " + (i + 1) + " 次尝试)...");
+
+                try (Response response = client.newCall(request).execute()) {
+                    if (response.isSuccessful()) {
+                        String resultJson = response.body().string();
+                        JSONObject jsonObject = JSON.parseObject(resultJson);
+                        return jsonObject.getJSONArray("choices")
+                                .getJSONObject(0)
+                                .getJSONObject("message")
+                                .getString("content");
+                    } else {
+                        String errBody = response.body() != null ? response.body().string() : "";
+                        lastError = "HTTP " + response.code() + ": " + errBody;
+                        System.err.println("[DeepSeek] 失败 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+
+                        if (response.code() >= 500) {
+                            Thread.sleep(2000);
+                            continue;
+                        } else {
+                            return "AI request failed: " + lastError;
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                lastError = e.getMessage();
+                System.err.println("[DeepSeek] 网络异常 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                lastError = "retry interrupted: " + e.getMessage();
+                break;
             }
-
-            // 5. 解析 AI 返回的 JSON
-            String resultJson = response.body().string();
-            JSONObject jsonObject = JSON.parseObject(resultJson);
-
-            // 提取真正的回答内容
-            return jsonObject.getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content");
-
-        } catch (IOException e) {
-            e.printStackTrace();
-            return "❌ 网络连接出错: " + e.getMessage();
         }
+
+        return "AI request failed after " + maxRetries + " retries: " + lastError;
     }
 }
