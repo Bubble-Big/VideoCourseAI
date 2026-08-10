@@ -3,7 +3,6 @@ package com.example.server.service;
 import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.strategy.AiAnalysisStrategy;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
@@ -12,17 +11,18 @@ import org.springframework.stereotype.Service;
 @Service
 public class AiService {
 
-    @Autowired
-    private MediaFileMapper mediaFileMapper;
-
-    @Autowired
-    @Qualifier("defaultAiStrategy")
-    private AiAnalysisStrategy aiAnalysisStrategy;
-
+    private final MediaFileMapper mediaFileMapper;
+    private final AiAnalysisStrategy aiAnalysisStrategy;
     // 【关键】必须注入 Redis 工具！
-    @Autowired
-    private StringRedisTemplate redisTemplate;
+    private final StringRedisTemplate redisTemplate;
 
+    public AiService(MediaFileMapper mediaFileMapper,
+                     @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
+                     StringRedisTemplate redisTemplate) {
+        this.mediaFileMapper = mediaFileMapper;
+        this.aiAnalysisStrategy = aiAnalysisStrategy;
+        this.redisTemplate = redisTemplate;
+    }
 
     public void asyncAnalyze(Long mediaId) {
         System.out.println(" [线程池] 开始处理任务，ID: " + mediaId);

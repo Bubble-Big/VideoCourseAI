@@ -3,30 +3,33 @@ package com.example.server.controller;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.example.server.entity.User;
 import com.example.server.mapper.UserMapper;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/user")
-//加上这个是为了防止跨域问题漏网
+// 加上这个是为了防止跨域问题漏网
 @CrossOrigin(originPatterns = "*", allowCredentials = "true")
 public class UserController {
 
-    @Autowired(required = false)
-    private UserMapper userMapper;
+    private final UserMapper userMapper;
 
-    //注册接口
+    public UserController(Optional<UserMapper> userMapper) {
+        this.userMapper = userMapper.orElse(null);
+    }
+
+    // 注册接口
     @PostMapping("/register")
     public Map<String, Object> register(@RequestBody User user) {
         Map<String, Object> result = new HashMap<>();
         try {
-            //打印日志，确认数据进来了
+            // 打印日志，确认数据进来了
             System.out.println("收到注册请求: " + user.getUsername());
 
-            //检查 Mapper 是否注入成功
+            // 检查 Mapper 是否注入成功
             if (userMapper == null) {
                 throw new RuntimeException("UserMapper 未注入，请检查 @Mapper 注解！");
             }

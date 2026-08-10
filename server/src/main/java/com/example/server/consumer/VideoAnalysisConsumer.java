@@ -6,26 +6,28 @@ import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 @Component
-//监听 "video-analysis-topic" 主题，组名随便起
+// 监听 "video-analysis-topic" 主题，组名随便起
 @RocketMQMessageListener(topic = "video-analysis-topic", consumerGroup = "video-group")
 public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> {
 
-    @Autowired
-    private AiService aiService;
+    private final AiService aiService;
+    private final MediaFileMapper mediaFileMapper;
+    // 注入之前配置好的 IO 密集型线程池
+    private final Executor aiTaskExecutor;
 
-    @Autowired
-    private MediaFileMapper mediaFileMapper;
-
-    //注入之前配置好的 IO 密集型线程池
-    @Autowired
-    private Executor aiTaskExecutor;
+    public VideoAnalysisConsumer(AiService aiService,
+                                 MediaFileMapper mediaFileMapper,
+                                 Executor aiTaskExecutor) {
+        this.aiService = aiService;
+        this.mediaFileMapper = mediaFileMapper;
+        this.aiTaskExecutor = aiTaskExecutor;
+    }
 
     @Override
     public void onMessage(AnalysisTaskMsg msg) {

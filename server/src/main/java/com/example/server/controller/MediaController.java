@@ -5,10 +5,9 @@ import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.MediaService;
 import com.example.server.utils.MinioUtils;
-import com.example.server.utils.YtDlpUtils; //确保导入这个
+import com.example.server.utils.YtDlpUtils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -17,6 +16,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.File;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 @RestController
@@ -24,23 +24,26 @@ import java.util.concurrent.TimeUnit;
 @CrossOrigin(originPatterns = "*", allowCredentials = "true")
 public class MediaController {
 
-    @Autowired(required = false)
-    private MediaFileMapper mediaFileMapper;
+    private final MediaFileMapper mediaFileMapper;
+    private final StringRedisTemplate redisTemplate;
+    private final ObjectMapper objectMapper;
+    private final MinioUtils minioUtils;
+    private final YtDlpUtils ytDlpUtils;
+    private final MediaService mediaService;
 
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Autowired
-    private MinioUtils minioUtils;
-
-    @Autowired
-    private YtDlpUtils ytDlpUtils;
-
-    @Autowired
-    private MediaService mediaService;
+    public MediaController(Optional<MediaFileMapper> mediaFileMapper,
+                           StringRedisTemplate redisTemplate,
+                           ObjectMapper objectMapper,
+                           MinioUtils minioUtils,
+                           YtDlpUtils ytDlpUtils,
+                           MediaService mediaService) {
+        this.mediaFileMapper = mediaFileMapper.orElse(null);
+        this.redisTemplate = redisTemplate;
+        this.objectMapper = objectMapper;
+        this.minioUtils = minioUtils;
+        this.ytDlpUtils = ytDlpUtils;
+        this.mediaService = mediaService;
+    }
 
     @PostMapping("/init-upload")
     public ResponseEntity<String> initUpload() {

@@ -5,11 +5,10 @@ import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
 import com.example.server.strategy.AiAnalysisStrategy;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
-import org.springframework.data.redis.core.StringRedisTemplate; // 【修复】导入 Redis 类
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -22,34 +21,35 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit; //导入时间单位
+import java.util.concurrent.TimeUnit;
 
 @RestController
 @RequestMapping("/debug")
 @CrossOrigin(originPatterns = "*", allowCredentials = "true")
 public class DebugController {
 
-    @Autowired
-    private MediaFileMapper mediaFileMapper;
+    private final MediaFileMapper mediaFileMapper;
+    private final AiAnalysisStrategy aiAnalysisStrategy;
+    private final AiService aiService;
+    private final StringRedisTemplate redisTemplate;
+    private final org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate;
+    private final org.redisson.api.RedissonClient redissonClient;
 
-    @Autowired
-    @Qualifier("defaultAiStrategy")
-    private AiAnalysisStrategy aiAnalysisStrategy;
+    public DebugController(MediaFileMapper mediaFileMapper,
+                           @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
+                           AiService aiService,
+                           StringRedisTemplate redisTemplate,
+                           org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate,
+                           org.redisson.api.RedissonClient redissonClient) {
+        this.mediaFileMapper = mediaFileMapper;
+        this.aiAnalysisStrategy = aiAnalysisStrategy;
+        this.aiService = aiService;
+        this.redisTemplate = redisTemplate;
+        this.rocketMQTemplate = rocketMQTemplate;
+        this.redissonClient = redissonClient;
+    }
 
-    @Autowired
-    private AiService aiService;
-
-
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    @Autowired
-    private org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate;
-
-    @Autowired
-    private org.redisson.api.RedissonClient redissonClient;
-
-    //AI总结接口(分布式锁 + 限流 + MQ)
+    // AI总结接口(分布式锁 + 限流 + MQ)
     @GetMapping("/ai")
     public String aiAnalyze(@RequestParam Long id) {
         //【Redisson 分布式锁】防瞬时并发连点

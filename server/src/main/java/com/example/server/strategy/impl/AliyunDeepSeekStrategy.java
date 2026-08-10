@@ -3,7 +3,6 @@ package com.example.server.strategy.impl;
 import com.example.server.strategy.AiAnalysisStrategy;
 import com.example.server.utils.AliyunAsrUtils;
 import com.example.server.utils.DeepSeekUtils;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
@@ -14,11 +13,14 @@ import java.util.UUID;
 @Component("defaultAiStrategy")
 public class AliyunDeepSeekStrategy implements AiAnalysisStrategy {
 
-    @Autowired
-    private AliyunAsrUtils aliyunAsrUtils;
+    private final AliyunAsrUtils aliyunAsrUtils;
+    private final DeepSeekUtils deepSeekUtils;
 
-    @Autowired
-    private DeepSeekUtils deepSeekUtils;
+    public AliyunDeepSeekStrategy(AliyunAsrUtils aliyunAsrUtils,
+                                  DeepSeekUtils deepSeekUtils) {
+        this.aliyunAsrUtils = aliyunAsrUtils;
+        this.deepSeekUtils = deepSeekUtils;
+    }
 
     @Override
     public String transcribe(String videoPath) {
