@@ -579,13 +579,13 @@ const startPolling = (id, type) => {
 
   pollingTimers.value[id] = { timer, type }
 
-  // 5分钟强制兜底停止
+  // 10分钟强制兜底停止
   setTimeout(() => {
     if (pollingTimers.value[id]) {
       clearInterval(pollingTimers.value[id].timer)
       delete pollingTimers.value[id]
     }
-  }, 300000)
+  }, 600000)
 }
 
 const openSidebar = (type, title) => {

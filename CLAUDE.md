@@ -31,7 +31,6 @@ cd client && npm install && npm run dev
 
 - **错误字符串被写入 DB**：`DeepSeekUtils.analyzeContent()` 失败时返回 `"❌ AI 请求失败: ..."` 字符串而非抛异常，被直接写入 `aiSummary`，前端无法识别为失败。
 - **AI 总结无重试**：`DeepSeekUtils` 无 `retryOnConnectionFailure`，单次失败即返回错误。ASR (`AliyunAsrUtils`) 有 3 次重试。
-- **FFmpeg 命令重复 3 处**：[AliyunDeepSeekStrategy](server/src/main/java/com/example/server/strategy/impl/AliyunDeepSeekStrategy.java#L72-L109)、[DebugController](server/src/main/java/com/example/server/controller/DebugController.java#L151-L174)、[MediaService](server/src/main/java/com/example/server/service/MediaService.java#L61-L70)。修改需同步。
 - **密码明文**：`UserController` 直接比对明文密码。
 - **前端单文件**：全部逻辑在 [App.vue](client/src/App.vue) (~890行)，无路由/Pinia，后端 URL `http://localhost:9090` 硬编码。
 - **API 密钥明文** 在 [application.properties](server/src/main/resources/application.properties) 中已提交 Git。

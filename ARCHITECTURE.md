@@ -85,6 +85,7 @@ VideoCourseAI-main/
 │           │   ├── UserMapper.java
 │           │   └── MediaFileMapper.java
 │           └── utils/                   # 工具类
+│               ├── FfmpegUtils.java     # FFmpeg 音频提取（统一入口）
 │               ├── MinioUtils.java      # MinIO 上传/删除
 │               ├── YtDlpUtils.java      # yt-dlp 视频下载
 │               ├── DeepSeekUtils.java   # DeepSeek AI 调用
@@ -231,7 +232,7 @@ VideoCourseAI-main/
           ┌─────────────────────────────────────┐
           │           AiService.asyncAnalyze()   │
           │                                      │
-          │  1. FFmpeg 提取音频 (extractAudio)   │
+          │  1. Ffmpeg 提取音频 (extractAudio)   │
           │  2. Aliyun ASR 语音转文字            │
           │     (3次指数退避重试, 2s间隔)         │
           │  3. DeepSeek AI 智能总结             │
@@ -324,7 +325,7 @@ VideoCourseAI-main/
 AiAnalysisStrategy (接口)
     │
     └── AliyunDeepSeekStrategy (实现, @Component("defaultAiStrategy"))
-            ├── transcribe()      → FFmpeg 提取音频 → Aliyun ASR
+            ├── transcribe()      → Ffmpeg 提取音频 → Aliyun ASR
             └── generateSummary() → transcribe() → DeepSeek AI 总结
 ```
 
@@ -528,7 +529,7 @@ rocketmq.producer.group=video-analysis-group
 
 ## 十四、文件清单
 
-### 后端 Java 文件 (17个)
+### 后端 Java 文件 (22个)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
@@ -538,12 +539,12 @@ rocketmq.producer.group=video-analysis-group
 | `config/WebConfig.java` | 24 | CORS 全局跨域配置 |
 | `controller/UserController.java` | 90 | 用户注册/登录 |
 | `controller/MediaController.java` | 198 | 媒体上传/列表/删除 |
-| `controller/DebugController.java` | 175 | AI分析/文字提取/音频下载 |
-| `service/MediaService.java` | 93 | 分片上传初始化 + FFmpeg 转换 |
+| `controller/DebugController.java` | 150 | AI分析/文字提取/音频下载 |
+| `service/MediaService.java` | 35 | 分片上传初始化 |
 | `service/AiService.java` | 103 | 异步 AI 分析 + 缓存清除 |
 | `consumer/VideoAnalysisConsumer.java` | 57 | RocketMQ 消费者 |
 | `strategy/AiAnalysisStrategy.java` | 20 | AI 分析策略接口 |
-| `strategy/impl/AliyunDeepSeekStrategy.java` | 110 | FFmpeg + ASR + DeepSeek 实现 |
+| `strategy/impl/AliyunDeepSeekStrategy.java` | 71 | ASR + DeepSeek 实现 |
 | `dto/AnalysisTaskMsg.java` | 21 | RocketMQ 消息体 |
 | `entity/User.java` | 27 | 用户实体 |
 | `entity/MediaFile.java` | 30 | 媒体文件实体 |
@@ -553,6 +554,7 @@ rocketmq.producer.group=video-analysis-group
 | `utils/YtDlpUtils.java` | 88 | yt-dlp 视频下载工具 |
 | `utils/DeepSeekUtils.java` | 123 | DeepSeek AI 调用 |
 | `utils/AliyunAsrUtils.java` | 83 | 阿里云 ASR 语音识别 |
+| `utils/FfmpegUtils.java` | 95 | FFmpeg 音频提取（统一入口） |
 
 ### 前端文件
 

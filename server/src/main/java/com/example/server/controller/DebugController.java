@@ -5,6 +5,7 @@ import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
 import com.example.server.strategy.AiAnalysisStrategy;
+import com.example.server.utils.FfmpegUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
@@ -18,8 +19,6 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -129,7 +128,7 @@ public class DebugController {
         String outputMp3Path = System.getProperty("java.io.tmpdir") + File.separator + "download_" + UUID.randomUUID() + ".mp3";
         System.out.println("⬇ 下载请求，正在从源地址转码音频: " + inputPath);
 
-        boolean success = runFfmpeg(inputPath, outputMp3Path);
+        boolean success = FfmpegUtils.extractAudio(inputPath, outputMp3Path);
 
         if (!success) return ResponseEntity.internalServerError().build();
 
@@ -146,30 +145,4 @@ public class DebugController {
                 .contentType(MediaType.parseMediaType("audio/mpeg"))
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + encodedName)
                 .body(resource);
-    }
-
-    private boolean runFfmpeg(String inputPath, String outputPath) {
-        try {
-            List<String> command = new ArrayList<>();
-            command.add("ffmpeg");
-            command.add("-y");
-            command.add("-i");
-            command.add(inputPath);
-            command.add("-vn");
-            command.add("-acodec");
-            command.add("libmp3lame");
-            command.add("-q:a");
-            command.add("2");
-            command.add(outputPath);
-
-            ProcessBuilder pb = new ProcessBuilder(command);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
-            Process process = pb.start();
-            return process.waitFor(15, TimeUnit.MINUTES) && process.exitValue() == 0;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
-    }
-}
+    }}

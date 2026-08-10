@@ -3,5 +3,8 @@
     "allow": [
       "Bash(git init *)"
     ]
+  },
+  "env": {
+      "CLAUDE_CODE_NEW_INIT": 1
   }
 }
