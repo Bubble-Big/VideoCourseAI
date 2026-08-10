@@ -13,14 +13,9 @@ import java.util.concurrent.TimeUnit;
 @Component
 public class DeepSeekUtils {
 
-    @Value("${ai.deepseek.api-key}")
-    private String apiKey;
-
-    @Value("${ai.deepseek.base-url}")
-    private String baseUrl;
-
-    @Value("${ai.deepseek.model}")
-    private String model;
+    private final String apiKey;
+    private final String baseUrl;
+    private final String model;
 
     // 配置 HTTP 客户端，超时时间设置长一点，因为 AI 思考需要时间
 
@@ -29,6 +24,14 @@ public class DeepSeekUtils {
             .readTimeout(300, TimeUnit.SECONDS)  // 给 AI 5分钟思考时间
             .writeTimeout(60, TimeUnit.SECONDS)
             .build();
+
+    public DeepSeekUtils(@Value("${ai.deepseek.api-key}") String apiKey,
+                         @Value("${ai.deepseek.base-url}") String baseUrl,
+                         @Value("${ai.deepseek.model}") String model) {
+        this.apiKey = apiKey;
+        this.baseUrl = baseUrl;
+        this.model = model;
+    }
 
     /**
      * 真·AI 深度思考

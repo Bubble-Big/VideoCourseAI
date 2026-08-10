@@ -13,11 +13,14 @@ import java.util.UUID;
 @Component
 public class YtDlpUtils {
 
-    @Value("${tool.ytdlp.path}")
-    private String ytDlpPath;
+    private final String ytDlpPath;
+    private final String ffmpegDir;
 
-    @Value("${tool.ffmpeg.dir}")
-    private String ffmpegDir;
+    public YtDlpUtils(@Value("${tool.ytdlp.path}") String ytDlpPath,
+                      @Value("${tool.ffmpeg.dir}") String ffmpegDir) {
+        this.ytDlpPath = ytDlpPath;
+        this.ffmpegDir = ffmpegDir;
+    }
 
     public File downloadVideo(String url) throws Exception {
         String tempDir = System.getProperty("java.io.tmpdir");

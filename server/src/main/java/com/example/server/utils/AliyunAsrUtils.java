@@ -13,14 +13,9 @@ import java.util.concurrent.TimeUnit;
 @Component
 public class AliyunAsrUtils {
 
-    @Value("${ai.deepseek.api-key}")
-    private String apiKey;
-
-    @Value("${ai.asr.model}")
-    private String asrModel;
-
-    @Value("${ai.asr.url}")
-    private String asrUrl;
+    private final String apiKey;
+    private final String asrModel;
+    private final String asrUrl;
 
     private final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(120, TimeUnit.SECONDS)
@@ -28,6 +23,14 @@ public class AliyunAsrUtils {
             .writeTimeout(600, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build();
+
+    public AliyunAsrUtils(@Value("${ai.deepseek.api-key}") String apiKey,
+                          @Value("${ai.asr.model}") String asrModel,
+                          @Value("${ai.asr.url}") String asrUrl) {
+        this.apiKey = apiKey;
+        this.asrModel = asrModel;
+        this.asrUrl = asrUrl;
+    }
 
     public String audioToText(String filePath) {
         File file = new File(filePath);

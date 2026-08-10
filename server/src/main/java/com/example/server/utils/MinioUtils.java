@@ -3,7 +3,6 @@ package com.example.server.utils;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import io.minio.RemoveObjectArgs;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.multipart.MultipartFile;
@@ -14,14 +13,17 @@ import java.util.UUID;
 @Component
 public class MinioUtils {
 
-    @Autowired
-    private MinioClient minioClient;
+    private final MinioClient minioClient;
+    private final String bucketName;
+    private final String endpoint;
 
-    @Value("${minio.bucketName}")
-    private String bucketName;
-
-    @Value("${minio.endpoint}")
-    private String endpoint;
+    public MinioUtils(MinioClient minioClient,
+                      @Value("${minio.bucketName}") String bucketName,
+                      @Value("${minio.endpoint}") String endpoint) {
+        this.minioClient = minioClient;
+        this.bucketName = bucketName;
+        this.endpoint = endpoint;
+    }
 
     /**
      * 上传文件并返回访问 URL
