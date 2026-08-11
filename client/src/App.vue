@@ -94,8 +94,28 @@
             </div>
 
             <div class="magnet-content busy" v-else>
-              <div class="quantum-loader"></div>
-              <span class="busy-text">正在建立通道并解析资源...</span>
+              <!-- 分片上传进度 -->
+              <template v-if="chunkState.status === 'uploading' || chunkState.status === 'merging' || chunkState.status === 'hashing'">
+                <div class="quantum-loader"></div>
+                <span class="busy-text">
+                  {{ chunkState.status === 'hashing' ? '正在扫描文件...' :
+                     chunkState.status === 'merging' ? '正在合并分片...' :
+                     `分片上传中 ${chunkState.progress}%` }}
+                </span>
+                <div class="progress-bar-wrap">
+                  <div class="progress-bar-fill" :style="{ width: chunkState.progress + '%' }"></div>
+                </div>
+                <div class="progress-detail">
+                  <span>{{ formatSize(chunkState.uploadedBytes) }} / {{ formatSize(chunkState.fileSize) }}</span>
+                  <span v-if="chunkState.speed > 0">{{ formatSize(chunkState.speed) }}/s</span>
+                </div>
+                <button class="cancel-upload-btn" @click="cancelChunk">取消上传</button>
+              </template>
+              <!-- 旧版整文件上传状态 -->
+              <template v-else>
+                <div class="quantum-loader"></div>
+                <span class="busy-text">正在建立通道并解析资源...</span>
+              </template>
             </div>
 
             <div class="border-glow"></div>
@@ -232,8 +252,9 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { marked } from 'marked'
+import { useChunkedUpload } from './composables/useChunkedUpload.js'
 
 // --- 变量定义 ---
 const file = ref(null)
@@ -251,6 +272,49 @@ const authMessage = ref('')
 const authError = ref(false)
 const authForm = ref({ username: '', password: '', nickname: '' })
 const pollingTimers = ref({})
+
+// ---- 分片上传 ----
+const CHUNK_THRESHOLD = 5 * 1024 * 1024 // 5MB，小于此走旧接口
+const {
+  uploadState: chunkState,
+  startUpload,
+  cancelUpload: cancelChunk,
+  discardUpload,
+  checkResumable,
+} = useChunkedUpload()
+
+// 监听分片上传状态变化
+watch(() => chunkState.value.status, (newStatus, oldStatus) => {
+  if (newStatus === 'done') {
+    uploading.value = false
+    file.value = null
+    showMsg('✅ 分片上传完成')
+    fetchList()
+  } else if (newStatus === 'error') {
+    uploading.value = false
+    showMsg('❌ ' + (chunkState.value.error || '上传失败'), true)
+  } else if (newStatus === 'cancelled') {
+    uploading.value = false
+    showMsg('⚠️ 上传已取消（可稍后恢复）')
+  }
+  // HINT_DUPLICATE 在 startUpload 中通过 duplicateMediaId 处理
+})
+
+// 异步检查是否已存在相同文件
+watch(() => chunkState.value.duplicateMediaId, (mediaId) => {
+  if (mediaId) {
+    uploading.value = false
+    const confirmed = confirm('同名同大小的文件在资料库中已存在，是否跳过上传？')
+    if (confirmed) {
+      showMsg('已跳过重复文件')
+      file.value = null
+    } else {
+      // 用户坚持上传，需要重新触发（走正常流程）
+      file.value = null
+      showMsg('⚠️ 请重新选择文件以上传')
+    }
+  }
+})
 
 // Markdown 解析
 const renderedMarkdown = computed(() => {
@@ -296,29 +360,44 @@ const handleDrop = async (e) => {
   await uploadFile()
 }
 
-// 【普通文件上传】
+// 【文件上传 — 支持分片上传+断点续传】
 const uploadFile = async () => {
   if (!file.value) return
   uploading.value = true
-  message.value = '正在建立加密通道并上传数据...'
-  const formData = new FormData()
-  formData.append('file', file.value)
-  if (currentUser.value) formData.append('userId', currentUser.value.id)
 
+  const userId = currentUser.value ? currentUser.value.id : null
+
+  // 小于 5MB：走旧的整文件上传
+  if (file.value.size < CHUNK_THRESHOLD) {
+    message.value = '正在建立加密通道并上传数据...'
+    const formData = new FormData()
+    formData.append('file', file.value)
+    if (userId) formData.append('userId', userId)
+
+    try {
+      const res = await fetch('http://localhost:9090/media/upload', {
+        method: 'POST',
+        body: formData
+      })
+      const text = await res.text()
+      if (!res.ok) throw new Error(text || 'Upload failed')
+      showMsg('✅ 本地上传完成')
+      fetchList()
+    } catch (error) {
+      console.error(error)
+      showMsg('❌ 上传失败: ' + error.message, true)
+    } finally {
+      uploading.value = false
+    }
+    return
+  }
+
+  // 大于等于 5MB：走分片上传
+  message.value = '正在初始化分片上传...'
   try {
-    const res = await fetch('http://localhost:9090/media/upload', {
-      method: 'POST',
-      body: formData
-    })
-    const text = await res.text()
-    if (!res.ok) throw new Error(text || 'Upload failed')
-
-    showMsg('✅ 本地上传完成')
-    fetchList()
+    await startUpload(file.value, userId)
   } catch (error) {
-    console.error(error)
-    showMsg('❌ 上传失败: ' + error.message, true)
-  } finally {
+    showMsg('❌ 分片上传异常: ' + error.message, true)
     uploading.value = false
   }
 }
@@ -410,6 +489,13 @@ const deleteItem = async (item) => {
   } catch (e) {
     showMsg('❌ 删除请求失败', true)
   }
+}
+
+const formatSize = (bytes) => {
+  if (!bytes || bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i]
 }
 
 const formatTime = (timeStr) => {
@@ -653,7 +739,16 @@ const logout = () => {
   list.value = []
   showMsg('已退出系统')
 }
-onMounted(() => {
+// 页面关闭前提醒
+const beforeUnloadHandler = (e) => {
+  if (chunkState.value.status === 'uploading' || chunkState.value.status === 'merging') {
+    e.preventDefault()
+    e.returnValue = '上传正在进行中，离开后需重新恢复'
+    return e.returnValue
+  }
+}
+
+onMounted(async () => {
   const savedUser = localStorage.getItem('user')
   if (savedUser) {
     try {
@@ -661,6 +756,33 @@ onMounted(() => {
     } catch(e) {}
   }
   fetchList()
+
+  // 断点续传恢复检查
+  const resumeInfo = await checkResumable()
+  if (resumeInfo) {
+    const confirmed = confirm(
+      `检测到未完成的上传任务：\n` +
+      `文件：${resumeInfo.fileName}\n` +
+      `进度：${resumeInfo.completedChunks.length}/${resumeInfo.totalChunks} 片\n\n` +
+      `是否继续上传？`
+    )
+    if (confirmed) {
+      uploading.value = true
+      message.value = '正在恢复上传...'
+      // 重新获取文件引用（需要通过 input 重新选择）
+      // 由于 File 对象无法持久化到 localStorage，需要用户重新选择文件
+      showMsg('⚠️ 出于安全限制，请重新选择同一文件以恢复上传')
+      uploading.value = false
+    } else {
+      discardUpload()
+    }
+  }
+
+  window.addEventListener('beforeunload', beforeUnloadHandler)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('beforeunload', beforeUnloadHandler)
 })
 </script>
 
@@ -888,4 +1010,26 @@ html, body, #app {
 @keyframes slideUpFade { from { opacity: 0; transform: translateY(40px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes pulse-lime { 0% { opacity: 0.5; box-shadow: 0 0 5px var(--accent-lime); } 100% { opacity: 1; box-shadow: 0 0 15px var(--accent-lime); } }
 @keyframes blink { 50% { opacity: 0.5; } }
+
+/* 分片上传进度条 */
+.progress-bar-wrap {
+  width: 280px; height: 6px; background: var(--border-tech);
+  border-radius: 3px; margin-top: 16px; overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%; background: var(--accent-lime);
+  border-radius: 3px; transition: width 0.3s ease;
+  box-shadow: 0 0 8px rgba(197, 249, 70, 0.4);
+}
+.progress-detail {
+  display: flex; gap: 20px; margin-top: 8px;
+  font-family: monospace; font-size: 0.8rem; color: var(--text-sub);
+}
+.cancel-upload-btn {
+  margin-top: 12px; background: transparent; border: 1px solid #ff4757;
+  color: #ff4757; padding: 6px 20px; border-radius: 4px;
+  font-family: 'Noto Sans SC', sans-serif; font-size: 0.85rem;
+  cursor: pointer; transition: all 0.3s;
+}
+.cancel-upload-btn:hover { background: rgba(255,71,87,0.1); box-shadow: 0 0 10px rgba(255,71,87,0.2); }
 </style>
