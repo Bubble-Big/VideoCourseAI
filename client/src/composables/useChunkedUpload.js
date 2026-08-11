@@ -1,4 +1,4 @@
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 
 const CHUNK_SIZE = 5 * 1024 * 1024        // 5MB 每片
 const MAX_CONCURRENCY = 3                  // 最大并发数

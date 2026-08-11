@@ -12,7 +12,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
-import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.*;
@@ -24,9 +23,8 @@ import java.util.stream.Collectors;
  * <p>
  * 关键 Redis Key：
  * <pre>
- *   upload:meta:{uploadId}         — Hash  元数据
+ *   upload:meta:{uploadId}         — Hash  元数据 (fileName, fileSize, totalChunks, userId, status)
  *   upload:chunks:{uploadId}       — Set   已完成分片序号
- *   upload:chunk:md5:{uploadId}    — Hash  分片序号→MD5
  *   lock:merge:{uploadId}          — RLock 合并分布式锁
  * </pre>
  */
@@ -65,7 +63,7 @@ public class ChunkUploadService {
      *   <li>HINT_DUPLICATE — 可能存在同名同大小文件，提示用户</li>
      * </ul>
      */
-    public Map<String, Object> initUpload(ChunkUploadDTO.InitRequest req) {
+    public ChunkUploadDTO.InitResponse initUpload(ChunkUploadDTO.InitRequest req) {
         // 1. 参数合法性校验
         if (req.getFileName() == null || req.getFileName().isBlank()) {
             throw new IllegalArgumentException("文件名不能为空");
@@ -86,11 +84,9 @@ public class ChunkUploadService {
                     .eq("status", "COMPLETED");
             MediaFile dup = mediaFileMapper.selectOne(dupQuery);
             if (dup != null) {
-                Map<String, Object> resp = new HashMap<>();
-                resp.put("uploadId", null);
-                resp.put("status", "HINT_DUPLICATE");
-                resp.put("existingMediaId", dup.getId());
-                resp.put("completedChunks", List.of());
+                ChunkUploadDTO.InitResponse resp = new ChunkUploadDTO.InitResponse(null, "HINT_DUPLICATE");
+                resp.setExistingMediaId(dup.getId());
+                resp.setCompletedChunks(Collections.emptySet());
                 return resp;
             }
         }
@@ -110,10 +106,8 @@ public class ChunkUploadService {
         redis.opsForHash().putAll(metaKey, meta);
         redis.expire(metaKey, META_TTL_HOURS, TimeUnit.HOURS);
 
-        Map<String, Object> resp = new HashMap<>();
-        resp.put("uploadId", uploadId);
-        resp.put("status", "NEW");
-        resp.put("completedChunks", List.of());
+        ChunkUploadDTO.InitResponse resp = new ChunkUploadDTO.InitResponse(uploadId, "NEW");
+        resp.setCompletedChunks(Collections.emptySet());
         return resp;
     }
 
@@ -122,35 +116,35 @@ public class ChunkUploadService {
     /**
      * 查询上传任务状态，返回已完成分片集合供前端断点续传
      */
-    public Map<String, Object> checkStatus(String uploadId) {
+    public ChunkUploadDTO.CheckResponse checkStatus(String uploadId) {
         String metaKey = META_KEY_PREFIX + uploadId;
         Map<Object, Object> meta = redis.opsForHash().entries(metaKey);
 
-        Map<String, Object> resp = new HashMap<>();
-        resp.put("uploadId", uploadId);
+        ChunkUploadDTO.CheckResponse resp = new ChunkUploadDTO.CheckResponse();
+        resp.setUploadId(uploadId);
 
         if (meta.isEmpty()) {
-            resp.put("status", "NOT_FOUND");
+            resp.setStatus("NOT_FOUND");
             return resp;
         }
 
         String status = (String) meta.get("status");
-        resp.put("status", status);
-        resp.put("fileName", meta.get("fileName"));
-        resp.put("fileSize", parseLong(meta.get("fileSize")));
-        resp.put("totalChunks", parseInt(meta.get("totalChunks")));
+        resp.setStatus(status);
+        resp.setFileName((String) meta.get("fileName"));
+        resp.setFileSize(parseLong(meta.get("fileSize")));
+        resp.setTotalChunks(parseInt(meta.get("totalChunks")));
 
         if ("COMPLETED".equals(status)) {
-            resp.put("mediaId", parseLong(meta.get("mediaId")));
+            resp.setMediaId(parseLong(meta.get("mediaId")));
         }
 
         // 获取已完成分片集合
         String chunksKey = CHUNKS_KEY_PREFIX + uploadId;
         Set<String> chunkStrs = redis.opsForSet().members(chunksKey);
         if (chunkStrs != null && !chunkStrs.isEmpty()) {
-            resp.put("completedChunks", chunkStrs.stream().map(Integer::parseInt).collect(Collectors.toList()));
+            resp.setCompletedChunks(chunkStrs.stream().map(Integer::parseInt).collect(Collectors.toSet()));
         } else {
-            resp.put("completedChunks", List.of());
+            resp.setCompletedChunks(Collections.emptySet());
         }
 
         return resp;
@@ -210,14 +204,14 @@ public class ChunkUploadService {
      * <p>
      * 流程：抢分布式锁 → 幂等检查 → 校验全集 → composeObject → 计算 MD5 → 写 DB → 清理
      */
-    public Map<String, Object> mergeChunks(String uploadId, Long userId) throws Exception {
+    public ChunkUploadDTO.MergeResponse mergeChunks(String uploadId, Long userId) throws Exception {
         String lockKey = LOCK_MERGE_PREFIX + uploadId;
         RLock lock = redissonClient.getLock(lockKey);
 
         // 1. 抢分布式锁
         if (!lock.tryLock(0, 120, TimeUnit.SECONDS)) {
-            Map<String, Object> resp = new HashMap<>();
-            resp.put("status", "MERGING");
+            ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
+            resp.setStatus("MERGING");
             return resp; // 已有其他线程在合并
         }
 
@@ -226,10 +220,10 @@ public class ChunkUploadService {
             String metaKey = META_KEY_PREFIX + uploadId;
             Map<Object, Object> meta = redis.opsForHash().entries(metaKey);
             if ("COMPLETED".equals(meta.get("status"))) {
-                Map<String, Object> resp = new HashMap<>();
-                resp.put("mediaId", parseLong(meta.get("mediaId")));
-                resp.put("filePath", meta.get("filePath"));
-                resp.put("status", "COMPLETED");
+                ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
+                resp.setMediaId(parseLong(meta.get("mediaId")));
+                resp.setFilePath((String) meta.get("filePath"));
+                resp.setStatus("COMPLETED");
                 return resp;
             }
 
@@ -295,10 +289,10 @@ public class ChunkUploadService {
                 redis.delete("media:list:user:" + userId);
             }
 
-            Map<String, Object> resp = new HashMap<>();
-            resp.put("mediaId", mediaFile.getId());
-            resp.put("filePath", fileUrl);
-            resp.put("status", "COMPLETED");
+            ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
+            resp.setMediaId(mediaFile.getId());
+            resp.setFilePath(fileUrl);
+            resp.setStatus("COMPLETED");
             return resp;
 
         } finally {

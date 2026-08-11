@@ -30,7 +30,7 @@ public class ChunkController {
      * 初始化分片上传
      */
     @PostMapping("/init")
-    public Result<Map<String, Object>> initUpload(@RequestBody Map<String, Object> body) {
+    public Result<ChunkUploadDTO.InitResponse> initUpload(@RequestBody Map<String, Object> body) {
         ChunkUploadDTO.InitRequest request = new ChunkUploadDTO.InitRequest();
         request.setFileName((String) body.get("fileName"));
         request.setFileSize(toLong(body.get("fileSize")));
@@ -39,22 +39,11 @@ public class ChunkController {
         return Result.ok(chunkUploadService.initUpload(request));
     }
 
-    private Long toLong(Object v) {
-        if (v == null) return null;
-        if (v instanceof Number) return ((Number) v).longValue();
-        return Long.valueOf(v.toString());
-    }
-    private Integer toInt(Object v) {
-        if (v == null) return null;
-        if (v instanceof Number) return ((Number) v).intValue();
-        return Integer.valueOf(v.toString());
-    }
-
     /**
      * 查询上传状态
      */
     @PostMapping("/check")
-    public Result<Map<String, Object>> checkStatus(@RequestBody Map<String, Object> body) {
+    public Result<ChunkUploadDTO.CheckResponse> checkStatus(@RequestBody Map<String, Object> body) {
         String uploadId = (String) body.get("uploadId");
         return Result.ok(chunkUploadService.checkStatus(uploadId));
     }
@@ -77,11 +66,11 @@ public class ChunkController {
      * 合并分片
      */
     @PostMapping("/merge")
-    public Result<Map<String, Object>> mergeChunks(@RequestBody Map<String, Object> body) throws Exception {
+    public Result<ChunkUploadDTO.MergeResponse> mergeChunks(@RequestBody Map<String, Object> body) throws Exception {
         String uploadId = (String) body.get("uploadId");
         Long userId = toLong(body.get("userId"));
-        Map<String, Object> resp = chunkUploadService.mergeChunks(uploadId, userId);
-        if ("MERGING".equals(resp.get("status"))) {
+        ChunkUploadDTO.MergeResponse resp = chunkUploadService.mergeChunks(uploadId, userId);
+        if ("MERGING".equals(resp.getStatus())) {
             throw new IllegalStateException("合并正在进行中，请稍后...");
         }
         return Result.ok(resp);
@@ -95,5 +84,17 @@ public class ChunkController {
         String uploadId = (String) body.get("uploadId");
         chunkUploadService.cancelUpload(uploadId);
         return Result.ok(Map.of("status", "CANCELLED"));
+    }
+
+    private Long toLong(Object v) {
+        if (v == null) return null;
+        if (v instanceof Number n) return n.longValue();
+        return Long.valueOf(v.toString());
+    }
+
+    private Integer toInt(Object v) {
+        if (v == null) return null;
+        if (v instanceof Number n) return n.intValue();
+        return Integer.valueOf(v.toString());
     }
 }
