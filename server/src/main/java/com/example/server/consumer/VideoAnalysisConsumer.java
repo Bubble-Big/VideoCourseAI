@@ -1,5 +1,6 @@
 package com.example.server.consumer;
 
+import com.example.server.common.AiStatus;
 import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
@@ -52,6 +53,7 @@ public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> 
     private void markAsFailed(Long id, String error) {
         MediaFile file = mediaFileMapper.selectById(id);
         if (file != null) {
+            file.setAiStatus(AiStatus.FAILED.name());
             file.setAiSummary("❌ 分析失败: " + error);
             mediaFileMapper.updateById(file);
         }

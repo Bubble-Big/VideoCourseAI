@@ -2,6 +2,7 @@ package com.example.server.controller;
 
 import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.entity.MediaFile;
+import com.example.server.common.AiStatus;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
 import com.example.server.strategy.AiAnalysisStrategy;
@@ -75,12 +76,14 @@ public class DebugController {
             //查库校验
             MediaFile file = mediaFileMapper.selectById(id);
             if (file == null) return "文件不存在";
-            if (file.getAiSummary() != null && file.getAiSummary().contains("正在")) {
+            String aiSt = file.getAiStatus();
+            if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
                 return "任务已在后台运行，无需重复提交";
             }
 
-            //更新状态
-            file.setAiSummary("[MQ] 已进入消息队列，等待调度...");
+            //更新状态：投递 MQ 进入 PENDING；清空旧结果避免残留
+            file.setAiStatus(AiStatus.PENDING.name());
+            file.setAiSummary(null);
             mediaFileMapper.updateById(file);
             String userIdKey = (file.getUserId() == null) ? "anon" : String.valueOf(file.getUserId());
             redisTemplate.delete("media:list:user:" + userIdKey);
@@ -106,6 +109,17 @@ public class DebugController {
     public String transcribe(@RequestParam Long id) {
         MediaFile mediaFile = mediaFileMapper.selectById(id);
         if (mediaFile == null) return "❌ 找不到文件记录";
+
+        // 防重复提交：正在提取时直接拒绝
+        if (AiStatus.PROCESSING.name().equals(mediaFile.getTranscriptStatus())) {
+            return "任务已在后台运行，无需重复提交";
+        }
+
+        // 更新状态为 PROCESSING，并失效缓存让前端立即感知
+        mediaFile.setTranscriptStatus(AiStatus.PROCESSING.name());
+        mediaFileMapper.updateById(mediaFile);
+        String userIdKey = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
+        redisTemplate.delete("media:list:user:" + userIdKey);
 
         // 调用异步服务
         aiService.asyncTranscribe(id);

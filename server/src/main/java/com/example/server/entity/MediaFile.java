@@ -20,7 +20,9 @@ public class MediaFile {
     private String filePath;
 
     //下面这几个是新加的
+    private String aiStatus;         // AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED
     private String aiSummary;
+    private String transcriptStatus; // 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED
     private String transcriptText;
     private String coverUrl;
 

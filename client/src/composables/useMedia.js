@@ -81,23 +81,33 @@ async function downloadAudio(item) {
 
 async function transcribe(id) {
   const item = list.value.find(i => i.id === id)
-  if (item && item.transcriptText) {
+  const st = item?.transcriptStatus || 'NONE'
+
+  // 1. 已完成（成功/失败）→ 直接显示结果
+  if (st === 'SUCCESS' || st === 'FAILED') {
     openSidebar('text', '全量文字提取')
-    sidebar.value.content = item.transcriptText
+    sidebar.value.content = item.transcriptText || ''
     sidebar.value.loading = false
     return
   }
-  if (pollingTimers.value[id] && pollingTimers.value[id].type === 'text') {
+
+  // 2. 正在处理 → 打开转圈，并恢复/维持轮询
+  if (st === 'PROCESSING') {
     openSidebar('text', '全量文字提取')
     sidebar.value.loading = true
-    sidebar.value.content = "📝 文字提取正在后台进行中..."
+    sidebar.value.content = "文字转写中..."
+    const t = pollingTimers.value[id]
+    if (!t || t.type !== 'text') startPolling(id, 'text')
     return
   }
+
+  // 3. NONE → 提交请求
   openSidebar('text', '全量文字提取')
   sidebar.value.loading = true
-  sidebar.value.content = "📝 提取任务已提交，正在识别语音流..."
+  sidebar.value.content = "资源请求中..."
   try {
     await api.transcribe(id)
+    sidebar.value.content = "资源请求成功！准备接入转写..."
     startPolling(id, 'text')
   } catch (e) {
     sidebar.value.content = "Error: " + e
@@ -108,27 +118,30 @@ async function transcribe(id) {
 // AI 分析：含限流/锁错误的处理
 async function aiAnalyze(id) {
   const item = list.value.find(i => i.id === id)
+  const st = item?.aiStatus || 'NONE'
 
-  // 1. 已有结果，直接显示
-  if (item && item.aiSummary && !item.aiSummary.includes("任务已") && !item.aiSummary.includes("正在")) {
+  // 1. 已完成（成功/失败）→ 直接显示结果
+  if (st === 'SUCCESS' || st === 'FAILED') {
     openSidebar('ai', 'AI 智能总结')
-    sidebar.value.content = item.aiSummary
+    sidebar.value.content = item.aiSummary || ''
     sidebar.value.loading = false
     return
   }
 
-  // 2. 正在轮询，直接打开侧边栏
-  if (pollingTimers.value[id] && pollingTimers.value[id].type === 'ai') {
+  // 2. 正在处理 → 打开转圈，并恢复/维持轮询
+  if (st === 'PENDING' || st === 'PROCESSING') {
     openSidebar('ai', 'AI 智能总结')
     sidebar.value.loading = true
-    sidebar.value.content = "🚀 系统正在后台拼命计算中...\n\n(任务正在进行，无需重复提交)"
+    sidebar.value.content = st === 'PENDING' ? 'AI调用中...' : 'AI分析中...'
+    const t = pollingTimers.value[id]
+    if (!t || t.type !== 'ai') startPolling(id, 'ai')
     return
   }
 
   // 3. 准备提交请求，打开侧边栏 loading
   openSidebar('ai', 'AI 智能总结')
   sidebar.value.loading = true
-  sidebar.value.content = "🚀 正在向分布式集群请求计算资源..."
+  sidebar.value.content = "资源请求中..."
 
   try {
     const res = await api.aiAnalyze(id)
@@ -144,7 +157,7 @@ async function aiAnalyze(id) {
 
     // 5. 成功投递，开始轮询
     startPolling(id, 'ai')
-    sidebar.value.content = text + "\n\n⏳ 等待消费者接单处理..."
+    sidebar.value.content = "资源请求成功！准备接入AI..."
   } catch (e) {
     sidebar.value.content = "Error: " + e
     sidebar.value.loading = false
@@ -166,19 +179,16 @@ function startPolling(id, type) {
     let result = ''
 
     if (type === 'ai') {
-      const text = item.aiSummary || ''
-      // 纯文本判断：成功（含 Markdown 标题特征 "##"）或失败（含错误关键词）
-      const isSuccess = text.includes("##")
-      const isError = text.includes("失败") || text.includes("Error") || text.includes("超时") || text.includes("500")
-      if (isSuccess || isError) {
+      const st = item.aiStatus || 'NONE'
+      if (st === 'SUCCESS' || st === 'FAILED') {
         isFinished = true
-        result = text
+        result = item.aiSummary || ''
       }
     } else if (type === 'text') {
-      const text = item.transcriptText || ''
-      if (text && (text.length > 10 || text.includes("失败"))) {
+      const st = item.transcriptStatus || 'NONE'
+      if (st === 'SUCCESS' || st === 'FAILED') {
         isFinished = true
-        result = text
+        result = item.transcriptText || ''
       }
     }
 
@@ -189,7 +199,8 @@ function startPolling(id, type) {
         sidebar.value.loading = false
       }
 
-      if (result.includes("失败") || result.includes("Error")) {
+      const st = type === 'ai' ? (item.aiStatus || 'NONE') : (item.transcriptStatus || 'NONE')
+      if (st === 'FAILED') {
         showMsg("⚠️ 任务结束，但存在错误", true)
       } else {
         showMsg("✅ 任务完成")
@@ -197,6 +208,17 @@ function startPolling(id, type) {
 
       clearInterval(timer)
       delete pollingTimers.value[id]
+    } else if (sidebar.value.visible && sidebar.value.title.includes(type === 'ai' ? 'AI' : '文字')) {
+      // 进行中：按状态实时刷新转圈文案
+      if (type === 'ai') {
+        const st = item.aiStatus || 'NONE'
+        if (st === 'PENDING') sidebar.value.content = 'AI调用中...'
+        else if (st === 'PROCESSING') sidebar.value.content = 'AI分析中...'
+      } else {
+        const st = item.transcriptStatus || 'NONE'
+        if (st === 'PROCESSING') sidebar.value.content = '文字转写中...'
+      }
+      sidebar.value.loading = true
     }
   }, 3000) // 3 秒轮询一次
 

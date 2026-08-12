@@ -48,9 +48,26 @@ VideoCourseAI-main/
 │   ├── vite.config.js               # Vite 构建配置
 │   └── src/
 │       ├── main.js                  # Vue 应用入口
-│       ├── App.vue                  # 根组件（全部业务逻辑在内）
-│       ├── style.css                # 全局样式
-│       └── assets/                  # 静态资源
+│       ├── App.vue                  # 根组件（纯布局组合 + 启动编排，约 30 行）
+│       ├── api/
+│       │   └── index.js             # 后端接口统一封装（BASE_URL + 全部请求）
+│       ├── utils/
+│       │   └── format.js            # formatSize / formatTime 格式化工具
+│       ├── styles/
+│       │   └── main.css             # 全局样式（由原 App.vue <style> 迁移）
+│       ├── composables/
+│       │   ├── useNotice.js         # 全局通知条（message + showMsg）
+│       │   ├── useAuth.js           # 登录态 + 认证弹窗
+│       │   ├── useMedia.js          # 列表/侧边栏/轮询/删除/下载/转写/AI
+│       │   ├── useUpload.js         # 上传编排（文件/URL/续传/去重/进度）
+│       │   ├── useBootstrap.js      # 启动/卸载编排（封装初始化顺序）
+│       │   └── useChunkedUpload.js  # 分片上传核心（单例）
+│       └── components/
+│           ├── AppNavbar.vue        # 导航栏（品牌/登录/状态灯）
+│           ├── UploadZone.vue       # 上传区（磁贴/进度条/横幅）
+│           ├── VideoList.vue        # 工作台列表
+│           ├── ResultSidebar.vue    # AI 总结 / 文字提取侧边栏
+│           └── AuthModal.vue        # 登录/注册弹窗
 │
 ├── server/                          # Spring Boot 后端项目
 │   ├── pom.xml                      # Maven 依赖配置
@@ -535,7 +552,7 @@ AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
 
 ### 10.1 技术特点
 
-- **组件拆分**：分片上传逻辑抽离到 `composables/useChunkedUpload.js` 组合式函数；`App.vue` 保留 UI 与其余业务逻辑（约 1000+ 行）
+- **组件化拆分**：前端按功能模块拆分为 5 个组件 + 6 个组合式函数（Composable 单例），`App.vue` 仅负责布局组合与启动编排（约 30 行）
 - **赛博朋克风格**：自定义 CSS 变量、SVG 噪点背景、霓虹绿 (#c5f946) 主题色
 - **响应式状态**：Vue 3 Composition API (`ref`, `computed`, `watch`, `onMounted`)
 - **Markdown 渲染**：`marked` 库解析 AI 返回的总结内容
@@ -555,6 +572,31 @@ AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
 | 音频下载 | FFmpeg 转码 MP3 → Blob 下载 |
 | 视频删除 | DELETE 请求 + 前端列表移除 |
 | 工作台 | 单列横排列表，文件名左、按钮右 |
+
+### 10.3 前端目录结构与状态管理
+
+前端已从单文件（`App.vue` 约 1162 行）重构为按功能模块划分的多文件结构，采用 **Composable 单例** 共享状态（不引入 Pinia）。
+
+**分层职责**：
+
+| 层 | 目录/文件 | 职责 |
+|----|-----------|------|
+| 视图层 | `components/*.vue`（5 个） | 纯展示 + 事件触发，直接 import composable |
+| 状态/逻辑层 | `composables/*.js`（6 个） | 模块级响应式状态 + 业务逻辑，单例共享 |
+| 接口层 | `api/index.js` | 统一 `BASE_URL` 与全部后端请求，杜绝 URL 硬编码 |
+| 工具层 | `utils/format.js` | 通用格式化函数 |
+| 样式层 | `styles/main.css` | 全局样式（非 scoped，原 App.vue `<style>` 迁移） |
+
+**Composable 依赖关系（单向，无循环）**：
+
+```
+useNotice / useAuth / useChunkedUpload   ← 无依赖
+useUpload  → useChunkedUpload + useNotice + useAuth + useMedia + api
+useMedia   → useNotice + useAuth + api + marked
+useBootstrap → useAuth + useUpload          （仅编排启动顺序）
+```
+
+**首次数据加载**：`App.vue` 在 `onMounted` 调用 `useBootstrap.start()` → `restoreSession()` 恢复登录态 → `useMedia` 中的 `watch(currentUser)` 统一驱动列表刷新（登录刷新 / 登出清空），避免 `useAuth` 与 `useMedia` 形成循环依赖；`onUnmounted` 调用 `stop()` 注销 `beforeunload` 监听。
 
 ---
 
@@ -610,7 +652,7 @@ rocketmq.producer.group=video-analysis-group
 
 1. **密码加密**：引入 BCrypt/SCrypt 对用户密码进行哈希存储
 2. **认证升级**：使用 JWT + Spring Security 替代简单的 token 机制
-3. **前端组件化**：将 App.vue 中的各功能模块拆分为独立组件（AuthPanel, UploadZone, WorkspaceCard, SidePanel 等）
+3. ~~**前端组件化**~~ ✅ 已完成：App.vue 已拆分为 5 个组件 + 6 个组合式函数（详见 10.3 节）；下一步可考虑引入 Pinia / Vue Router 进一步完善状态与路由管理
 4. **配置安全**：API 密钥抽离到环境变量或 Spring Cloud Config / Vault
 5. **监控告警**：接入 Prometheus + Grafana 监控 MQ 积压、线程池状态、AI API 调用量
 6. **数据库优化**：对 `media_files.user_id` 和 `media_files.status` 建立索引
@@ -659,12 +701,24 @@ rocketmq.producer.group=video-analysis-group
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `App.vue` | 930+ | 全部前端 UI 与业务逻辑 (含分片进度条) |
-| `composables/useChunkedUpload.js` | 377 | 分片上传组合式函数 (新增) |
-| `main.js` | 6 | Vue 应用入口 |
+| `App.vue` | 30 | 根组件（布局组合 + 启动编排） |
+| `main.js` | 5 | Vue 应用入口 |
+| `api/index.js` | 105 | 后端接口统一封装（BASE_URL + 全部请求） |
+| `utils/format.js` | 16 | formatSize / formatTime 格式化工具 |
+| `styles/main.css` | 274 | 全局样式（原 App.vue `<style>` 迁移） |
+| `composables/useChunkedUpload.js` | 399 | 分片上传核心（单例） |
+| `composables/useUpload.js` | 297 | 上传编排（文件/URL/续传/去重/进度） |
+| `composables/useMedia.js` | 239 | 列表/侧边栏/轮询/删除/下载/转写/AI |
+| `composables/useAuth.js` | 103 | 登录态 + 认证弹窗 |
+| `composables/useBootstrap.js` | 20 | 启动/卸载编排 |
+| `composables/useNotice.js` | 14 | 全局通知条（message + showMsg） |
+| `components/UploadZone.vue` | 147 | 上传区（磁贴/进度条/横幅） |
+| `components/VideoList.vue` | 64 | 工作台列表 |
+| `components/AuthModal.vue` | 41 | 登录/注册弹窗 |
+| `components/AppNavbar.vue` | 40 | 导航栏（品牌/登录/状态灯） |
+| `components/ResultSidebar.vue` | 30 | AI 总结 / 文字提取侧边栏 |
 | `vite.config.js` | 7 | Vite 构建配置 |
 | `index.html` | 14 | HTML 入口 |
-| `style.css` | — | 全局样式 |
 
 ---
 

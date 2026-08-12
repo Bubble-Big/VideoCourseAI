@@ -45,7 +45,7 @@ cd client && npm install && npm run dev
 
 - **错误字符串被写入 DB**：`DeepSeekUtils.analyzeContent()` 失败时返回 `"❌ AI 请求失败: ..."` 字符串而非抛异常，被直接写入 `aiSummary`，前端无法识别为失败。
 - **密码明文**：`UserController` 直接比对明文密码。
-- **前端单文件**：全部逻辑在 [App.vue](client/src/App.vue) (~930行)，无路由/Pinia，后端 URL `http://localhost:9090` 硬编码。
+- **Ai调用返回错误字符串而非抛异常** `DeepSeekUtils` 失败仍返回 `AI request failed: ...` 字符串而非抛异常，应当让策略失败时抛异常，`catch` 统一设 `FAILED` 
 - **API 密钥明文** 在 [application.properties](server/src/main/resources/application.properties) 中已提交 Git。
 - **MinIO 分片生命周期**需在控制台手动配置：`http://127.0.0.1:9001` → Buckets → media → Lifecycle → Prefix `chunks/`, Expiry 2 days
 - **@RequestBody 反序列化**：因 fastjson2 对静态内部类存在兼容性问题，ChunkController 使用 `Map<String, Object>` 接收 JSON 后手动提取字段

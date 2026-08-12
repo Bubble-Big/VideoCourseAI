@@ -14,7 +14,7 @@
       <button class="close-btn" @click="closeSidebar">×</button>
     </div>
     <div class="sidebar-body">
-      <div v-if="sidebar.loading" class="loading-state"><div class="quantum-loader small"></div><p>数据流处理中...</p></div>
+      <div v-if="sidebar.loading" class="loading-state"><div class="quantum-loader small"></div><p>{{ sidebar.content ? sidebar.content : '数据流处理中...' }}</p></div>
       <div v-else>
         <div v-if="sidebar.type === 'ai'" class="markdown-content" v-html="renderedMarkdown"></div>
         <div v-else class="text-content"><pre>{{ sidebar.content }}</pre></div>
