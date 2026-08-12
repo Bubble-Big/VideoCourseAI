@@ -1,0 +1,297 @@
+import { ref, watch } from 'vue'
+import { useChunkedUpload } from './useChunkedUpload.js'
+import { useAuth } from './useAuth.js'
+import { useNotice } from './useNotice.js'
+import { useMedia } from './useMedia.js'
+import * as api from '../api/index.js'
+
+const CHUNK_THRESHOLD = 5 * 1024 * 1024 // 5MB，小于此走旧整文件接口
+
+// ---- 模块级状态（单例） ----
+const file = ref(null)
+const videoUrl = ref('')
+const uploading = ref(false)
+const isDragOver = ref(false)
+const resumeBanner = ref({ visible: false, fileName: '', progress: 0 })
+const duplicateBanner = ref({ visible: false, fileName: '' })
+
+const {
+  uploadState: chunkState,
+  startUpload,
+  resumeWithoutRecheck,
+  cancelUpload: cancelChunk,
+  discardUpload,
+  matchUpload,
+} = useChunkedUpload()
+
+const { currentUser, openAuthModal } = useAuth()
+const { message, showMsg } = useNotice()
+const { fetchList } = useMedia()
+
+// 监听分片上传状态变化
+watch(() => chunkState.value.status, (newStatus) => {
+  if (newStatus === 'done') {
+    uploading.value = false
+    file.value = null
+    resumeBanner.value.visible = false
+    showMsg('✅ 分片上传完成')
+    fetchList()
+  } else if (newStatus === 'error') {
+    uploading.value = false
+    // 场景一：中断后显示续传横幅
+    if (file.value && chunkState.value.fileName) {
+      resumeBanner.value = {
+        visible: true,
+        fileName: chunkState.value.fileName,
+        progress: chunkState.value.progress,
+      }
+    }
+    showMsg('❌ ' + (chunkState.value.error || '上传失败'), true)
+  } else if (newStatus === 'cancelled') {
+    uploading.value = false
+    // 取消也显示续传横幅（用户可能想稍后继续）
+    if (file.value && chunkState.value.fileName) {
+      resumeBanner.value = {
+        visible: true,
+        fileName: chunkState.value.fileName,
+        progress: chunkState.value.progress,
+      }
+    }
+    showMsg('⚠️ 上传已取消（可稍后恢复）')
+  }
+})
+
+// HINT_DUPLICATE：去重提示横幅
+watch(() => chunkState.value.duplicateMediaId, (mediaId) => {
+  if (mediaId) {
+    uploading.value = false
+    duplicateBanner.value = {
+      visible: true,
+      fileName: chunkState.value.fileName,
+    }
+  }
+})
+
+// ---- 去重横幅操作 ----
+
+async function handleDuplicateSkip() {
+  duplicateBanner.value.visible = false
+  file.value = null
+  showMsg('已跳过重复文件')
+}
+
+async function handleDuplicateForce() {
+  duplicateBanner.value.visible = false
+  uploading.value = true
+  message.value = '正在上传（已确认忽略重复提示）...'
+  const userId = currentUser.value ? currentUser.value.id : null
+  try {
+    await startUpload(file.value, userId, null, true)
+  } catch (error) {
+    showMsg('❌ 上传失败: ' + error.message, true)
+    uploading.value = false
+  }
+}
+
+// ---- 续传横幅操作 ----
+
+async function handleResumeContinue() {
+  if (!file.value) return
+  resumeBanner.value.visible = false
+  uploading.value = true
+  message.value = '正在恢复上传...'
+  const userId = currentUser.value ? currentUser.value.id : null
+  try {
+    await resumeWithoutRecheck(file.value, userId)
+  } catch (error) {
+    showMsg('❌ 恢复上传失败: ' + error.message, true)
+    uploading.value = false
+  }
+}
+
+function handleResumeRestart() {
+  resumeBanner.value.visible = false
+  discardUpload()
+  showMsg('已清除上传记录，请重新选择文件')
+}
+
+// ---- 文件选择 / 拖拽 ----
+
+async function handleFileChange(e) {
+  if (!currentUser.value) {
+    e.target.value = ''
+    showMsg('⚠️ 权限受限：请先登录系统', true)
+    openAuthModal()
+    return
+  }
+  const selectedFile = e.target.files[0]
+  if (!selectedFile) return
+  file.value = selectedFile
+  videoUrl.value = ''
+  resumeBanner.value.visible = false
+  await uploadFile()
+}
+
+async function handleDrop(e) {
+  isDragOver.value = false
+  if (!currentUser.value) {
+    showMsg('⚠️ 权限受限：请先登录系统', true)
+    openAuthModal()
+    return
+  }
+  const droppedFiles = e.dataTransfer.files
+  if (!droppedFiles || droppedFiles.length === 0) return
+  const selectedFile = droppedFiles[0]
+  if (!selectedFile.type.startsWith('video/')) {
+    showMsg('⚠️ 仅支持上传视频文件', true)
+    return
+  }
+  file.value = selectedFile
+  videoUrl.value = ''
+  resumeBanner.value.visible = false
+  await uploadFile()
+}
+
+// 文件上传 — 支持分片上传 + 断点续传
+async function uploadFile() {
+  if (!file.value) return
+  uploading.value = true
+
+  const userId = currentUser.value ? currentUser.value.id : null
+
+  // 小于 5MB：走旧的整文件上传
+  if (file.value.size < CHUNK_THRESHOLD) {
+    message.value = '正在建立加密通道并上传数据...'
+    const formData = new FormData()
+    formData.append('file', file.value)
+    if (userId) formData.append('userId', userId)
+
+    try {
+      const res = await api.uploadMedia(formData)
+      const text = await res.text()
+      if (!res.ok) throw new Error(text || 'Upload failed')
+      showMsg('✅ 本地上传完成')
+      fetchList()
+    } catch (error) {
+      console.error(error)
+      showMsg('❌ 上传失败: ' + error.message, true)
+    } finally {
+      uploading.value = false
+    }
+    return
+  }
+
+  // 大于等于 5MB：走分片上传
+  // 场景二：检查是否存在该文件的历史上传记录（文件重新选择后自动识别）
+  message.value = '正在核对已上传分片...'
+  const resumeInfo = await matchUpload(file.value)
+
+  if (resumeInfo) {
+    const confirmed = confirm(
+      `检测到该文件的未完成上传记录：\n` +
+      `文件：${resumeInfo.fileName}\n` +
+      `已完成：${resumeInfo.completedChunks.size}/${resumeInfo.totalChunks} 片\n\n` +
+      `是否继续上传？（点击"确定"继续，点击"取消"重新开始）`
+    )
+    if (confirmed) {
+      try {
+        await startUpload(file.value, userId, resumeInfo)
+      } catch (error) {
+        showMsg('❌ 恢复上传失败: ' + error.message, true)
+        uploading.value = false
+      }
+      return
+    }
+    // 用户选择重新开始
+  }
+
+  // 全新上传
+  message.value = '正在初始化分片上传...'
+  try {
+    await startUpload(file.value, userId)
+  } catch (error) {
+    showMsg('❌ 分片上传异常: ' + error.message, true)
+    uploading.value = false
+  }
+}
+
+// 链接上传
+async function handleUrlUpload() {
+  if (!videoUrl.value) return
+
+  if (!currentUser.value) {
+    showMsg('⚠️ 权限受限：请先登录系统', true)
+    openAuthModal()
+    return
+  }
+
+  // 简单校验链接
+  if (!videoUrl.value.startsWith('http')) {
+    showMsg('⚠️ 请输入合法的 http/https 链接', true)
+    return
+  }
+
+  uploading.value = true
+  message.value = '正在解析链接并极速下载 (低码率模式)...'
+
+  const formData = new FormData()
+  formData.append('url', videoUrl.value)
+  if (currentUser.value) formData.append('userId', currentUser.value.id)
+
+  try {
+    const res = await api.uploadUrl(formData)
+    const text = await res.text()
+    if (!res.ok) throw new Error(text)
+
+    showMsg('✅ 链接资源已入库')
+    videoUrl.value = ''
+    fetchList()
+  } catch (error) {
+    console.error(error)
+    let errMsg = error.message
+    if (errMsg.includes("Unsupported URL")) errMsg = "不支持该平台链接"
+    showMsg('❌ 解析失败: ' + errMsg, true)
+  } finally {
+    uploading.value = false
+  }
+}
+
+// ---- beforeunload：页面关闭前提醒 ----
+
+function beforeUnloadHandler(e) {
+  if (chunkState.value.status === 'uploading' || chunkState.value.status === 'merging') {
+    e.preventDefault()
+    e.returnValue = '上传正在进行中，离开后需重新恢复'
+    return e.returnValue
+  }
+}
+
+function installBeforeUnload() {
+  window.addEventListener('beforeunload', beforeUnloadHandler)
+}
+
+function uninstallBeforeUnload() {
+  window.removeEventListener('beforeunload', beforeUnloadHandler)
+}
+
+export function useUpload() {
+  return {
+    file,
+    videoUrl,
+    uploading,
+    isDragOver,
+    resumeBanner,
+    duplicateBanner,
+    chunkState,
+    handleFileChange,
+    handleDrop,
+    handleUrlUpload,
+    handleResumeContinue,
+    handleResumeRestart,
+    handleDuplicateForce,
+    handleDuplicateSkip,
+    cancelChunk,
+    installBeforeUnload,
+    uninstallBeforeUnload,
+  }
+}
