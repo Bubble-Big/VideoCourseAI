@@ -5,19 +5,27 @@ const MAX_CONCURRENCY = 3                  // 最大并发数
 const MAX_RETRIES = 3                      // 每片最多重试次数
 const BASE_URL = 'http://localhost:9090'
 
-const LS_KEY = 'chunked_upload'            // localStorage 键名
+const LS_KEY = 'chunked_uploads'           // localStorage 键名（改为复数，支持多文件记录）
+
+/**
+ * 生成文件指纹：文件名 + 大小 + 最后修改时间
+ * 同一文件重新选择时，指纹不变，可用于匹配历史上传会话
+ */
+function computeFileKey(file) {
+  return `${file.name}_${file.size}_${file.lastModified}`
+}
 
 /**
  * 分片上传 + 断点续传 组合式函数
  *
- * 用法：
- *   const { uploadState, startUpload, cancelUpload } = useChunkedUpload()
- *   startUpload(file, userId)    // 开始上传
+ * 两个续传场景：
+ *  场景一：页面未刷新 → File 对象仍在内存 → 直接显示续传横幅，点击即可继续
+ *  场景二：页面刷新后 → File 对象丢失 → 重新选择同一文件 → 自动识别并恢复
  */
 export function useChunkedUpload() {
   // ---- 响应式状态 ----
   const uploadState = ref({
-    status: 'idle',          // idle | hashing | uploading | merging | done | error | cancelled
+    status: 'idle',          // idle | uploading | merging | done | error | cancelled
     uploadId: null,
     fileName: '',
     fileSize: 0,
@@ -26,42 +34,52 @@ export function useChunkedUpload() {
     progress: 0,             // 0 ~ 100
     uploadedBytes: 0,
     speed: 0,                // 字节/秒
-    eta: null,               // 预计剩余秒数
     error: null,
     mediaId: null,
     filePath: null,
     duplicateMediaId: null,  // 去重提示
+    pendingFile: null,       // 场景一：中断后暂存的 File 引用，用于一键继续
   })
 
   // 内部非响应式变量
   let abortController = null
   let speedSamples = []       // 速度采样窗口 [{time, bytes}]
-  let startTime = 0
+  let currentFile = null      // 当前正在上传的 File 引用
 
-  // ---- 持久化 ----
+  // ---- localStorage 读写（支持多文件记录） ----
 
-  function saveToLocalStorage(uploadId, fileName, fileSize, totalChunks) {
-    localStorage.setItem(LS_KEY, JSON.stringify({ uploadId, fileName, fileSize, totalChunks, timestamp: Date.now() }))
-  }
-
-  function loadFromLocalStorage() {
+  function loadAllSessions() {
     try {
       const raw = localStorage.getItem(LS_KEY)
-      if (!raw) return null
-      const data = JSON.parse(raw)
-      // 48 小时内有效
-      if (Date.now() - data.timestamp > 48 * 3600 * 1000) {
-        localStorage.removeItem(LS_KEY)
-        return null
-      }
-      return data
+      return raw ? JSON.parse(raw) : {}
     } catch {
-      return null
+      return {}
     }
   }
 
-  function clearLocalStorage() {
-    localStorage.removeItem(LS_KEY)
+  function saveSession(fileKey, data) {
+    const all = loadAllSessions()
+    all[fileKey] = { ...data, timestamp: Date.now() }
+    localStorage.setItem(LS_KEY, JSON.stringify(all))
+  }
+
+  function removeSession(fileKey) {
+    const all = loadAllSessions()
+    delete all[fileKey]
+    localStorage.setItem(LS_KEY, JSON.stringify(all))
+  }
+
+  function findSession(fileKey) {
+    const all = loadAllSessions()
+    const data = all[fileKey]
+    if (!data) return null
+    // 48 小时内有效
+    if (Date.now() - data.timestamp > 48 * 3600 * 1000) {
+      delete all[fileKey]
+      localStorage.setItem(LS_KEY, JSON.stringify(all))
+      return null
+    }
+    return data
   }
 
   // ---- 速度计算 ----
@@ -69,33 +87,88 @@ export function useChunkedUpload() {
   function updateSpeed(chunkBytes) {
     const now = Date.now()
     speedSamples.push({ time: now, bytes: chunkBytes })
-    // 只保留最近 5 秒
     speedSamples = speedSamples.filter(s => now - s.time < 5000)
     const totalBytes = speedSamples.reduce((sum, s) => sum + s.bytes, 0)
     const elapsed = (now - speedSamples[0].time) / 1000
     uploadState.value.speed = elapsed > 0 ? totalBytes / elapsed : 0
   }
 
+  // ---- 场景二：根据文件匹配已有的上传会话 ----
+
+  /**
+   * 用文件指纹匹配 localStorage 中的历史上传记录，
+   * 并调后端 check 接口获取最新状态。
+   * @returns { fileKey, uploadId, totalChunks, completedChunks, fileName, fileSize } 或 null
+   */
+  async function matchUpload(file) {
+    const fileKey = computeFileKey(file)
+    const saved = findSession(fileKey)
+    if (!saved) return null
+
+    try {
+      const resp = await fetch(`${BASE_URL}/media/api/chunk/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId: saved.uploadId }),
+      })
+
+      if (!resp.ok) {
+        // check 失败（uploadId 可能已过期），清理记录
+        removeSession(fileKey)
+        return null
+      }
+
+      const result = await resp.json()
+      const data = result.data
+
+      if (!data || data.status === 'NOT_FOUND') {
+        removeSession(fileKey)
+        return null
+      }
+
+      if (data.status === 'COMPLETED') {
+        // 已经合并完成了，不需要恢复
+        removeSession(fileKey)
+        return null
+      }
+
+      // UPLOADING → 可以恢复
+      return {
+        fileKey,
+        uploadId: saved.uploadId,
+        totalChunks: saved.totalChunks,
+        completedChunks: new Set(data.completedChunks || []),
+        fileName: saved.fileName,
+        fileSize: saved.fileSize,
+      }
+    } catch {
+      // 网络异常，返回本地记录（前端可以稍后重试）
+      return null
+    }
+  }
+
   // ---- 主流程 ----
 
   /**
-   * 入口：开始上传一个文件
+   * 入口：开始上传一个文件（自动检测是否可续传）
    * @param {File} file  浏览器 File 对象
    * @param {number} userId
+   * @param {object|null} resumeFrom  matchUpload() 的返回值，非 null 表示断点续传
    */
-  async function startUpload(file, userId) {
+  async function startUpload(file, userId, resumeFrom = null, force = false) {
     if (!file) return
 
-    // 重置状态
+    currentFile = file
     abortController = new AbortController()
     speedSamples = []
-    startTime = Date.now()
 
+    const fileKey = computeFileKey(file)
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+    let uploadId, completedSet
 
     uploadState.value = {
       ...uploadState.value,
-      status: 'hashing',
+      status: 'uploading',
       fileName: file.name,
       fileSize: file.size,
       totalChunks,
@@ -103,50 +176,58 @@ export function useChunkedUpload() {
       progress: 0,
       uploadedBytes: 0,
       speed: 0,
-      eta: null,
       error: null,
       duplicateMediaId: null,
+      pendingFile: null,
     }
 
     try {
-      // 1. 初始化上传
-      const initResp = await fetch(`${BASE_URL}/media/api/chunk/init`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fileName: file.name,
-          fileSize: file.size,
-          totalChunks,
-          userId
-        }),
-        signal: abortController.signal,
-      })
+      if (resumeFrom) {
+        // ========== 断点续传路径 ==========
+        uploadId = resumeFrom.uploadId
+        completedSet = resumeFrom.completedChunks
 
-      if (!initResp.ok) {
-        throw new Error('初始化失败: ' + await initResp.text())
+        uploadState.value.uploadId = uploadId
+        uploadState.value.completedChunks = completedSet
+        uploadState.value.progress = Math.round((completedSet.size / totalChunks) * 100)
+        uploadState.value.uploadedBytes = completedSet.size * CHUNK_SIZE
+      } else {
+        // ========== 全新上传路径 ==========
+        const initResp = await fetch(`${BASE_URL}/media/api/chunk/init`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileName: file.name, fileSize: file.size, totalChunks, userId, force }),
+          signal: abortController.signal,
+        })
+
+        if (!initResp.ok) {
+          throw new Error('初始化失败: ' + await initResp.text())
+        }
+
+        const initResult = await initResp.json()
+        const initData = initResult.data
+
+        if (initData.status === 'HINT_DUPLICATE') {
+          uploadState.value.status = 'idle'
+          uploadState.value.duplicateMediaId = initData.existingMediaId
+          currentFile = null
+          return
+        }
+
+        uploadId = initData.uploadId
+        completedSet = new Set(initData.completedChunks || [])
+
+        uploadState.value.uploadId = uploadId
+        uploadState.value.completedChunks = completedSet
+        uploadState.value.uploadedBytes = completedSet.size * CHUNK_SIZE
+        uploadState.value.progress = Math.round((completedSet.size / totalChunks) * 100)
+
+        // 首次持久化
+        saveSession(fileKey, { uploadId, fileName: file.name, fileSize: file.size, totalChunks })
       }
 
-      const initResult = await initResp.json()
-      const initData = initResult.data  // 后端统一 Result<T> 包装
-
-      if (initData.status === 'HINT_DUPLICATE') {
-        uploadState.value.status = 'idle'
-        uploadState.value.duplicateMediaId = initData.existingMediaId
-        return // 让调用方处理提示
-      }
-
-      const uploadId = initData.uploadId
-      const completedSet = new Set(initData.completedChunks || [])
-
-      uploadState.value.uploadId = uploadId
-      uploadState.value.completedChunks = completedSet
-      uploadState.value.status = 'uploading'
-
-      // 持久化
-      saveToLocalStorage(uploadId, file.name, file.size, totalChunks)
-
-      // 2. 上传所有分片
-      await uploadAllChunks(uploadId, file, totalChunks, completedSet)
+      // 2. 上传剩余分片
+      await uploadAllChunks(uploadId, file, totalChunks, completedSet, fileKey)
 
       // 3. 合并
       uploadState.value.status = 'merging'
@@ -164,28 +245,57 @@ export function useChunkedUpload() {
       }
 
       const mergeResult = await mergeResp.json()
-      const mergeData = mergeResult.data  // 后端统一 Result<T> 包装
+      const mergeData = mergeResult.data
       uploadState.value.status = 'done'
       uploadState.value.progress = 100
       uploadState.value.mediaId = mergeData.mediaId
       uploadState.value.filePath = mergeData.filePath
 
-      clearLocalStorage()
+      removeSession(fileKey)
+      currentFile = null
     } catch (err) {
       if (err.name === 'AbortError') {
         uploadState.value.status = 'cancelled'
+        // 场景一：中断后 File 仍在内存，暂存供一键继续
+        if (currentFile) {
+          uploadState.value.pendingFile = currentFile
+        }
       } else {
         uploadState.value.status = 'error'
         uploadState.value.error = err.message
+        // 错误也暂存，允许重试（场景一）
+        if (currentFile) {
+          uploadState.value.pendingFile = currentFile
+        }
       }
     }
   }
 
   /**
+   * 场景一专用：一键继续上传（File 对象仍在内存，跳过 init/check，直接续传）
+   */
+  async function resumeWithoutRecheck(file, userId) {
+    if (!file) return
+    const fileKey = computeFileKey(file)
+    const saved = findSession(fileKey)
+    if (!saved) {
+      // localStorage 也没有，走全新上传
+      return startUpload(file, userId)
+    }
+    // 从 localStorage 恢复，跳过 init
+    return startUpload(file, userId, {
+      uploadId: saved.uploadId,
+      totalChunks: saved.totalChunks,
+      completedChunks: uploadState.value.completedChunks, // 内存中还保留着
+      fileName: saved.fileName,
+      fileSize: saved.fileSize,
+    })
+  }
+
+  /**
    * 并发上传所有未完成的分片
    */
-  async function uploadAllChunks(uploadId, file, totalChunks, completedSet) {
-    // 构建待上传分片列表
+  async function uploadAllChunks(uploadId, file, totalChunks, completedSet, fileKey) {
     const pending = []
     for (let i = 0; i < totalChunks; i++) {
       if (!completedSet.has(i)) {
@@ -193,22 +303,15 @@ export function useChunkedUpload() {
       }
     }
 
-    // 初始进度 = 已完成分片
-    const completedBytes = completedSet.size * CHUNK_SIZE
-    uploadState.value.uploadedBytes = completedBytes
-    uploadState.value.progress = Math.round((completedSet.size / totalChunks) * 100)
-
     if (pending.length === 0) {
-      return // 所有分片已完成（断点续传场景）
+      return // 所有分片已完成
     }
 
-    // 并发控制：最多 MAX_CONCURRENCY 个同时进行
     const executing = new Set()
-
     for (const chunkIndex of pending) {
       if (abortController.signal.aborted) break
 
-      const task = uploadOneChunk(uploadId, file, chunkIndex, totalChunks)
+      const task = uploadOneChunk(uploadId, file, chunkIndex, totalChunks, fileKey)
       executing.add(task)
       task.finally(() => executing.delete(task))
 
@@ -216,15 +319,13 @@ export function useChunkedUpload() {
         await Promise.race(executing)
       }
     }
-
-    // 等待剩余任务
     await Promise.all(executing)
   }
 
   /**
    * 上传单个分片（含重试）
    */
-  async function uploadOneChunk(uploadId, file, chunkIndex, totalChunks) {
+  async function uploadOneChunk(uploadId, file, chunkIndex, totalChunks, fileKey) {
     const start = chunkIndex * CHUNK_SIZE
     const end = Math.min(start + CHUNK_SIZE, file.size)
     const blob = file.slice(start, end)
@@ -250,7 +351,6 @@ export function useChunkedUpload() {
           throw new Error(`分片 ${chunkIndex} 上传失败 (${resp.status}): ${errText}`)
         }
 
-        // 成功：更新进度
         const newSet = new Set(uploadState.value.completedChunks)
         newSet.add(chunkIndex)
         uploadState.value.completedChunks = newSet
@@ -258,82 +358,32 @@ export function useChunkedUpload() {
         uploadState.value.progress = Math.round((newSet.size / totalChunks) * 100)
         updateSpeed(blob.size)
 
-        // 每完成一个分片就更新 localStorage（确保断点续传精度）
-        saveToLocalStorage(uploadId, file.name, file.size, totalChunks)
+        if (fileKey) {
+          saveSession(fileKey, { uploadId, fileName: file.name, fileSize: file.size, totalChunks })
+        }
         return
       } catch (err) {
         lastError = err
         if (attempt < MAX_RETRIES) {
-          // 指数退避
           await sleep(1000 * Math.pow(2, attempt - 1))
         }
       }
     }
-
     throw lastError || new Error(`分片 ${chunkIndex} 上传失败`)
   }
 
-  // ---- 查询状态（页面刷新恢复用） ----
-
-  async function checkResumable() {
-    const saved = loadFromLocalStorage()
-    if (!saved) return null
-
-    try {
-      const resp = await fetch(`${BASE_URL}/media/api/chunk/check`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uploadId: saved.uploadId }),
-      })
-
-      if (!resp.ok) return null
-      const result = await resp.json()
-      const data = result.data  // 后端统一 Result<T> 包装
-      if (!data) return null
-
-      if (data.status === 'UPLOADING') {
-        // 恢复状态
-        uploadState.value = {
-          ...uploadState.value,
-          status: 'idle', // 等待用户确认
-          uploadId: saved.uploadId,
-          fileName: saved.fileName,
-          fileSize: saved.fileSize,
-          totalChunks: saved.totalChunks,
-          completedChunks: new Set(data.completedChunks || []),
-          progress: data.totalChunks
-            ? Math.round(((data.completedChunks || []).length / data.totalChunks) * 100)
-            : 0,
-        }
-        return { uploadId: saved.uploadId, completedChunks: data.completedChunks || [], fileSize: saved.fileSize, fileName: saved.fileName, totalChunks: saved.totalChunks }
-      }
-
-      if (data.status === 'COMPLETED') {
-        clearLocalStorage()
-        return null // 已合并完成，无需恢复
-      }
-
-      // NOT_FOUND：清理过期记录
-      clearLocalStorage()
-      return null
-    } catch {
-      return null
-    }
-  }
-
-  // ---- 取消 ----
+  // ---- 取消 / 放弃 ----
 
   function cancelUpload() {
     if (abortController) {
       abortController.abort()
     }
-    // 不清 localStorage，允许用户稍后恢复
     uploadState.value.status = 'cancelled'
+    // 不清 localStorage，不清 pendingFile，允许恢复
   }
 
-  // ---- 放弃（清理一切） ----
-
   async function discardUpload() {
+    const fileKey = currentFile ? computeFileKey(currentFile) : null
     if (uploadState.value.uploadId) {
       try {
         await fetch(`${BASE_URL}/media/api/chunk/cancel`, {
@@ -343,8 +393,9 @@ export function useChunkedUpload() {
         })
       } catch { /* 忽略 */ }
     }
-    clearLocalStorage()
-    uploadState.value = { status: 'idle', completedChunks: new Set() }
+    if (fileKey) removeSession(fileKey)
+    uploadState.value = { status: 'idle', completedChunks: new Set(), pendingFile: null }
+    currentFile = null
   }
 
   // ---- 工具 ----
@@ -358,9 +409,9 @@ export function useChunkedUpload() {
   return {
     uploadState,
     startUpload,
+    resumeWithoutRecheck,
     cancelUpload,
     discardUpload,
-    checkResumable,
-    clearLocalStorage,
+    matchUpload,
   }
 }

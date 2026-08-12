@@ -6,8 +6,8 @@
     <header class="navbar">
       <div class="nav-content">
         <div class="brand">
-          <span class="brand-do">DO</span>
-          <span class="brand-video">Video</span>
+          <span class="brand-videocourse">VideoCourse</span>
+          <span class="brand-ai">AI</span>
           <span class="beta-badge">PRO</span>
         </div>
 
@@ -36,8 +36,8 @@
 
     <main class="main-container">
       <section class="hero-section">
-        <h1 class="slogan-main">DECODE YOUR VIDEO</h1>
-        <p class="slogan-sub">影视重构 · 算力赋能</p>
+        <h1 class="slogan-main">DECODE ALL VIDEOS</h1>
+        <p class="slogan-sub">视频解构 · AI赋能</p>
 
         <div class="upload-wrapper">
           <input
@@ -126,65 +126,86 @@
             {{ message }}
           </div>
         </transition>
+
+        <!-- 场景一：上传中断后 File 仍在内存，显示续传横幅 -->
+        <transition name="toast-pop">
+          <div v-if="resumeBanner.visible && !uploading" class="resume-banner">
+            <div class="resume-info">
+              <span class="resume-icon">⏸</span>
+              <span>{{ resumeBanner.fileName }} 已完成 {{ resumeBanner.progress }}%，可继续未完成的上传</span>
+            </div>
+            <div class="resume-actions">
+              <button class="resume-btn continue" @click="handleResumeContinue">继续上传</button>
+              <button class="resume-btn restart" @click="handleResumeRestart">重新开始</button>
+            </div>
+          </div>
+        </transition>
+
+        <!-- 去重提示横幅（红色警告体系） -->
+        <transition name="toast-pop">
+          <div v-if="duplicateBanner.visible" class="duplicate-banner">
+            <div class="resume-info">
+              <span class="resume-icon">⚠️</span>
+              <span>同名视频文件「{{ duplicateBanner.fileName }}」资料库中已存在，可能为重复文件，是否继续上传？</span>
+            </div>
+            <div class="resume-actions">
+              <button class="resume-btn force" @click="handleDuplicateForce">坚持上传</button>
+              <button class="resume-btn restart" @click="handleDuplicateSkip">跳过</button>
+            </div>
+          </div>
+        </transition>
       </section>
 
       <section v-if="list.length > 0" class="workspace-section">
         <div class="section-header"><h3>工作台</h3><div class="count-chip">{{ list.length }} TASKS</div></div>
-        <div class="card-grid">
-          <div v-for="item in list" :key="item.id" class="project-card">
+        <div class="video-list">
+          <div v-for="item in list" :key="item.id" class="video-row">
 
-            <button class="delete-btn" @click.stop="deleteItem(item)" title="删除此项">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="18" y1="6" x2="6" y2="18"></line>
-                <line x1="6" y1="6" x2="18" y2="18"></line>
-              </svg>
-            </button>
-            <div class="card-meta">
+            <div class="row-left">
               <div class="meta-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
               </div>
-              <div class="meta-info">
-                <div class="filename-mask" :title="item.filename">{{ item.filename }}</div>
-                <div class="meta-tags">
-                  <span class="time-tag">{{ formatTime(item.uploadTime) }}</span>
-                  <span class="status-indicator" :class="item.status.toLowerCase()">
-                    {{ item.status === 'COMPLETED' ? 'READY' : 'PROCESSING' }}
-                  </span>
-                </div>
+              <div class="row-filename" :title="item.filename">{{ item.filename }}</div>
+              <div class="row-meta">
+                <span class="time-tag">{{ formatTime(item.uploadTime) }}</span>
+                <span v-if="item.fileSize" class="size-tag">{{ formatSize(item.fileSize) }}</span>
+                <span class="status-indicator" :class="item.status.toLowerCase()">
+                  {{ item.status === 'COMPLETED' ? 'READY' : 'PROCESSING' }}
+                </span>
               </div>
             </div>
 
-            <div class="action-dock">
-              <button class="dock-item" @click="downloadAudio(item)">
-                <span class="item-icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
-                </span>
-                <span class="item-label">下载音频</span>
+            <div class="row-actions">
+              <button class="row-btn" @click="downloadAudio(item)" title="下载音频">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
+                <span>下载音频</span>
               </button>
 
               <button
-                  class="dock-item"
+                  class="row-btn"
                   :disabled="item.status !== 'COMPLETED'"
                   @click="transcribe(item.id)"
+                  title="提取文字"
               >
-                <span class="item-icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
-                </span>
-                <span class="item-label">提取文字</span>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                <span>提取文字</span>
               </button>
 
               <button
-                  class="dock-item ai-core"
+                  class="row-btn ai-btn"
                   :disabled="item.status !== 'COMPLETED'"
                   @click="aiAnalyze(item.id)"
+                  title="AI 智能总结"
               >
-                <span class="item-icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
-                </span>
-                <div class="label-group">
-                  <span class="item-label">AI 智能总结</span>
-                </div>
-                <div class="shimmer"></div>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
+                <span>AI 总结</span>
+              </button>
+
+              <button class="row-btn delete" @click.stop="deleteItem(item)" title="删除">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
               </button>
             </div>
           </div>
@@ -278,43 +299,111 @@ const CHUNK_THRESHOLD = 5 * 1024 * 1024 // 5MB，小于此走旧接口
 const {
   uploadState: chunkState,
   startUpload,
+  resumeWithoutRecheck,
   cancelUpload: cancelChunk,
   discardUpload,
-  checkResumable,
+  matchUpload,
 } = useChunkedUpload()
 
+// 续传横幅状态
+const resumeBanner = ref({
+  visible: false,
+  fileName: '',
+  progress: 0,
+})
+
+// 去重提示横幅状态
+const duplicateBanner = ref({
+  visible: false,
+  fileName: '',
+})
+
 // 监听分片上传状态变化
-watch(() => chunkState.value.status, (newStatus, oldStatus) => {
+watch(() => chunkState.value.status, (newStatus) => {
   if (newStatus === 'done') {
     uploading.value = false
     file.value = null
+    resumeBanner.value.visible = false
     showMsg('✅ 分片上传完成')
     fetchList()
   } else if (newStatus === 'error') {
     uploading.value = false
+    // 场景一：中断后显示续传横幅
+    if (file.value && chunkState.value.fileName) {
+      resumeBanner.value = {
+        visible: true,
+        fileName: chunkState.value.fileName,
+        progress: chunkState.value.progress,
+      }
+    }
     showMsg('❌ ' + (chunkState.value.error || '上传失败'), true)
   } else if (newStatus === 'cancelled') {
     uploading.value = false
+    // 取消也显示续传横幅（用户可能想稍后继续）
+    if (file.value && chunkState.value.fileName) {
+      resumeBanner.value = {
+        visible: true,
+        fileName: chunkState.value.fileName,
+        progress: chunkState.value.progress,
+      }
+    }
     showMsg('⚠️ 上传已取消（可稍后恢复）')
   }
-  // HINT_DUPLICATE 在 startUpload 中通过 duplicateMediaId 处理
 })
 
-// 异步检查是否已存在相同文件
+// HINT_DUPLICATE：去重提示横幅
 watch(() => chunkState.value.duplicateMediaId, (mediaId) => {
   if (mediaId) {
     uploading.value = false
-    const confirmed = confirm('同名同大小的文件在资料库中已存在，是否跳过上传？')
-    if (confirmed) {
-      showMsg('已跳过重复文件')
-      file.value = null
-    } else {
-      // 用户坚持上传，需要重新触发（走正常流程）
-      file.value = null
-      showMsg('⚠️ 请重新选择文件以上传')
+    duplicateBanner.value = {
+      visible: true,
+      fileName: chunkState.value.fileName,
     }
   }
 })
+
+// ---- 去重横幅操作 ----
+
+async function handleDuplicateSkip() {
+  duplicateBanner.value.visible = false
+  file.value = null
+  showMsg('已跳过重复文件')
+}
+
+async function handleDuplicateForce() {
+  duplicateBanner.value.visible = false
+  uploading.value = true
+  message.value = '正在上传（已确认忽略重复提示）...'
+  const userId = currentUser.value ? currentUser.value.id : null
+  try {
+    await startUpload(file.value, userId, null, true)
+  } catch (error) {
+    showMsg('❌ 上传失败: ' + error.message, true)
+    uploading.value = false
+  }
+}
+
+// ---- 续传横幅操作 ----
+
+async function handleResumeContinue() {
+  if (!file.value) return
+  resumeBanner.value.visible = false
+  uploading.value = true
+  message.value = '正在恢复上传...'
+  const userId = currentUser.value ? currentUser.value.id : null
+  try {
+    await resumeWithoutRecheck(file.value, userId)
+  } catch (error) {
+    showMsg('❌ 恢复上传失败: ' + error.message, true)
+    uploading.value = false
+  }
+}
+
+function handleResumeRestart() {
+  resumeBanner.value.visible = false
+  discardUpload()
+  showMsg('已清除上传记录，请重新选择文件')
+}
 
 // Markdown 解析
 const renderedMarkdown = computed(() => {
@@ -338,6 +427,7 @@ const handleFileChange = async (e) => {
   if (!selectedFile) return
   file.value = selectedFile
   videoUrl.value = ''
+  resumeBanner.value.visible = false
   await uploadFile()
 }
 
@@ -357,6 +447,7 @@ const handleDrop = async (e) => {
   }
   file.value = selectedFile
   videoUrl.value = ''
+  resumeBanner.value.visible = false
   await uploadFile()
 }
 
@@ -393,6 +484,30 @@ const uploadFile = async () => {
   }
 
   // 大于等于 5MB：走分片上传
+  // 场景二：检查是否存在该文件的历史上传记录（文件重新选择后自动识别）
+  message.value = '正在核对已上传分片...'
+  const resumeInfo = await matchUpload(file.value)
+
+  if (resumeInfo) {
+    const confirmed = confirm(
+      `检测到该文件的未完成上传记录：\n` +
+      `文件：${resumeInfo.fileName}\n` +
+      `已完成：${resumeInfo.completedChunks.size}/${resumeInfo.totalChunks} 片\n\n` +
+      `是否继续上传？（点击"确定"继续，点击"取消"重新开始）`
+    )
+    if (confirmed) {
+      try {
+        await startUpload(file.value, userId, resumeInfo)
+      } catch (error) {
+        showMsg('❌ 恢复上传失败: ' + error.message, true)
+        uploading.value = false
+      }
+      return
+    }
+    // 用户选择重新开始
+  }
+
+  // 全新上传
   message.value = '正在初始化分片上传...'
   try {
     await startUpload(file.value, userId)
@@ -463,8 +578,7 @@ const fetchList = async () => {
 
       const res = await fetch(url)
       const data = await res.json()
-      // 倒序排列，新的在前面
-      list.value = data.reverse()
+      list.value = data
     } else {
       list.value = []
     }
@@ -757,26 +871,10 @@ onMounted(async () => {
   }
   fetchList()
 
-  // 断点续传恢复检查
-  const resumeInfo = await checkResumable()
-  if (resumeInfo) {
-    const confirmed = confirm(
-      `检测到未完成的上传任务：\n` +
-      `文件：${resumeInfo.fileName}\n` +
-      `进度：${resumeInfo.completedChunks.length}/${resumeInfo.totalChunks} 片\n\n` +
-      `是否继续上传？`
-    )
-    if (confirmed) {
-      uploading.value = true
-      message.value = '正在恢复上传...'
-      // 重新获取文件引用（需要通过 input 重新选择）
-      // 由于 File 对象无法持久化到 localStorage，需要用户重新选择文件
-      showMsg('⚠️ 出于安全限制，请重新选择同一文件以恢复上传')
-      uploading.value = false
-    } else {
-      discardUpload()
-    }
-  }
+  // 场景一：页面刷新后，从 localStorage 恢复上传状态元数据，
+  // 但 File 对象已丢失，无法自动续传。等用户重新选择文件时，
+  // handleFileChange → uploadFile → matchUpload 会自动匹配并提示。
+  // 这里只做静默检查，不去弹窗（弹窗没有 File 引用也无法真正恢复）。
 
   window.addEventListener('beforeunload', beforeUnloadHandler)
 })
@@ -820,8 +918,8 @@ html, body, #app {
 .navbar { position: sticky; top: 0; z-index: 100; width: 100%; padding: 1.2rem 0; background: rgba(11, 12, 16, 0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border-tech); }
 .nav-content { max-width: 1400px; margin: 0 auto; padding: 0 2rem; display: flex; justify-content: space-between; align-items: center; }
 .brand { display: flex; align-items: baseline; gap: 2px; }
-.brand-do { font-family: 'Dela Gothic One', sans-serif; font-size: 1.8rem; color: var(--text-main); letter-spacing: -1px; }
-.brand-video { font-family: 'Space Grotesk', sans-serif; font-size: 1.8rem; font-weight: 300; }
+.brand-videocourse { font-family: 'Space Grotesk', sans-serif; font-size: 1.8rem; font-weight: 300; }
+.brand-ai { font-family: 'Dela Gothic One', sans-serif; font-size: 1.8rem; color: var(--text-main); letter-spacing: -1px; }
 .beta-badge { font-size: 0.7rem; font-weight: 700; background: var(--accent-lime); color: var(--text-inverse); padding: 2px 6px; border-radius: 2px; margin-left: 8px; transform: translateY(-4px); box-shadow: 0 0 5px var(--accent-lime); }
 
 .nav-controls { display: flex; align-items: center; gap: 15px; }
@@ -932,32 +1030,44 @@ html, body, #app {
 .quantum-loader { width: 50px; height: 50px; border: 4px solid var(--border-tech); border-top-color: var(--accent-lime); border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 1rem; box-shadow: 0 0 10px var(--accent-lime); }
 .quantum-loader.small { width: 30px; height: 30px; margin: 0 auto; }
 
-/* Workspace */
+/* Workspace — 横排列表 */
 .workspace-section { opacity: 0; animation: slideUpFade 0.8s 0.4s forwards; }
-.section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 2rem; border-bottom: 2px solid var(--border-tech); padding-bottom: 10px; }
+.section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 1.5rem; border-bottom: 2px solid var(--border-tech); padding-bottom: 10px; }
 .section-header h3 { font-size: 1.5rem; font-weight: 700; }
 .count-chip { background: var(--border-tech); padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; font-family: monospace; }
-.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
-.project-card { background: var(--bg-card); border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.3); border: 1px solid var(--border-tech); overflow: hidden; transition: transform 0.2s; position: relative; }
-.project-card:hover { transform: translateY(-2px); border-color: var(--accent-lime); }
-.card-meta { display: flex; gap: 1.5rem; padding: 1.5rem; align-items: center; border-bottom: 1px solid var(--border-tech); background: rgba(18, 21, 18, 0.5); }
-.meta-icon { width: 56px; height: 56px; background: rgba(197, 249, 70, 0.05); border: 1px solid var(--accent-lime); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--accent-lime); }
-.filename-mask { font-size: 1.1rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
-.meta-tags { display: flex; gap: 12px; font-size: 0.85rem; font-family: monospace; margin-top: 5px; }
-.time-tag { color: var(--text-sub); }
-.status-indicator { font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+
+.video-list { display: flex; flex-direction: column; gap: 1px; }
+.video-row {
+  display: flex; align-items: center; gap: 16px;
+  background: var(--bg-card); border: 1px solid var(--border-tech);
+  border-radius: 6px; padding: 10px 16px;
+  transition: border-color 0.2s;
+}
+.video-row:hover { border-color: var(--accent-lime); }
+
+.row-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+.meta-icon { flex-shrink: 0; width: 40px; height: 40px; background: rgba(197, 249, 70, 0.05); border: 1px solid var(--accent-lime); border-radius: 6px; display: flex; align-items: center; justify-content: center; color: var(--accent-lime); }
+.row-filename { font-size: 0.95rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 360px; color: var(--text-main); }
+.row-meta { display: flex; align-items: center; gap: 10px; flex-shrink: 0; margin-left: auto; }
+.time-tag { color: var(--text-sub); font-family: monospace; font-size: 0.8rem; }
+.size-tag { color: var(--text-sub); font-family: monospace; font-size: 0.75rem; opacity: 0.7; }
+.status-indicator { font-weight: 600; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-family: monospace; }
 .status-indicator.completed { color: var(--accent-lime); border: 1px solid var(--accent-lime); background: rgba(197, 249, 70, 0.1); }
 .status-indicator.processing { color: var(--accent-purple); border: 1px solid var(--accent-purple); animation: blink 1s infinite; }
 
-.action-dock { display: grid; grid-template-columns: 1fr 1fr 1.5fr; gap: 12px; padding: 12px; background: rgba(5, 8, 5, 0.5); }
-.dock-item { position: relative; border: 1px solid var(--border-tech); background: var(--bg-card); border-radius: 8px; padding: 16px; display: flex; align-items: center; justify-content: center; gap: 10px; cursor: pointer; transition: all 0.3s; color: var(--text-sub); font-family: monospace; overflow: hidden; }
-.dock-item:hover:not(:disabled) { color: var(--accent-lime); border-color: var(--accent-lime); background: rgba(197, 249, 70, 0.05); }
-.dock-item:disabled { opacity: 0.3; cursor: not-allowed; }
-.dock-item.ai-core { border-color: var(--accent-purple); color: var(--accent-purple); }
-.dock-item.ai-core .label-group { display: flex; flex-direction: column; align-items: flex-start; z-index: 1; }
-.dock-item.ai-core .item-sub { font-size: 0.75rem; color: var(--accent-purple); opacity: 0.8; }
-.dock-item.ai-core:hover:not(:disabled) { border-color: var(--accent-lime); color: var(--text-inverse); background: var(--accent-lime); }
-.dock-item.ai-core:hover:not(:disabled) .item-sub { color: var(--text-inverse); }
+.row-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.row-btn {
+  display: flex; align-items: center; gap: 4px;
+  background: transparent; border: 1px solid var(--border-tech); border-radius: 4px;
+  padding: 6px 12px; color: var(--text-sub); cursor: pointer;
+  font-family: monospace; font-size: 0.78rem; transition: all 0.2s;
+}
+.row-btn:hover:not(:disabled) { color: var(--accent-lime); border-color: var(--accent-lime); }
+.row-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.row-btn.ai-btn { border-color: rgba(138, 43, 226, 0.4); color: var(--accent-purple); }
+.row-btn.ai-btn:hover:not(:disabled) { background: var(--accent-lime); border-color: var(--accent-lime); color: var(--text-inverse); }
+.row-btn.delete { border-color: transparent; color: var(--text-sub); padding: 6px 8px; }
+.row-btn.delete:hover { color: #ff4757; }
 
 /* Sidebar */
 .sidebar-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 998; }
@@ -998,14 +1108,6 @@ html, body, #app {
 .auth-msg { margin-top: 15px; text-align: center; font-family: 'Noto Sans SC', monospace; font-size: 0.8rem; color: var(--accent-lime); }
 .auth-msg.error { color: #ff4757; }
 
-/* 删除按钮 */
-.delete-btn {
-  position: absolute; top: 10px; right: 10px; background: transparent; border: none;
-  color: #71757a; cursor: pointer; opacity: 0; transition: all 0.3s ease; z-index: 10; padding: 5px;
-}
-.project-card:hover .delete-btn { opacity: 1; }
-.delete-btn:hover { color: #ff4757; transform: scale(1.2) rotate(90deg); }
-
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes slideUpFade { from { opacity: 0; transform: translateY(40px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes pulse-lime { 0% { opacity: 0.5; box-shadow: 0 0 5px var(--accent-lime); } 100% { opacity: 1; box-shadow: 0 0 15px var(--accent-lime); } }
@@ -1032,4 +1134,29 @@ html, body, #app {
   cursor: pointer; transition: all 0.3s;
 }
 .cancel-upload-btn:hover { background: rgba(255,71,87,0.1); box-shadow: 0 0 10px rgba(255,71,87,0.2); }
+
+/* 横幅共用 */
+.resume-banner, .duplicate-banner {
+  margin-top: 1.5rem; display: flex; flex-direction: column; align-items: center; gap: 14px;
+  border-radius: 8px; padding: 16px 24px; max-width: 600px; margin-left: auto; margin-right: auto;
+}
+.resume-banner {
+  background: rgba(197, 249, 70, 0.08); border: 1px solid var(--accent-lime);
+}
+.duplicate-banner {
+  background: rgba(255, 71, 87, 0.06); border: 1px solid #ff4757;
+}
+.resume-info { display: flex; align-items: center; gap: 10px; font-family: monospace; font-size: 0.9rem; color: var(--text-main); text-align: center; }
+.resume-icon { font-size: 1.2rem; flex-shrink: 0; }
+.resume-actions { display: flex; gap: 10px; }
+.resume-btn {
+  border: none; padding: 8px 18px; border-radius: 4px; font-family: 'Noto Sans SC', sans-serif;
+  font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.3s;
+}
+.resume-btn.continue { background: var(--accent-lime); color: var(--text-inverse); }
+.resume-btn.continue:hover { box-shadow: 0 0 12px rgba(197, 249, 70, 0.5); }
+.resume-btn.force { background: #ff4757; color: #fff; }
+.resume-btn.force:hover { box-shadow: 0 0 12px rgba(255, 71, 87, 0.5); }
+.resume-btn.restart { background: transparent; border: 1px solid var(--border-tech); color: var(--text-sub); }
+.resume-btn.restart:hover { border-color: #ff4757; color: #ff4757; }
 </style>

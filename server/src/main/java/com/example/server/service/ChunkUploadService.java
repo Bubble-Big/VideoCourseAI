@@ -76,7 +76,8 @@ public class ChunkUploadService {
         }
 
         // 2. 轻量去重检测：查询 DB 中 (userId, fileName, fileSize) 是否存在已完成记录
-        if (req.getUserId() != null) {
+        // 若用户坚持上传 (force=true)，跳过此步骤，到合并后再做精确 MD5 判断
+        if (!req.isForce() && req.getUserId() != null) {
             QueryWrapper<MediaFile> dupQuery = new QueryWrapper<>();
             dupQuery.eq("user_id", req.getUserId())
                     .eq("filename", req.getFileName())
@@ -101,6 +102,7 @@ public class ChunkUploadService {
         meta.put("totalChunks", String.valueOf(req.getTotalChunks()));
         meta.put("userId", req.getUserId() == null ? "" : String.valueOf(req.getUserId()));
         meta.put("status", "UPLOADING");
+        meta.put("forceUpload", req.isForce() ? "1" : "0");
         meta.put("createdAt", String.valueOf(System.currentTimeMillis()));
 
         redis.opsForHash().putAll(metaKey, meta);
@@ -261,9 +263,42 @@ public class ChunkUploadService {
             // 4.5 计算全文件 MD5（从 MinIO 流式读取，不占用服务器磁盘）
             String fileMd5 = computeFileMd5(targetObjectName);
 
+            // 4.6 坚持上传的去重逻辑：MD5 比对同名文件
+            String finalFileName = fileName;
+            boolean isForce = "1".equals(meta.get("forceUpload"));
+            if (isForce && userId != null) {
+                // 查找同名同大小的已完成文件
+                QueryWrapper<MediaFile> dupQuery = new QueryWrapper<>();
+                dupQuery.eq("user_id", userId)
+                        .eq("filename", fileName)
+                        .eq("file_size", parseLong(meta.get("fileSize")))
+                        .eq("status", "COMPLETED");
+                MediaFile existing = mediaFileMapper.selectOne(dupQuery);
+                if (existing != null && existing.getFileMd5() != null && existing.getFileMd5().equals(fileMd5)) {
+                    // MD5 相同 → 同一文件，删除新文件，更新旧文件时间
+                    minioUtils.removeFile(fileUrl);
+                    existing.setUploadTime(LocalDateTime.now());
+                    mediaFileMapper.updateById(existing);
+                    // 返回已有记录
+                    redis.opsForHash().put(metaKey, "status", "COMPLETED");
+                    redis.opsForHash().put(metaKey, "mediaId", String.valueOf(existing.getId()));
+                    redis.opsForHash().put(metaKey, "filePath", existing.getFilePath());
+                    cleanUpChunks(uploadId);
+                    if (userId != null) { redis.delete("media:list:user:" + userId); }
+                    ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
+                    resp.setMediaId(existing.getId());
+                    resp.setFilePath(existing.getFilePath());
+                    resp.setStatus("COMPLETED");
+                    return resp;
+                } else if (existing != null && existing.getFileMd5() != null) {
+                    // MD5 不同 → 同名不同文件，添加防重名后缀
+                    finalFileName = findAvailableFileName(fileName, userId);
+                }
+            }
+
             // 5. 写入 MySQL
             MediaFile mediaFile = new MediaFile();
-            mediaFile.setFilename(fileName);
+            mediaFile.setFilename(finalFileName);
             mediaFile.setFilePath(fileUrl);
             mediaFile.setStatus("COMPLETED");
             mediaFile.setFileSize(parseLong(meta.get("fileSize")));
@@ -355,6 +390,31 @@ public class ChunkUploadService {
         } catch (Exception e) {
             System.err.println("全文件 MD5 计算失败，使用空值: " + e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * 查找可用的文件名：如果重名，添加 (1)、(2) 等后缀
+     */
+    private String findAvailableFileName(String originalName, Long userId) {
+        String base = originalName;
+        String ext = "";
+        int dotIdx = originalName.lastIndexOf('.');
+        if (dotIdx > 0) {
+            base = originalName.substring(0, dotIdx);
+            ext = originalName.substring(dotIdx);
+        }
+
+        int counter = 1;
+        String candidate = originalName;
+        while (true) {
+            QueryWrapper<MediaFile> q = new QueryWrapper<>();
+            q.eq("user_id", userId).eq("filename", candidate).eq("status", "COMPLETED");
+            if (mediaFileMapper.selectOne(q) == null) {
+                return candidate;
+            }
+            candidate = base + "(" + counter + ")" + ext;
+            counter++;
         }
     }
 

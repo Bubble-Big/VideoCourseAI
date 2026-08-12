@@ -9,7 +9,7 @@
 
 **VideoCourseAI** 是一个全链路视频内容理解平台，集成用户鉴权、视频上传（本地/URL）、音频提取、AI 语音转文字与智能总结等能力。项目针对视频处理场景中的 **长耗时阻塞**、**高并发资源冲突**、**大文件传输不稳定** 等痛点，基于 **RocketMQ + Redisson + 分片续传** 重构了系统架构，抛弃了传统的同步处理模式。
 
-**核心标语**：DECODE YOUR VIDEO — 影视重构 · 算力赋能
+**核心标语**：DECODE ALL VIDEOS — 视频解构 · AI赋能
 
 ---
 
@@ -23,7 +23,7 @@
 | **ORM** | MyBatis Plus | 3.5.9 |
 | **数据库** | MySQL | 8.0 |
 | **缓存** | Redis | 7.x |
-| **分布式锁** | Redisson | 3.23.5 |
+| **分布式锁** | Redisson | 3.52.0 |
 | **消息队列** | RocketMQ | 4.9.4 |
 | **对象存储** | MinIO | latest |
 | **AI SDK** | DashScope SDK (阿里云) | 2.16.0 |
@@ -57,19 +57,28 @@ VideoCourseAI-main/
 │   ├── mvnw / mvnw.cmd              # Maven Wrapper
 │   └── src/main/
 │       ├── resources/
-│       │   └── application.properties   # 应用配置
+│       │   ├── application.properties   # 应用配置
+│       │   └── db/                      # 数据库脚本
+│       │       ├── schema.sql           # 完整建表语句
+│       │       └── V1__add_file_size_and_md5.sql  # 增量迁移
 │       └── java/com/example/server/
 │           ├── ServerApplication.java   # 启动类
+│           ├── common/                  # 公共组件 (新增)
+│           │   ├── Result.java          # 统一 API 响应体
+│           │   └── ErrorCode.java       # 统一错误码枚举
 │           ├── config/                  # 配置层
-│           │   ├── MinioConfig.java     # MinIO 客户端配置
+│           │   ├── MinioConfig.java     # MinIO 客户端配置 (含分片生命周期)
 │           │   ├── ThreadPoolConfig.java# 线程池配置
 │           │   └── WebConfig.java       # 跨域 CORS 配置
 │           ├── controller/              # 控制层
 │           │   ├── UserController.java  # 用户注册/登录
 │           │   ├── MediaController.java # 媒体上传/列表/删除
-│           │   └── DebugController.java # AI分析/转写/音频下载
+│           │   ├── ChunkController.java # 分片上传 (新增)
+│           │   ├── DebugController.java # AI分析/转写/音频下载
+│           │   └── ApiExceptionHandler.java # 全局异常处理 (新增)
 │           ├── service/                 # 服务层
 │           │   ├── MediaService.java    # 媒体处理服务
+│           │   ├── ChunkUploadService.java  # 分片上传核心逻辑 (新增)
 │           │   └── AiService.java       # AI 分析服务
 │           ├── consumer/                # MQ 消费者
 │           │   └── VideoAnalysisConsumer.java
@@ -77,16 +86,19 @@ VideoCourseAI-main/
 │           │   ├── AiAnalysisStrategy.java        # 策略接口
 │           │   └── impl/AliyunDeepSeekStrategy.java # 阿里云+DeepSeek实现
 │           ├── dto/                     # 数据传输对象
-│           │   └── AnalysisTaskMsg.java # MQ 消息体
+│           │   ├── AnalysisTaskMsg.java # MQ 消息体
+│           │   └── ChunkUploadDTO.java  # 分片上传请求/响应 DTO (新增)
 │           ├── entity/                  # 实体层
 │           │   ├── User.java
-│           │   └── MediaFile.java
+│           │   └── MediaFile.java       # (新增 file_size, file_md5 字段)
+│           ├── exception/               # 异常定义 (新增)
+│           │   └── BusinessException.java
 │           ├── mapper/                  # 数据访问层
 │           │   ├── UserMapper.java
 │           │   └── MediaFileMapper.java
 │           └── utils/                   # 工具类
 │               ├── FfmpegUtils.java     # FFmpeg 音频提取（统一入口）
-│               ├── MinioUtils.java      # MinIO 上传/删除
+│               ├── MinioUtils.java      # MinIO 上传/删除/分片/合并
 │               ├── YtDlpUtils.java      # yt-dlp 视频下载
 │               ├── DeepSeekUtils.java   # DeepSeek AI 调用
 │               └── AliyunAsrUtils.java  # 阿里云语音识别
@@ -117,11 +129,16 @@ VideoCourseAI-main/
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                     CONTROLLER LAYER                          │   │
-│  │  UserController    MediaController      DebugController       │   │
-│  │  /user/register    /media/upload        /debug/ai             │   │
-│  │  /user/login       /media/upload-url    /debug/transcribe     │   │
-│  │                    /media/list          /debug/download       │   │
-│  │                    /media/delete                               │   │
+│  │  UserController    MediaController      ChunkController       │   │
+│  │  /user/register    /media/upload        /media/api/chunk/init │   │
+│  │  /user/login       /media/upload-url    /media/api/chunk/check│   │
+│  │                    /media/list          /media/api/chunk/upload│  │
+│  │                    /media/delete        /media/api/chunk/merge│  │
+│  │                                         /media/api/chunk/cancel│ │
+│  │                    DebugController                            │   │
+│  │                    /debug/ai                                  │   │
+│  │                    /debug/transcribe                           │   │
+│  │                    /debug/download                             │   │
 │  └────────┬──────────────────┬───────────────────┬──────────────┘   │
 │           │                  │                   │                  │
 │  ┌────────▼──────┐  ┌───────▼────────┐  ┌───────▼──────────────┐   │
@@ -168,33 +185,72 @@ VideoCourseAI-main/
 
 ## 五、核心业务流程详解
 
-### 5.1 视频上传流程
+### 5.1 视频上传流程（分片上传 + 断点续传）
+
+大文件（≥ 5MB）走分片上传链路，小文件（< 5MB）走原有整文件上传。
 
 ```
-用户操作 ──► 前端校验登录 ──► POST /media/upload (FormData)
-                                  │
-                    ┌─────────────┴─────────────┐
-                    ▼                           ▼
-            本地上传 (MultipartFile)      URL 下载 (yt-dlp)
-                    │                           │
-                    ▼                           ▼
-            MinIO.uploadFile()          YtDlpUtils.downloadVideo()
-                    │                    → MinIO.uploadLocalFile()
-                    ▼                           │
-            返回文件URL ◄────────────────────────┘
+用户选择文件 ──► 前端判断文件大小
                     │
-                    ▼
-          MediaFileMapper.insert() ──► 写入数据库 (status=COMPLETED)
-                    │
-                    ▼
-          Redis 删除用户列表缓存 ──► 返回成功 (50ms 内响应)
+        ┌───────────┴───────────┐
+        ▼                       ▼
+   < 5MB: 整文件上传        ≥ 5MB: 分片上传
+        │                       │
+        ▼                       ▼
+  POST /media/upload        POST /media/api/chunk/init
+  (FormData)                {fileName, fileSize, totalChunks, userId, force}
+        │                       │
+        ▼                       ▼
+  MinIO.putObject()        去重检测(force=false) → Redis meta Hash → 返回 uploadId
+        │                       │
+        ▼                       ▼
+  写 DB → 清缓存          POST /media/api/chunk/upload × N
+        │                 (并发 3 片, 每片 5MB, 3 次指数退避重试)
+        │                       │
+        │                 "先落盘后记账":
+        │                 ① 校验 uploadId / chunkIndex
+        │                 ② MinIO: chunks/{uploadId}/{idx}
+        │                 ③ Redis: SADD upload:chunks:{uploadId}
+        │                       │
+        │                       ▼
+        │                 全部完成 → POST /media/api/chunk/merge
+        │                       │
+        │                 Redisson 分布式锁 lock:merge:{uploadId}
+        │                       │
+        │                 MinIO composeObject (服务端合并, 零下载)
+        │                       │
+        │                 计算全文件 MD5
+        │                       │
+        │             ┌─────────┴─────────┐
+        │             ▼ (force 上传)      ▼ (普通上传)
+        │        MD5 比对同名文件      写 DB → 清理分片
+        │         ├相同: 删新+更新旧时间
+        │         └不同: 文件名加 (1)(2) 后缀
+        │                       │
+        ▼                       ▼
+  列表刷新 ←──── Redis 缓存清除 ────┘
 ```
+
+**断点续传（两个场景）**：
+- **场景一（页面未刷新，File 对象仍在内存）**：上传中断/取消后，前端显示续传横幅，用户点击「继续上传」直接续传，无需重新选择文件。
+- **场景二（页面刷新，File 对象已丢失）**：用户重新选择同一文件，前端用文件指纹（`fileName + fileSize + lastModified`）匹配 localStorage 中的 uploadId，调 `/check` 获取已传分片后自动续传。
+
+**去重策略（三层）**：
+1. **init 阶段（轻量启发式）**：`(userId, fileName, fileSize)` 查 DB，命中则内嵌横幅提示「资料库中已存在」
+2. **坚持上传（force=true）**：跳过 init 去重，正常分片上传；合并后计算 MD5 与疑似重复文件比对
+   - MD5 相同 → 同一文件，删除新上传，更新旧记录 `upload_time` 使其排列到列表顶部
+   - MD5 不同 → 同名不同文件，文件名自动加 `(1)`、`(2)` 后缀
+3. **merge 阶段（精确 MD5）**：全文件 MD5 存入 `media_files.file_md5`，供后续精确去重
+
+**列表排序**：`ORDER BY upload_time DESC`（最新上传排顶部），去重替换时更新旧记录时间即可自然置顶。
 
 **关键文件**：
-- `MediaController.java:52-89` — 文件上传接口
-- `MediaController.java:92-137` — URL 上传接口
-- `MinioUtils.java:29-52` — MinIO 上传实现
-- `YtDlpUtils.java:22-87` — yt-dlp 视频下载
+- `ChunkController.java` — 分片上传 5 个 REST 端点
+- `ChunkUploadService.java` — 分片上传核心业务逻辑（含去重/后缀生成）
+- `MinioUtils.java` — MinIO 分片/合并/清理方法
+- `client/src/composables/useChunkedUpload.js` — 前端分片上传组合式函数（含文件指纹匹配）
+- `MediaController.java` — 整文件上传 / 列表排序
+- `MediaController.java:92-137` — URL 上传
 
 ### 5.2 AI 异步分析流程 (核心链路)
 
@@ -289,6 +345,8 @@ VideoCourseAI-main/
 | filename | VARCHAR | 文件名 |
 | status | VARCHAR | 状态 (UPLOADED/COMPLETED) |
 | file_path | VARCHAR | MinIO 文件 URL |
+| file_size | BIGINT | 文件大小(字节) — 分片上传重构新增 |
+| file_md5 | VARCHAR(32) | 全文件 MD5(合并后计算) — 分片上传重构新增 |
 | ai_summary | TEXT | AI 总结内容 (Markdown) |
 | transcript_text | TEXT | 语音转写全文 |
 | cover_url | VARCHAR | 封面 URL |
@@ -299,9 +357,11 @@ VideoCourseAI-main/
 | 缓存键 | 类型 | TTL | 说明 |
 |--------|------|-----|------|
 | `media:list:user:{userId}` | String (JSON) | 30 分钟 | 用户媒体列表缓存 |
-| `upload:chunked:{uploadId}` | String | 1 天 | 分片上传状态 |
-| `lock:analyze:{id}` | Redisson Lock | WatchDog | 分析任务分布式锁 |
-| `limit:ai:global` | RateLimiter | — | 全局 AI 调用限流 |
+| `upload:meta:{uploadId}` | Hash | 48 小时 | 分片上传元数据 (fileName, fileSize, totalChunks, userId, status, forceUpload, createdAt) |
+| `upload:chunks:{uploadId}` | Set | 48 小时 | 已完成分片序号集合 |
+| `lock:merge:{uploadId}` | Redisson RLock | 120s | 分片合并分布式锁 |
+| `lock:analyze:{id}` | Redisson RLock | WatchDog | AI 分析任务分布式锁 |
+| `limit:ai:global` | RateLimiter | — | 全局 AI 调用限流 (10次/分钟) |
 
 ### 6.3 RocketMQ 消息
 
@@ -375,7 +435,36 @@ RateType.OVERALL, 10 tokens/minute
 - 全局每分钟最多 10 次 AI 分析请求，防止 API 费用爆炸
 - **文件**：`DebugController.java:65-74`
 
-### 7.6 指数退避重试
+### 7.6 统一响应体 (Result<T>)
+
+所有 API 统一返回 `Result<T>` JSON 结构：
+
+```json
+{ "code": 0, "message": "success", "data": {...} }
+```
+
+- `code == 0` 表示成功，非 0 承载业务/系统错误码
+- HTTP 状态码仅表达传输层语义，业务语义由 `code` 承载
+- `ErrorCode` 枚举集中管理错误码 (400/401/403/404/409/422/500)
+
+**文件**：`common/Result.java`, `common/ErrorCode.java`
+
+### 7.7 全局异常处理 (@RestControllerAdvice)
+
+`ApiExceptionHandler` 统一拦截 Controller 层异常，转换为 `Result` 响应：
+
+| 异常类型 | HTTP 状态码 | 说明 |
+|---------|------------|------|
+| `BusinessException` | 动态映射 | 携带 ErrorCode 语义 |
+| `IllegalArgumentException` | 400 | 参数不合法 |
+| `IllegalStateException` | 409 | 状态冲突（如重复合并） |
+| `Exception` (兜底) | 500 | 未知异常不泄漏技术细节 |
+
+Controller 层无需 try-catch，专注业务逻辑。
+
+**文件**：`controller/ApiExceptionHandler.java`, `exception/BusinessException.java`
+
+### 7.8 指数退避重试
 
 ```
 ASR 请求: 最多3次重试, 遇到 5xx 错误等待2秒后重试
@@ -446,23 +535,26 @@ AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
 
 ### 10.1 技术特点
 
-- **单文件组件 (SFC)**：所有业务逻辑集中在 `App.vue`（约 890 行），未做组件拆分
+- **组件拆分**：分片上传逻辑抽离到 `composables/useChunkedUpload.js` 组合式函数；`App.vue` 保留 UI 与其余业务逻辑（约 1000+ 行）
 - **赛博朋克风格**：自定义 CSS 变量、SVG 噪点背景、霓虹绿 (#c5f946) 主题色
-- **响应式状态**：Vue 3 Composition API (`ref`, `computed`, `onMounted`)
+- **响应式状态**：Vue 3 Composition API (`ref`, `computed`, `watch`, `onMounted`)
 - **Markdown 渲染**：`marked` 库解析 AI 返回的总结内容
-- **轮询机制**：3秒间隔轮询后端 `/media/list` 检测异步任务完成状态，5分钟强制超时兜底
+- **轮询机制**：3秒间隔轮询后端 `/media/list` 检测异步任务完成状态，10分钟强制超时兜底
 
 ### 10.2 前端功能模块
 
 | 功能 | 实现方式 |
 |------|---------|
 | 用户注册/登录 | 模态框 + localStorage 持久化 |
-| 本地上传 | `<input type="file">` + 拖拽 (drag & drop) + FormData |
+| 本地上传 | `<input type="file">` + 拖拽 (drag & drop) + 分片/整文件双路径 |
+| 断点续传 | 场景一：内存 File + 续传横幅一键继续；场景二：文件指纹匹配 + 重新选择自动续传 |
+| 去重提示 | 内嵌横幅（红色警告）+ 坚持上传走 force 流程 |
 | URL 下载 | 输入框 + yt-dlp 后端下载 + 轮询结果 |
 | AI 分析 | 按钮触发 RocketMQ → 前端轮询检测 `##` 标记判定完成 |
 | 文字提取 | 异步提交 → 轮询结果 |
 | 音频下载 | FFmpeg 转码 MP3 → Blob 下载 |
 | 视频删除 | DELETE 请求 + 前端列表移除 |
+| 工作台 | 单列横排列表，文件名左、按钮右 |
 
 ---
 
@@ -529,28 +621,35 @@ rocketmq.producer.group=video-analysis-group
 
 ## 十四、文件清单
 
-### 后端 Java 文件 (22个)
+### 后端 Java 文件 (30+个)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `ServerApplication.java` | 18 | Spring Boot 启动类 |
-| `config/MinioConfig.java` | 76 | MinIO 客户端初始化 + 桶策略 |
+| `common/Result.java` | 32 | 统一 API 响应体 (新增) |
+| `common/ErrorCode.java` | 30 | 统一错误码枚举 (新增) |
+| `config/MinioConfig.java` | 76 | MinIO 客户端初始化 + 桶策略 + 生命周期 |
 | `config/ThreadPoolConfig.java` | 35 | AI 任务线程池配置 |
 | `config/WebConfig.java` | 24 | CORS 全局跨域配置 |
 | `controller/UserController.java` | 90 | 用户注册/登录 |
 | `controller/MediaController.java` | 198 | 媒体上传/列表/删除 |
+| `controller/ChunkController.java` | 103 | 分片上传 5 个端点 (新增) |
 | `controller/DebugController.java` | 150 | AI分析/文字提取/音频下载 |
-| `service/MediaService.java` | 35 | 分片上传初始化 |
+| `controller/ApiExceptionHandler.java` | 105 | 全局异常处理 (新增) |
+| `service/MediaService.java` | 35 | 媒体处理服务 |
+| `service/ChunkUploadService.java` | 384 | 分片上传核心逻辑 (新增) |
 | `service/AiService.java` | 103 | 异步 AI 分析 + 缓存清除 |
 | `consumer/VideoAnalysisConsumer.java` | 57 | RocketMQ 消费者 |
+| `exception/BusinessException.java` | 20 | 业务异常 (新增) |
 | `strategy/AiAnalysisStrategy.java` | 20 | AI 分析策略接口 |
 | `strategy/impl/AliyunDeepSeekStrategy.java` | 71 | ASR + DeepSeek 实现 |
 | `dto/AnalysisTaskMsg.java` | 21 | RocketMQ 消息体 |
+| `dto/ChunkUploadDTO.java` | 116 | 分片上传请求/响应 DTO (新增) |
 | `entity/User.java` | 27 | 用户实体 |
-| `entity/MediaFile.java` | 30 | 媒体文件实体 |
+| `entity/MediaFile.java` | 33 | 媒体文件实体 (新增 file_size, file_md5) |
 | `mapper/UserMapper.java` | 9 | 用户 DAO |
 | `mapper/MediaFileMapper.java` | 9 | 媒体文件 DAO |
-| `utils/MinioUtils.java` | 94 | MinIO 上传/删除工具 |
+| `utils/MinioUtils.java` | 238 | MinIO 上传/删除/分片/合并 |
 | `utils/YtDlpUtils.java` | 88 | yt-dlp 视频下载工具 |
 | `utils/DeepSeekUtils.java` | 123 | DeepSeek AI 调用 |
 | `utils/AliyunAsrUtils.java` | 83 | 阿里云 ASR 语音识别 |
@@ -560,7 +659,8 @@ rocketmq.producer.group=video-analysis-group
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `App.vue` | 890+ | 全部前端 UI 与业务逻辑 |
+| `App.vue` | 930+ | 全部前端 UI 与业务逻辑 (含分片进度条) |
+| `composables/useChunkedUpload.js` | 377 | 分片上传组合式函数 (新增) |
 | `main.js` | 6 | Vue 应用入口 |
 | `vite.config.js` | 7 | Vite 构建配置 |
 | `index.html` | 14 | HTML 入口 |
@@ -573,9 +673,11 @@ rocketmq.producer.group=video-analysis-group
 VideoCourseAI 是一个设计思路清晰的 **视频 + AI 异步处理平台**，核心亮点在于：
 
 1. **全链路异步化**：通过 RocketMQ + CompletableFuture + 线程池，将长耗时的 AI 分析从主请求链路剥离
-2. **分布式防护**：Redisson 分布式锁防重复处理 + 令牌桶限流保护 AI API 费用
-3. **面向失败设计**：ASR 3次指数退避重试、WatchDog 防止长任务锁过期、5分钟轮询超时兜底
-4. **策略模式扩展**：AI Provider 通过接口抽象，可灵活替换
-5. **容器化部署**：所有中间件 Docker Compose 一键启动
+2. **分片上传 + 断点续传**：5MB 固定切片，MinIO composeObject 服务端合并，Redis 维护上传状态；双场景续传（内存 File 横幅一键继续 + 文件指纹匹配自动恢复）；三层去重（init 轻量提示 + force 坚持上传 MD5 比对 + merge 精确 MD5）
+3. **分布式防护**：Redisson 分布式锁 (3.52.0) 防重复处理/合并 + 令牌桶限流保护 AI API 费用
+4. **面向失败设计**：分片 3 次指数退避重试、ASR 3 次重试、WatchDog 防止长任务锁过期、5 分钟轮询超时兜底
+5. **统一 API 规范**：Result<T> 响应体 + ErrorCode 错误码枚举 + @RestControllerAdvice 全局异常处理
+6. **策略模式扩展**：AI Provider 通过接口抽象，可灵活替换
+7. **容器化部署**：所有中间件 Docker Compose 一键启动
 
 技术栈成熟务实，适合作为 Spring Boot + RocketMQ + AI 集成方向的参考项目。

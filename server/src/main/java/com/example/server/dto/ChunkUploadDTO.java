@@ -15,6 +15,7 @@ public class ChunkUploadDTO {
         private Long fileSize;
         private Integer totalChunks;
         private Long userId;
+        private boolean force;  // 用户坚持上传，跳过去重检测
 
         public String getFileName() { return fileName; }
         public void setFileName(String fileName) { this.fileName = fileName; }
@@ -24,6 +25,8 @@ public class ChunkUploadDTO {
         public void setTotalChunks(Integer totalChunks) { this.totalChunks = totalChunks; }
         public Long getUserId() { return userId; }
         public void setUserId(Long userId) { this.userId = userId; }
+        public boolean isForce() { return force; }
+        public void setForce(boolean force) { this.force = force; }
     }
 
     public static class InitResponse {

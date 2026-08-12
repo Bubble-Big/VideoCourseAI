@@ -159,7 +159,7 @@ public class MediaController {
         } else {
             return List.of();
         }
-        List<MediaFile> list = mediaFileMapper.selectList(query.orderByDesc("id"));
+        List<MediaFile> list = mediaFileMapper.selectList(query.orderByDesc("upload_time"));
 
         try {
             String jsonToWrite = objectMapper.writeValueAsString(list);

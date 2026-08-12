@@ -16,7 +16,7 @@
       <img src="https://img.shields.io/badge/RocketMQ-4.9-orange" alt="RocketMQ">
     </a>
     <a href="https://github.com/Xiaoc7r/VideoCourseAI">
-      <img src="https://img.shields.io/badge/Redisson-Lock-red" alt="Redisson">
+      <img src="https://img.shields.io/badge/Redisson-3.52.0-red" alt="Redisson">
     </a>
     <a href="https://github.com/Xiaoc7r/VideoCourseAI">
       <img src="https://img.shields.io/badge/LangChain4j-AI-blueviolet" alt="LangChain4j">
@@ -64,15 +64,17 @@
 
 1. 🚀 稳定上传体验
 
-分片断点续传：针对 GB 级大文件（如 4K 课程录像），采用 Redis 维护上传分片状态。实测在 20% 丢包率弱网环境下，上传成功率从 25% 提升至 99%。
+**分片断点续传**：针对 GB 级大文件（如 4K 课程录像），前端按 5MB 固定切片，并发 3 片上传。后端”先落盘后记账”（MinIO → Redis Set），通过 `composeObject` 服务端合并零下载带宽。Redis 维护上传分片状态，localStorage 持久化 uploadId，页面刷新后可断点续传。
 
-秒级响应：引入 RocketMQ 将耗时的“视频分析”动作剥离出主线程。用户上传完成后仅需 50ms 即可得到反馈，后续处理全异步化，彻底告别页面转圈卡死。
+**秒级响应**：引入 RocketMQ 将耗时的”视频分析”动作剥离出主线程。用户上传完成后仅需 50ms 即可得到反馈，后续处理全异步化，彻底告别页面转圈卡死。
 
 2. 🛡️ 高并发防护
 
-分布式锁兜底：使用 Redisson + WatchDog 机制。当多个用户同时上传同一个热门公开课视频时，系统通过 MD5 内容指纹识别，利用分布式锁防止重复转码与 AI 分析，节省算力与 Token 开销。
+**分布式锁兜底**：使用 Redisson 3.52.0 + WatchDog 机制。分片合并用 `lock:merge:{uploadId}` 防重复合并，AI 分析用 `lock:analyze:{id}` 防重复处理。合并后计算全文件 MD5 存入数据库，后续相同文件可精确去重（秒传）。
 
-削峰填谷：Controller 层集成 Redis 令牌桶算法，有效遏制恶意请求与突发流量，保护后端服务不被击穿。
+**削峰填谷**：Controller 层集成 Redis 令牌桶算法，有效遏制恶意请求与突发流量，保护后端服务不被击穿。
+
+**统一 API 规范**：`Result<T>` 统一响应体 + `ErrorCode` 错误码枚举 + `@RestControllerAdvice` 全局异常处理。
 
 3.  🔄 任务处理流程详解
 
@@ -90,7 +92,7 @@
 
 ### 后端
 
-SpringBoot + RocketMQ + Redis + MySQL + MyBatis Plus + MinIO + FFmpeg + LangChain4j
+SpringBoot + RocketMQ + Redisson(3.52.0) + Redis + MySQL + MyBatis Plus + MinIO(composeObject) + FFmpeg + LangChain4j
 
 ### 部署
 

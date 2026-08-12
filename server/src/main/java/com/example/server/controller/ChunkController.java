@@ -36,6 +36,7 @@ public class ChunkController {
         request.setFileSize(toLong(body.get("fileSize")));
         request.setTotalChunks(toInt(body.get("totalChunks")));
         request.setUserId(toLong(body.get("userId")));
+        request.setForce(Boolean.TRUE.equals(body.get("force")));
         return Result.ok(chunkUploadService.initUpload(request));
     }
 
