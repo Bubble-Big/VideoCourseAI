@@ -1,7 +1,24 @@
 # AI 调用链路异常处理优化策略计划书
 
 > 本文档以 DOVideo-AI-main 的异常处理策略为参照基准，为 VideoCourseAI 设计一套分层、可重试、可追溯的异常处理改造方案。
-> 最后更新：2026-08-13
+> 最后更新：2026-08-13（P0/P1 已实施，实际偏离见「〇、实施状态与关键偏离」）
+
+---
+
+## 〇、实施状态与关键偏离
+
+P0（核心链路）与 P1（加固）已实施完成。实际落地与原计划的**关键偏离**如下（正文各章节仍保留原始设计，以本节为准）：
+
+| 偏离点 | 原计划 | 实际实施 | 原因 |
+|--------|--------|---------|------|
+| 异常类型 | `IllegalArgumentException`/`IllegalStateException` 二分 | 自定义 `AiAnalysisException`（`retryable` 布尔标志） | 项目 `ApiExceptionHandler` 已把 `IllegalStateException → 409`，被分片上传「重复合并」依赖，复用标准异常会语义冲突 |
+| FfmpegUtils | `extractAudio` 由 `boolean` 改抛异常 | 保持 `boolean` 不动，策略层把 `false` 转抛 `AiAnalysisException` | 通用工具被 `download`（同步）共用，改抛异常波及下载接口，留作后续独立任务 |
+| asyncTranscribe | 「与 asyncAnalyze 同一模式」含上抛 | 只落库 `FAILED` + 受控文案，**不上抛不重试** | `@Async` 一次性任务无 MQ 消费层接收重试，上抛只会落到 `SimpleAsyncUncaughtExceptionHandler` |
+| 可重试失败落库 | 重试期间保持 `PROCESSING`，耗尽后写 `FAILED` | 每次失败都写 `FAILED`（重投后重新 `PROCESSING`） | RocketMQ 重投耗尽进 `%DLQ%` 后消费层收不到消息、无人写 `FAILED`，前端会无限转圈 |
+| transcriptStatus 一致性 | 局部 `transcribed` 标记 | `markFailed` 内 `!SUCCESS.equals(transcriptStatus)` 判断 | 等价且更简单 |
+| ASR 空文本 | 未明确 | `audioToText` 补「`text` 空 → 抛 `AiAnalysisException`」 | 修复静音视频被静默标 `SUCCESS` |
+
+其余（同步消费方案 A、失败台账 `failed_analysis_task`、受控文案、ErrorCode httpStatus、Controller 统一 Result）均按原计划落地。
 
 ---
 
@@ -70,17 +87,17 @@ DOVideo-AI 把异常当作「需要被精确分类、可重试判断、可追溯
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 异常类型约定（对齐 DOVideo-AI）
+### 3.2 异常类型约定（实际实施：自定义 AiAnalysisException）
 
-沿用 DOVideo-AI 的「异常类型即语义」惯例，VideoCourseAI 引入两种约定，无需新增过多自定义异常类：
+实际落地采用**自定义 `AiAnalysisException extends RuntimeException`**，携带 `boolean retryable` 标志区分「可重试 / 不可重试」：
 
-| 异常类型 | 语义 | 消费层处理 | 触发场景 |
-|---------|------|-----------|---------|
-| `IllegalArgumentException` | 参数/确定性错误，**不可重试** | 判为永久失败 → 台账 + 死信 | 视频路径为空、磁盘文件不存在、模型返回 4xx |
-| `IllegalStateException` | 运行时失败，**可重试** | 未达上限 → MQ 重投；达上限 → 台账 | 网络抖动、模型 5xx、超时、ASR 服务端错误 |
+| 异常 | 语义 | 消费层处理 | 触发场景 |
+|------|------|-----------|---------|
+| `AiAnalysisException(msg, false)` | 确定性错误，**不可重试** | 判永久失败 → 台账 + 正常 ACK | 视频路径为空、磁盘文件不存在、mediaId 不存在、模型 4xx |
+| `AiAnalysisException(msg, true)` | 瞬时失败，**可重试** | 上抛 → RocketMQ 重投 | 网络抖动、模型 5xx/408/429、超时、重试耗尽、响应解析失败（空 content/text）、FFmpeg 失败 |
 | `BusinessException`（已有） | 携带 `ErrorCode` 的业务语义 | 同步接口由 `ApiExceptionHandler` 映射 | Controller 层可预期失败 |
 
-> **不新增自定义异常类的理由**：VideoCourseAI 没有 DOVideo-AI 的「预算耗尽」「上下文未就绪」等专属领域语义，`IllegalArgumentException` / `IllegalStateException` 二分法已能覆盖「不可重试 / 可重试」的全部需求。若未来引入成本预算，再补 `BudgetExceededException` 不迟。
+> **为何不用原计划的 `IllegalArgumentException`/`IllegalStateException` 二分**：项目 `ApiExceptionHandler` 已把 `IllegalStateException → 409 CONFLICT`（分片上传「重复合并/分片未集齐」依赖该映射），复用会撞车；且 `IllegalStateException` 的语义是「程序状态非法」而非「外部依赖瞬时失败」。故改用带 `retryable` 标志的自定义异常，语义清晰且不与既有约定冲突。
 
 ### 3.3 失败台账
 
@@ -90,7 +107,7 @@ DOVideo-AI 把异常当作「需要被精确分类、可重试判断、可追溯
 CREATE TABLE failed_analysis_task (
     id           BIGINT AUTO_INCREMENT PRIMARY KEY,
     media_id     BIGINT       NOT NULL COMMENT '关联 media_files.id',
-    error_type   VARCHAR(64)  COMMENT '异常类型（IllegalArgumentException/IllegalStateException/...）',
+    error_type   VARCHAR(64)  COMMENT '异常类型（AiAnalysisException/Exception 等）',
     error_msg    VARCHAR(2000) COMMENT '错误摘要（受控，不含堆栈）',
     attempts     INT          DEFAULT 1 COMMENT '累计投递次数',
     created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '首次失败时间'
@@ -246,7 +263,7 @@ public void asyncAnalyze(Long mediaId) {
 
 按优先级分三档：**P0 核心链路（必做）**、**P1 加固（推荐）**、**P2 增强（可选）**。
 
-### P0：核心链路改造（异常上抛 + 双层重试 + 台账）
+### P0：核心链路改造（异常上抛 + 双层重试 + 台账）✅ 已完成
 
 | 阶段 | 任务 | 涉及文件 |
 |------|------|---------|
@@ -257,7 +274,7 @@ public void asyncAnalyze(Long mediaId) {
 | 5 | 消费层同步化 + 永久失败判定 + 台账 | `consumer/VideoAnalysisConsumer.java` |
 | 6 | 受控文案（信息泄漏治理） | `service/AiService.java`（`markFailed`） |
 
-### P1：加固（ErrorCode + Controller 统一）
+### P1：加固（ErrorCode + Controller 统一）✅ 已完成
 
 | 阶段 | 任务 | 涉及文件 |
 |------|------|---------|
