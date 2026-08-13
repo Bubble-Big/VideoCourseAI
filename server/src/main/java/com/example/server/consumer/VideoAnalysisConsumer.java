@@ -41,8 +41,9 @@ public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> 
                 failedTaskService.record(mediaId, e);
                 return;
             }
-            // 瞬时失败：上抛触发 RocketMQ 重投（AiAnalysisException 是 RuntimeException）
-            log.warn("分析任务瞬时失败，等待 MQ 重投, mediaId={}, err={}", mediaId, e.getMessage());
+            // 瞬时失败：也写台账（记录本次失败），再上抛触发 RocketMQ 重投
+            log.warn("分析任务瞬时失败，记录台账并等待 MQ 重投, mediaId={}, err={}", mediaId, e.getMessage());
+            failedTaskService.record(mediaId, e);
             throw e;
         } catch (Exception e) {
             // 未预期异常：按可重试处理，触发重投

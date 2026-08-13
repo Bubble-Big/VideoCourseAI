@@ -61,11 +61,17 @@ public class AiService {
             log.info("AI 分析完成, mediaId={}", mediaId);
 
         } catch (Exception e) {
-            markFailed(mediaFile, e);
-            // 上抛：保留 AiAnalysisException 的 retryable 标志；未预期异常按可重试包装
-            if (e instanceof AiAnalysisException ae) {
+            // 只有确定不再重试的失败（retryable=false）才落 FAILED；
+            // 可重试失败与未预期异常保持 PROCESSING 上抛重投，重投成功后前端能看到 SUCCESS
+            if (e instanceof AiAnalysisException ae && !ae.isRetryable()) {
+                markFailed(mediaFile, e);   // 永久失败，落 FAILED
                 throw ae;
             }
+            if (e instanceof AiAnalysisException ae) {
+                log.warn("AI 分析瞬时失败，保持 PROCESSING 等待重投, mediaId={}, err={}", mediaFile.getId(), e.getMessage());
+                throw ae;
+            }
+            log.error("AI 分析未预期异常，保持 PROCESSING 等待重投, mediaId={}", mediaFile.getId(), e);
             throw new AiAnalysisException("AI 分析失败", true, e);
         }
     }
