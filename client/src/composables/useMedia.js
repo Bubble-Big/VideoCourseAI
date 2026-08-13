@@ -6,7 +6,7 @@ import * as api from '../api/index.js'
 
 // ---- 模块级状态（单例） ----
 const list = ref([])
-const sidebar = ref({ visible: false, type: 'ai', title: '', content: '', loading: false })
+const sidebar = ref({ visible: false, type: 'ai', id: null, title: '', content: '', loading: false })
 const pollingTimers = ref({})
 
 const { currentUser } = useAuth()
@@ -85,7 +85,7 @@ async function transcribe(id) {
 
   // 1. 已完成（成功/失败）→ 直接显示结果
   if (st === 'SUCCESS' || st === 'FAILED') {
-    openSidebar('text', '全量文字提取')
+    openSidebar('text', '全量文字提取', id)
     sidebar.value.content = item.transcriptText || ''
     sidebar.value.loading = false
     return
@@ -93,7 +93,7 @@ async function transcribe(id) {
 
   // 2. 正在处理 → 打开转圈，并恢复/维持轮询
   if (st === 'PROCESSING') {
-    openSidebar('text', '全量文字提取')
+    openSidebar('text', '全量文字提取', id)
     sidebar.value.loading = true
     sidebar.value.content = "文字转写中..."
     const t = pollingTimers.value[id]
@@ -102,7 +102,7 @@ async function transcribe(id) {
   }
 
   // 3. NONE → 提交请求
-  openSidebar('text', '全量文字提取')
+  openSidebar('text', '全量文字提取', id)
   sidebar.value.loading = true
   sidebar.value.content = "资源请求中..."
   try {
@@ -128,7 +128,7 @@ async function aiAnalyze(id) {
 
   // 1. 已完成（成功/失败）→ 直接显示结果
   if (st === 'SUCCESS' || st === 'FAILED') {
-    openSidebar('ai', 'AI 智能总结')
+    openSidebar('ai', 'AI 智能总结', id)
     sidebar.value.content = item.aiSummary || ''
     sidebar.value.loading = false
     return
@@ -136,7 +136,7 @@ async function aiAnalyze(id) {
 
   // 2. 正在处理 → 打开转圈，并恢复/维持轮询
   if (st === 'PENDING' || st === 'PROCESSING') {
-    openSidebar('ai', 'AI 智能总结')
+    openSidebar('ai', 'AI 智能总结', id)
     sidebar.value.loading = true
     sidebar.value.content = st === 'PENDING' ? 'AI调用中...' : 'AI分析中...'
     const t = pollingTimers.value[id]
@@ -145,7 +145,7 @@ async function aiAnalyze(id) {
   }
 
   // 3. 准备提交请求，打开侧边栏 loading
-  openSidebar('ai', 'AI 智能总结')
+  openSidebar('ai', 'AI 智能总结', id)
   sidebar.value.loading = true
   sidebar.value.content = "资源请求中..."
 
@@ -200,7 +200,7 @@ function startPolling(id, type) {
 
     // 2. 结算
     if (isFinished) {
-      if (sidebar.value.visible && sidebar.value.title.includes(type === 'ai' ? 'AI' : '文字')) {
+      if (sidebar.value.visible && sidebar.value.id === id) {
         sidebar.value.content = result
         sidebar.value.loading = false
       }
@@ -214,7 +214,7 @@ function startPolling(id, type) {
 
       clearInterval(timer)
       delete pollingTimers.value[id]
-    } else if (sidebar.value.visible && sidebar.value.title.includes(type === 'ai' ? 'AI' : '文字')) {
+    } else if (sidebar.value.visible && sidebar.value.id === id) {
       // 进行中：按状态实时刷新转圈文案
       if (type === 'ai') {
         const st = item.aiStatus || 'NONE'
@@ -239,9 +239,10 @@ function startPolling(id, type) {
   }, 600000)
 }
 
-function openSidebar(type, title) {
+function openSidebar(type, title, id) {
   sidebar.value.visible = true
   sidebar.value.type = type
+  sidebar.value.id = id
   sidebar.value.title = title
   sidebar.value.loading = true
   sidebar.value.content = ''
