@@ -33,7 +33,7 @@ cd client && npm install && npm run dev
 ### AI 异步分析
 `GET /debug/ai?id={id}` → Redisson 分布式锁 `lock:analyze:{id}` → Redis 令牌桶限流 (10次/分钟) → 写 `AnalysisTaskMsg` 到 RocketMQ topic `video-analysis-topic` → 立即返回。
 `VideoAnalysisConsumer` 收到消息 → `CompletableFuture.runAsync()` 提交到 `aiTaskExecutor` (核心4/最大8/队列100) → `AiService.asyncAnalyze()` → `AliyunDeepSeekStrategy`：FFmpeg 提取 MP3 (15min) → ASR (3次重试, 5xx 等 2s) → DeepSeek (3次重试, 5xx 等 2s) → 写 DB → 删 Redis 缓存 `media:list:user:{userId}`。
-前端 3s 轮询 `GET /media/list`，检测 `aiSummary` 含 `##` 即完成。
+前端 3s 轮询 `GET /media/list`，按 `aiStatus` 字段（SUCCESS/FAILED）判断是否完成。
 
 ## 新增架构组件
 
@@ -43,9 +43,7 @@ cd client && npm install && npm run dev
 
 ## 已知陷阱
 
-- **错误字符串被写入 DB**：`DeepSeekUtils.analyzeContent()` 失败时返回 `"❌ AI 请求失败: ..."` 字符串而非抛异常，被直接写入 `aiSummary`，前端无法识别为失败。
 - **密码明文**：`UserController` 直接比对明文密码。
-- **Ai调用返回错误字符串而非抛异常** `DeepSeekUtils` 失败仍返回 `AI request failed: ...` 字符串而非抛异常，应当让策略失败时抛异常，`catch` 统一设 `FAILED` 
 - **API 密钥明文** 在 [application.properties](server/src/main/resources/application.properties) 中已提交 Git。
 - **MinIO 分片生命周期**需在控制台手动配置：`http://127.0.0.1:9001` → Buckets → media → Lifecycle → Prefix `chunks/`, Expiry 2 days
 - **@RequestBody 反序列化**：因 fastjson2 对静态内部类存在兼容性问题，ChunkController 使用 `Map<String, Object>` 接收 JSON 后手动提取字段

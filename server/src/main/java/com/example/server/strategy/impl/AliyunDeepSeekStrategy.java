@@ -29,20 +29,18 @@ public class AliyunDeepSeekStrategy implements AiAnalysisStrategy {
     @Override
     public String generateSummary(String videoPath) {
         String text = processVideoToText(videoPath);
-        if (text.startsWith("❌")) return text;
-
         return deepSeekUtils.analyzeContent("请对以下视频提取的文字进行总结，不需要废话，直接列出核心观点：\n" + text);
     }
 
 
     private String processVideoToText(String inputPath) {
         //简单检查
-        if (inputPath == null || inputPath.isEmpty()) return "❌ 路径为空";
+        if (inputPath == null || inputPath.isEmpty()) throw new RuntimeException("视频路径为空");
 
         //如果是本地路径且不存在，报错；如果是 http 链接，跳过检查直接交给 FFmpeg
         if (!inputPath.startsWith("http")) {
             File localFile = new File(inputPath);
-            if (!localFile.exists()) return "❌ 磁盘找不到文件: " + inputPath;
+            if (!localFile.exists()) throw new RuntimeException("磁盘找不到文件: " + inputPath);
         }
 
         //准备临时 MP3 路径 (放在系统临时目录下)
@@ -53,7 +51,7 @@ public class AliyunDeepSeekStrategy implements AiAnalysisStrategy {
 
             // 3. 提取音频 (FFmpeg 原生支持 HTTP URL，这里直接传进去)
             boolean success = FfmpegUtils.extractAudio(inputPath, outputMp3Path);
-            if (!success) return "FFmpeg 转换失败 (可能是网络超时或文件损坏)";
+            if (!success) throw new RuntimeException("FFmpeg 提取音频失败");
 
             // 4. 语音转文字
             String text = aliyunAsrUtils.audioToText(outputMp3Path);
@@ -61,7 +59,7 @@ public class AliyunDeepSeekStrategy implements AiAnalysisStrategy {
 
         } catch (Exception e) {
             e.printStackTrace();
-            return "处理异常: " + e.getMessage();
+            throw new RuntimeException("处理异常: " + e.getMessage(), e);
         } finally {
             // 5. 清理临时文件
             File mp3 = new File(outputMp3Path);

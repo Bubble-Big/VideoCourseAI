@@ -164,5 +164,4 @@ client/src/composables/useMedia.js                                  # 三处状�
 
 | 事项 | 说明 |
 |------|------|
-| 修复 DeepSeek 返回错误字符串的已知陷阱 | `DeepSeekUtils` 失败仍返回 `AI request failed: ...` 字符串而非抛异常，本次仅在 `AiService` 层用 `isFailureText()` 识别，未改 `DeepSeekUtils` 本身。更彻底的做法是让策略失败时抛异常，`catch` 统一设 `FAILED` |
 | SSE 替代轮询 | 状态字段已就绪，`PENDING/PROCESSING/SUCCESS/FAILED` 可直接作为 SSE 事件的 `status` 字段推送，前端 `Map<id, status>` 的状态值无需再改模型 |

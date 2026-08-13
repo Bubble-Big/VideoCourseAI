@@ -34,7 +34,7 @@ public class AliyunAsrUtils {
 
     public String audioToText(String filePath) {
         File file = new File(filePath);
-        if (!file.exists()) return "❌ 错误：找不到文件";
+        if (!file.exists()) throw new RuntimeException("音频文件不存在: " + filePath);
 
         int maxRetries = 3; // 最大重试次数
         String lastError = "";
@@ -75,17 +75,21 @@ public class AliyunAsrUtils {
                             Thread.sleep(2000);
                             continue;
                         } else {
-                            // 如果是 400/401 等客户端错误，直接退出不重试
-                            return "❌ 识别失败: " + lastError;
+                            // 如果是 400/401 等客户端错误，直接抛出不重试
+                            throw new RuntimeException("ASR 识别失败: " + lastError);
                         }
                     }
                 }
-            } catch (Exception e) {
+            } catch (IOException e) {
                 lastError = e.getMessage();
                 System.err.println("⚠️ 网络异常 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                lastError = "线程中断: " + e.getMessage();
+                break;
             }
         }
 
-        return "❌ 最终失败 (重试3次): " + lastError;
+        throw new RuntimeException("ASR 最终失败（已重试 3 次）: " + lastError);
     }
 }

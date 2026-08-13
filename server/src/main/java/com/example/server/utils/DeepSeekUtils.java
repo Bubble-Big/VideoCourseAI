@@ -147,7 +147,7 @@ public class DeepSeekUtils {
                             Thread.sleep(2000);
                             continue;
                         } else {
-                            return "AI request failed: " + lastError;
+                            throw new RuntimeException("DeepSeek 请求失败: " + lastError);
                         }
                     }
                 }
@@ -161,6 +161,6 @@ public class DeepSeekUtils {
             }
         }
 
-        return "AI request failed after " + maxRetries + " retries: " + lastError;
+        throw new RuntimeException("DeepSeek 请求失败，已重试 " + maxRetries + " 次: " + lastError);
     }
 }

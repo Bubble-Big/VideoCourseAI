@@ -36,15 +36,15 @@ public class AiService {
         mediaFileMapper.updateById(mediaFile);
 
         try {
-            // 1. 语音转文字
+            // 1. 语音转文字（失败会抛异常，由下方 catch 统一设 FAILED）
             String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
             mediaFile.setTranscriptText(text);
-            mediaFile.setTranscriptStatus(isFailureText(text) ? AiStatus.FAILED.name() : AiStatus.SUCCESS.name());
+            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
 
-            // 2. 智能总结
+            // 2. 智能总结（失败会抛异常，由下方 catch 统一设 FAILED）
             String summary = aiAnalysisStrategy.generateSummary(mediaFile.getFilePath());
             mediaFile.setAiSummary(summary);
-            mediaFile.setAiStatus(isFailureText(summary) ? AiStatus.FAILED.name() : AiStatus.SUCCESS.name());
+            mediaFile.setAiStatus(AiStatus.SUCCESS.name());
 
             // 3. 保存数据库 (这一步你已经成功了)
             mediaFileMapper.updateById(mediaFile);
@@ -93,10 +93,10 @@ public class AiService {
         if (mediaFile == null) return;
 
         try {
-            //只做语音转文字
+            //只做语音转文字（失败会抛异常，由下方 catch 统一设 FAILED）
             String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
             mediaFile.setTranscriptText(text);
-            mediaFile.setTranscriptStatus(isFailureText(text) ? AiStatus.FAILED.name() : AiStatus.SUCCESS.name());
+            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
 
             //保存数据库
             mediaFileMapper.updateById(mediaFile);
@@ -123,17 +123,4 @@ public class AiService {
         }
     }
 
-    /**
-     * 判断工具链返回的文本是否为错误结果。
-     * <p>后端各环节失败时返回固定前缀的错误文案而非抛异常，
-     * 这里按前缀精确匹配，避免误伤正常的中文转写文本。</p>
-     */
-    private boolean isFailureText(String text) {
-        if (text == null || text.trim().isEmpty()) return true;
-        String t = text.trim();
-        return t.startsWith("❌")
-                || t.startsWith("FFmpeg 转换失败")
-                || t.startsWith("处理异常")
-                || t.startsWith("AI request failed");
-    }
 }
