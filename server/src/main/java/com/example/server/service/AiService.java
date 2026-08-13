@@ -2,8 +2,11 @@ package com.example.server.service;
 
 import com.example.server.common.AiStatus;
 import com.example.server.entity.MediaFile;
+import com.example.server.exception.AiAnalysisException;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.strategy.AiAnalysisStrategy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
@@ -11,6 +14,8 @@ import org.springframework.stereotype.Service;
 
 @Service
 public class AiService {
+
+    private static final Logger log = LoggerFactory.getLogger(AiService.class);
 
     private final MediaFileMapper mediaFileMapper;
     private final AiAnalysisStrategy aiAnalysisStrategy;
@@ -25,102 +30,99 @@ public class AiService {
         this.redisTemplate = redisTemplate;
     }
 
+    /**
+     * AI 分析：落库保证前端可见 + 异常上抛保证 MQ 可决策（两者解耦）。
+     * <p>成功写 SUCCESS；失败先 {@link #markFailed} 落库，再把异常上抛给消费层决定重试或收敛。</p>
+     */
     public void asyncAnalyze(Long mediaId) {
-        System.out.println(" [线程池] 开始处理任务，ID: " + mediaId);
-
         MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
-        if (mediaFile == null) return;
+        if (mediaFile == null) {
+            throw new AiAnalysisException("文件不存在: " + mediaId, false);
+        }
+        log.info("开始 AI 分析任务, mediaId={}", mediaId);
 
         // 进入处理态（不删缓存，避免中间态触发多余的 DB 查询）
         mediaFile.setAiStatus(AiStatus.PROCESSING.name());
         mediaFileMapper.updateById(mediaFile);
 
         try {
-            // 1. 语音转文字（失败会抛异常，由下方 catch 统一设 FAILED）
+            // 1. 语音转文字（失败抛 AiAnalysisException，由 catch 统一落库 + 上抛）
             String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
             mediaFile.setTranscriptText(text);
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
 
-            // 2. 智能总结（失败会抛异常，由下方 catch 统一设 FAILED）
+            // 2. 智能总结
             String summary = aiAnalysisStrategy.generateSummary(mediaFile.getFilePath());
             mediaFile.setAiSummary(summary);
             mediaFile.setAiStatus(AiStatus.SUCCESS.name());
 
-            // 3. 保存数据库 (这一步你已经成功了)
             mediaFileMapper.updateById(mediaFile);
-
-
-            // 1. 拼装缓存 Key (必须和 MediaController 里的逻辑完全一致！)
-            // Controller 里是: "media:list:user:" + (userId == null ? "anon" : userId)
-            String userIdStr = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
-            String cacheKey = "media:list:user:" + userIdStr;
-
-            // 2. 狠狠地删除
-            Boolean deleteResult = redisTemplate.delete(cacheKey);
-
-            // 3. 打印显眼日志 (请在黑窗口找这句话！！！)
-            if (Boolean.TRUE.equals(deleteResult)) {
-                System.out.println(" [线程池] 缓存清除成功！Key: " + cacheKey);
-            } else {
-                System.out.println("⚠️ [线程池] 缓存不存在或清除失败 (但这不影响新数据写入)，Key: " + cacheKey);
-            }
-
-            System.out.println("✅ [线程池] 任务全部完成，前端轮询将在下一次命中新数据。");
+            evictCache(mediaFile);
+            log.info("AI 分析完成, mediaId={}", mediaId);
 
         } catch (Exception e) {
-            e.printStackTrace();
-            System.err.println("❌ [线程池] 任务失败: " + e.getMessage());
-
-            // 失败写入状态字段 + 错误详情，避免前端一直转圈
-            mediaFile.setAiStatus(AiStatus.FAILED.name());
-            mediaFile.setAiSummary("❌ 分析失败: " + e.getMessage());
-            mediaFileMapper.updateById(mediaFile);
-
-            // 失败也要删缓存，否则前端会一直转圈看不到“失败”两个字
-            String userIdStr = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
-            redisTemplate.delete("media:list:user:" + userIdStr);
+            markFailed(mediaFile, e);
+            // 上抛：保留 AiAnalysisException 的 retryable 标志；未预期异常按可重试包装
+            if (e instanceof AiAnalysisException ae) {
+                throw ae;
+            }
+            throw new AiAnalysisException("AI 分析失败", true, e);
         }
     }
 
-
-
-    //异步提取全文 (专门负责提取文字)
+    /**
+     * 异步提取全文（@Async 一次性任务，无 MQ 消费层接收重试，失败只落库不上抛）。
+     */
     @Async("aiTaskExecutor")
     public void asyncTranscribe(Long mediaId) {
-        System.out.println(" [线程池] 开始全文提取任务，ID: " + mediaId);
-
         MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
-        if (mediaFile == null) return;
+        if (mediaFile == null) {
+            log.warn("全文提取任务找不到文件记录, mediaId={}", mediaId);
+            return;
+        }
+        log.info("开始全文提取任务, mediaId={}", mediaId);
 
         try {
-            //只做语音转文字（失败会抛异常，由下方 catch 统一设 FAILED）
+            // 只做语音转文字（失败抛 AiAnalysisException，由 catch 落库 FAILED）
             String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
             mediaFile.setTranscriptText(text);
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
 
-            //保存数据库
             mediaFileMapper.updateById(mediaFile);
-
-            //强制删除 Redis 缓存
-            String userIdStr = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
-            String cacheKey = "media:list:user:" + userIdStr;
-            redisTemplate.delete(cacheKey);
-
-            System.out.println(" [线程池] 全文提取完成，缓存已清除！Key: " + cacheKey);
+            evictCache(mediaFile);
+            log.info("全文提取完成, mediaId={}", mediaId);
 
         } catch (Exception e) {
-            e.printStackTrace();
-            System.err.println(" [线程池] 提取失败: " + e.getMessage());
-
-            // 失败写入状态字段 + 错误详情
+            log.error("全文提取失败, mediaId={}, err={}", mediaId, e.getMessage(), e);
+            // 失败写状态字段 + 受控文案（不泄漏堆栈），不上抛（@Async 无消费层）
             mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
-            mediaFile.setTranscriptText("❌ 提取失败: " + e.getMessage());
+            mediaFile.setTranscriptText("❌ 提取失败，请稍后重试");
             mediaFileMapper.updateById(mediaFile);
-
-            // 失败也删缓存，让前端能感知 FAILED
-            String userIdStr = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
-            redisTemplate.delete("media:list:user:" + userIdStr);
+            evictCache(mediaFile);
         }
     }
 
+    /**
+     * 失败落库：写 FAILED + 受控文案 + 同步 transcriptStatus + 删缓存。
+     * <p>受控文案不拼接异常 message，避免底层 errBody 泄漏到前端。</p>
+     */
+    private void markFailed(MediaFile mediaFile, Exception e) {
+        mediaFile.setAiStatus(AiStatus.FAILED.name());
+        mediaFile.setAiSummary("❌ 分析失败，请稍后重试");
+        // 若转写阶段尚未成功（即失败发生在 transcribe），同步置 FAILED，避免与 aiStatus 不一致
+        if (!AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())) {
+            mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
+        }
+        mediaFileMapper.updateById(mediaFile);
+        evictCache(mediaFile);
+        log.error("AI 分析失败, mediaId={}, err={}", mediaFile.getId(), e.getMessage(), e);
+    }
+
+    /**
+     * 失效列表缓存，拼装 Key 规则与 MediaController.list 保持一致。
+     */
+    private void evictCache(MediaFile mediaFile) {
+        String userIdStr = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
+        redisTemplate.delete("media:list:user:" + userIdStr);
+    }
 }

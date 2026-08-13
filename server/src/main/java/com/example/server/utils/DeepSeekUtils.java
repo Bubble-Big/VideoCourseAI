@@ -3,7 +3,10 @@ package com.example.server.utils;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
+import com.example.server.exception.AiAnalysisException;
 import okhttp3.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -60,6 +63,8 @@ public class DeepSeekUtils {
     ## 🏷️ 领域标签
     #标签1 #标签2 #标签3
     """;
+
+    private static final Logger log = LoggerFactory.getLogger(DeepSeekUtils.class);
 
     private static final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
@@ -118,7 +123,7 @@ public class DeepSeekUtils {
     // ======================== API 调用 + 重试（纯网络通信） ========================
 
     /**
-     * 执行 OkHttp 请求，3 次重试，5xx 等 2s 重试，4xx 不重试。
+     * 执行 OkHttp 请求，3 次重试：5xx/408/429 等 2s 重试，其余 4xx 不重试直接抛。
      * <p>通过 {@link Supplier} 获取 Request，重试时调用 Supplier 重新生成全新 Request。
      */
     private String callWithRetry(Supplier<Request> requestSupplier) {
@@ -128,32 +133,40 @@ public class DeepSeekUtils {
         for (int i = 0; i < maxRetries; i++) {
             try {
                 Request request = requestSupplier.get();
-                System.out.println("[DeepSeek] 请求中 (第 " + (i + 1) + " 次尝试)...");
+                log.info("[DeepSeek] 请求中 (第 {} 次尝试)...", i + 1);
 
                 try (Response response = client.newCall(request).execute()) {
                     if (response.isSuccessful()) {
                         String resultJson = response.body().string();
                         JSONObject jsonObject = JSON.parseObject(resultJson);
-                        return jsonObject.getJSONArray("choices")
-                                .getJSONObject(0)
+                        JSONArray choices = jsonObject.getJSONArray("choices");
+                        if (choices == null || choices.isEmpty()) {
+                            throw new AiAnalysisException("DeepSeek 响应无有效内容", true);
+                        }
+                        String content = choices.getJSONObject(0)
                                 .getJSONObject("message")
                                 .getString("content");
+                        if (content == null || content.isBlank()) {
+                            throw new AiAnalysisException("DeepSeek 响应无有效内容", true);
+                        }
+                        return content;
                     } else {
                         String errBody = response.body() != null ? response.body().string() : "";
                         lastError = "HTTP " + response.code() + ": " + errBody;
-                        System.err.println("[DeepSeek] 失败 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+                        log.warn("[DeepSeek] 失败 ({}/{}): {}", i + 1, maxRetries, lastError);
 
-                        if (response.code() >= 500) {
+                        int code = response.code();
+                        if (code >= 500 || code == 408 || code == 429) {
                             Thread.sleep(2000);
                             continue;
                         } else {
-                            throw new RuntimeException("DeepSeek 请求失败: " + lastError);
+                            throw new AiAnalysisException("DeepSeek 请求被拒绝: " + lastError, false);
                         }
                     }
                 }
             } catch (IOException e) {
                 lastError = e.getMessage();
-                System.err.println("[DeepSeek] 网络异常 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+                log.warn("[DeepSeek] 网络异常 ({}/{}): {}", i + 1, maxRetries, lastError);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 lastError = "retry interrupted: " + e.getMessage();
@@ -161,6 +174,6 @@ public class DeepSeekUtils {
             }
         }
 
-        throw new RuntimeException("DeepSeek 请求失败，已重试 " + maxRetries + " 次: " + lastError);
+        throw new AiAnalysisException("DeepSeek 请求失败，已重试 " + maxRetries + " 次: " + lastError, true);
     }
 }

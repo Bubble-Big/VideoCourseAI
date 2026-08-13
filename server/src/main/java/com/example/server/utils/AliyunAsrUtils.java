@@ -2,7 +2,10 @@ package com.example.server.utils;
 
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
+import com.example.server.exception.AiAnalysisException;
 import okhttp3.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -16,6 +19,8 @@ public class AliyunAsrUtils {
     private final String apiKey;
     private final String asrModel;
     private final String asrUrl;
+
+    private static final Logger log = LoggerFactory.getLogger(AliyunAsrUtils.class);
 
     private final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(120, TimeUnit.SECONDS)
@@ -34,14 +39,14 @@ public class AliyunAsrUtils {
 
     public String audioToText(String filePath) {
         File file = new File(filePath);
-        if (!file.exists()) throw new RuntimeException("音频文件不存在: " + filePath);
+        if (!file.exists()) throw new AiAnalysisException("音频文件不存在: " + filePath, false);
 
         int maxRetries = 3; // 最大重试次数
         String lastError = "";
 
         for (int i = 0; i < maxRetries; i++) {
             try {
-                System.out.println("🎤 [ASR] 上传中 (第 " + (i + 1) + " 次尝试)...");
+                log.info("🎤 [ASR] 上传中 (第 {} 次尝试)...", i + 1);
 
                 RequestBody requestBody = new MultipartBody.Builder()
                         .setType(MultipartBody.FORM)
@@ -61,28 +66,31 @@ public class AliyunAsrUtils {
                     if (response.isSuccessful()) {
                         String resultJson = response.body().string();
                         JSONObject jsonObject = JSON.parseObject(resultJson);
-                        if (jsonObject.containsKey("text")) {
-                            return jsonObject.getString("text");
+                        String text = jsonObject.getString("text");
+                        if (text == null || text.isBlank()) {
+                            throw new AiAnalysisException("ASR 返回空文本", true);
                         }
+                        return text;
                     } else {
                         // 如果是 500 错误，记录并重试
                         String errBody = response.body() != null ? response.body().string() : "";
                         lastError = "HTTP " + response.code() + ": " + errBody;
-                        System.err.println("⚠️ ASR 失败 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+                        log.warn("⚠️ ASR 失败 ({}/{}): {}", i + 1, maxRetries, lastError);
 
-                        // 遇到 500/502/503 等服务端错误，等待 2 秒再重试
-                        if (response.code() >= 500) {
+                        // 遇到 500/502/503 或 408/429 等服务端错误，等待 2 秒再重试
+                        int code = response.code();
+                        if (code >= 500 || code == 408 || code == 429) {
                             Thread.sleep(2000);
                             continue;
                         } else {
                             // 如果是 400/401 等客户端错误，直接抛出不重试
-                            throw new RuntimeException("ASR 识别失败: " + lastError);
+                            throw new AiAnalysisException("ASR 识别失败: " + lastError, false);
                         }
                     }
                 }
             } catch (IOException e) {
                 lastError = e.getMessage();
-                System.err.println("⚠️ 网络异常 (" + (i + 1) + "/" + maxRetries + "): " + lastError);
+                log.warn("⚠️ 网络异常 ({}/{}): {}", i + 1, maxRetries, lastError);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 lastError = "线程中断: " + e.getMessage();
@@ -90,6 +98,6 @@ public class AliyunAsrUtils {
             }
         }
 
-        throw new RuntimeException("ASR 最终失败（已重试 3 次）: " + lastError);
+        throw new AiAnalysisException("ASR 最终失败（已重试 3 次）: " + lastError, true);
     }
 }
