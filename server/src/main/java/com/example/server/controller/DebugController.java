@@ -3,6 +3,9 @@ package com.example.server.controller;
 import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.entity.MediaFile;
 import com.example.server.common.AiStatus;
+import com.example.server.common.ErrorCode;
+import com.example.server.common.Result;
+import com.example.server.exception.BusinessException;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
 import com.example.server.strategy.AiAnalysisStrategy;
@@ -51,18 +54,17 @@ public class DebugController {
 
     // AI总结接口(分布式锁 + 限流 + MQ)
     @GetMapping("/ai")
-    public String aiAnalyze(@RequestParam Long id) {
+    public Result<String> aiAnalyze(@RequestParam Long id) {
         //【Redisson 分布式锁】防瞬时并发连点
         String lockKey = "lock:analyze:" + id;
         org.redisson.api.RLock lock = redissonClient.getLock(lockKey);
 
         try {
             if (!lock.tryLock(0, -1, TimeUnit.SECONDS)) {
-                return "⚠️ 任务提交中，请勿重复点击！";
+                throw new BusinessException(ErrorCode.CONFLICT, "任务提交中，请勿重复点击");
             }
 
-
-            // 这里演示：全局限制每分钟只能分析 10 次 (防止费用爆炸)
+            // 全局限制每分钟只能分析 10 次 (防止费用爆炸)
             String limitKey = "limit:ai:global";
             org.redisson.api.RRateLimiter rateLimiter = redissonClient.getRateLimiter(limitKey);
             //初始化：每 1 分钟产生 10 个令牌 (RateType.OVERALL 全局, OVER_CLIENT 是单机)
@@ -70,15 +72,15 @@ public class DebugController {
 
             //尝试获取 1 个令牌
             if (!rateLimiter.tryAcquire(1)) {
-                return "⚠️ 系统繁忙(限流中)，请 1 分钟后再试！";
+                throw new BusinessException(ErrorCode.RATE_LIMITED, "系统繁忙，请 1 分钟后再试");
             }
 
             //查库校验
             MediaFile file = mediaFileMapper.selectById(id);
-            if (file == null) return "文件不存在";
+            if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在");
             String aiSt = file.getAiStatus();
             if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
-                return "任务已在后台运行，无需重复提交";
+                throw new BusinessException(ErrorCode.CONFLICT, "任务已在后台运行，无需重复提交");
             }
 
             //更新状态：投递 MQ 进入 PENDING；清空旧结果避免残留
@@ -92,11 +94,8 @@ public class DebugController {
             AnalysisTaskMsg msg = new AnalysisTaskMsg(id, "START_ANALYSIS");
             rocketMQTemplate.convertAndSend("video-analysis-topic", msg);
 
-            return "✅ 任务已投递至 RocketMQ！";
+            return Result.ok("任务已投递至 RocketMQ");
 
-        } catch (Exception e) {
-            e.printStackTrace();
-            return "❌ 提交失败: " + e.getMessage();
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
@@ -106,13 +105,13 @@ public class DebugController {
 
     //纯文字提取接口
     @GetMapping("/transcribe")
-    public String transcribe(@RequestParam Long id) {
+    public Result<String> transcribe(@RequestParam Long id) {
         MediaFile mediaFile = mediaFileMapper.selectById(id);
-        if (mediaFile == null) return "❌ 找不到文件记录";
+        if (mediaFile == null) throw new BusinessException(ErrorCode.NOT_FOUND, "找不到文件记录");
 
         // 防重复提交：正在提取时直接拒绝
         if (AiStatus.PROCESSING.name().equals(mediaFile.getTranscriptStatus())) {
-            return "任务已在后台运行，无需重复提交";
+            throw new BusinessException(ErrorCode.CONFLICT, "任务已在后台运行，无需重复提交");
         }
 
         // 更新状态为 PROCESSING，并失效缓存让前端立即感知
@@ -124,7 +123,7 @@ public class DebugController {
         // 调用异步服务
         aiService.asyncTranscribe(id);
 
-        return "✅ 提取任务已后台运行！请稍后查看结果。";
+        return Result.ok("提取任务已后台运行");
     }
 
     //下载音频接口

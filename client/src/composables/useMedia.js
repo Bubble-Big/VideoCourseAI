@@ -106,7 +106,13 @@ async function transcribe(id) {
   sidebar.value.loading = true
   sidebar.value.content = "资源请求中..."
   try {
-    await api.transcribe(id)
+    const res = await api.transcribe(id)
+    const data = await res.json()
+    if (data.code !== 0) {
+      showMsg(data.message || '提交失败', true)
+      sidebar.value.loading = false
+      return
+    }
     sidebar.value.content = "资源请求成功！准备接入转写..."
     startPolling(id, 'text')
   } catch (e) {
@@ -145,11 +151,11 @@ async function aiAnalyze(id) {
 
   try {
     const res = await api.aiAnalyze(id)
-    const text = await res.text()
+    const data = await res.json()
 
-    // 4. 检查后端返回：限流/锁/报错 → 任务被拒绝
-    if (text.includes("⚠️") || text.includes("❌")) {
-      showMsg(text, true)
+    // 4. 检查后端返回：code 非 0 → 限流/锁/报错，任务被拒绝
+    if (data.code !== 0) {
+      showMsg(data.message || '提交失败', true)
       sidebar.value.visible = false
       sidebar.value.loading = false
       return

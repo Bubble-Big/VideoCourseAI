@@ -30,8 +30,7 @@ public class ApiExceptionHandler {
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<Result<Void>> business(BusinessException error) {
         ErrorCode code = error.errorCode();
-        return build(HttpStatus.resolve(code.code()) != null ? HttpStatus.resolve(code.code()) : HttpStatus.INTERNAL_SERVER_ERROR,
-                code.code(), safe(error.getMessage(), "请求处理失败"));
+        return build(code.httpStatus(), code.code(), safe(error.getMessage(), "请求处理失败"));
     }
 
     /** 请求参数缺失 → 400 */
