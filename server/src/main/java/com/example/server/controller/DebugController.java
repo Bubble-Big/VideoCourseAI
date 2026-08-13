@@ -96,6 +96,10 @@ public class DebugController {
 
             return Result.ok("任务已投递至 RocketMQ");
 
+        } catch (InterruptedException e) {
+            // tryLock 等待锁时被中断：恢复中断标志，按内部错误处理
+            Thread.currentThread().interrupt();
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "任务提交被中断，请稍后重试");
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
