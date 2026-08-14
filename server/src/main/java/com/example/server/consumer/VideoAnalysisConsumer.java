@@ -4,8 +4,11 @@ import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.exception.AiAnalysisException;
 import com.example.server.service.AiService;
 import com.example.server.service.FailedAnalysisTaskService;
+import com.example.server.utils.AnalysisTaskKeys;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -19,17 +22,29 @@ public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> 
 
     private final AiService aiService;
     private final FailedAnalysisTaskService failedTaskService;
+    private final RedissonClient redissonClient;
 
     public VideoAnalysisConsumer(AiService aiService,
-                                 FailedAnalysisTaskService failedTaskService) {
+                                 FailedAnalysisTaskService failedTaskService,
+                                 RedissonClient redissonClient) {
         this.aiService = aiService;
         this.failedTaskService = failedTaskService;
+        this.redissonClient = redissonClient;
     }
 
     @Override
     public void onMessage(AnalysisTaskMsg msg) {
         Long mediaId = msg.getMediaId();
         log.info("收到分析任务, mediaId={}", mediaId);
+
+        // 内容级锁：以 contentHash 为身份，跨 mediaId 串行（同一内容只跑一次完整分析）
+        String contentHash = AnalysisTaskKeys.normalizeContentHash(mediaId, msg.getContentHash());
+        RLock lock = redissonClient.getLock(AnalysisTaskKeys.analysisLock(contentHash));
+        if (!lock.tryLock()) {
+            // 同一内容已在分析中（并发消费 / 消息重投 / 换 mediaId 重复上传），跳过，正常 ACK
+            log.info("分析任务已在执行，跳过重复消息 mediaId={} contentHash={}", mediaId, contentHash);
+            return;
+        }
 
         try {
             // 同步消费：异常在此上抛，交给 RocketMQ 按 maxReconsumeTimes 重投
@@ -49,6 +64,10 @@ public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> 
             // 未预期异常：按可重试处理，触发重投
             log.error("分析任务消费异常, mediaId={}", mediaId, e);
             throw new RuntimeException("视频分析消费异常", e);
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
 }

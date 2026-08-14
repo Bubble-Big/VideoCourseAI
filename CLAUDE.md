@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目
 
-VideoCourseAI — 视频上传（整文件 / 分片续传）→ MinIO composeObject 合并 → 提取音频 → ASR 语音转文字 → DeepSeek 智能总结 → Markdown 报告。
+VideoCourseAI — 视频上传（分片续传）→ MinIO composeObject 合并 → 提取音频 → ASR 语音转文字 → DeepSeek 智能总结 → Markdown 报告。
 Spring Boot 3.5.9 (Java 21, 端口 9090) + Vue 3 (端口 5173) + Docker 中间件。
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -23,9 +23,8 @@ cd client && npm install && npm run dev
 
 ## 核心链路
 
-### 视频上传（两套方案共存）
-- **小文件 (< 5MB)**：`POST /media/upload` → MultipartFile → MinIO 直传 → 写 DB → 返回
-- **大文件 (≥ 5MB)**：`POST /media/api/chunk/init` → (5MB 切片 × N) `POST /media/api/chunk/upload` → `POST /media/api/chunk/merge` → MinIO composeObject 服务端合并 → 计算全文件 MD5 → 写 DB → 清理分片
+### 视频上传（统一分片续传）
+- 所有文件统一走分片上传（小于 5MB 的文件只有 1 片）：`POST /media/api/chunk/init` → (5MB 切片 × N) `POST /media/api/chunk/upload` → `POST /media/api/chunk/merge` → MinIO composeObject 服务端合并 → 计算全文件 MD5 → 写 DB → 清理分片
 - 分片上传关键 Redis Key：`upload:meta:{uploadId}` (Hash, 48h TTL)、`upload:chunks:{uploadId}` (Set, 已完成序号)
 - 合并使用 Redisson 分布式锁 `lock:merge:{uploadId}` (看门狗自动续期)，幂等检查防止重复合并
 - 前端并发 3 片上传，每片 3 次指数退避重试，localStorage 持久化 uploadId 支持页面刷新后恢复

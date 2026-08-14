@@ -2,11 +2,6 @@
 
 const BASE_URL = 'http://localhost:9090'
 
-// ---- 媒体上传（小文件整文件上传） ----
-export function uploadMedia(formData) {
-  return fetch(`${BASE_URL}/media/upload`, { method: 'POST', body: formData })
-}
-
 // ---- 链接上传 ----
 export function uploadUrl(formData) {
   return fetch(`${BASE_URL}/media/upload-url`, { method: 'POST', body: formData })

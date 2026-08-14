@@ -8,7 +8,9 @@ import com.example.server.common.Result;
 import com.example.server.exception.BusinessException;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
+import com.example.server.service.RateLimitService;
 import com.example.server.strategy.AiAnalysisStrategy;
+import com.example.server.utils.AnalysisTaskKeys;
 import com.example.server.utils.FfmpegUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.FileSystemResource;
@@ -23,61 +25,56 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 
 @RestController
 @RequestMapping("/debug")
 @CrossOrigin(originPatterns = "*", allowCredentials = "true")
 public class DebugController {
 
+    /** 提交侧幂等键 TTL：秒级，只覆盖提交逻辑最坏耗时；提交成功后靠 TTL 自然过期，由 aiStatus 状态校验接管。 */
+    private static final Duration ACTIVE_TTL = Duration.ofSeconds(30);
+
     private final MediaFileMapper mediaFileMapper;
     private final AiAnalysisStrategy aiAnalysisStrategy;
     private final AiService aiService;
     private final StringRedisTemplate redisTemplate;
     private final org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate;
-    private final org.redisson.api.RedissonClient redissonClient;
+    private final RateLimitService rateLimitService;
 
     public DebugController(MediaFileMapper mediaFileMapper,
                            @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                            AiService aiService,
                            StringRedisTemplate redisTemplate,
                            org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate,
-                           org.redisson.api.RedissonClient redissonClient) {
+                           RateLimitService rateLimitService) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.aiService = aiService;
         this.redisTemplate = redisTemplate;
         this.rocketMQTemplate = rocketMQTemplate;
-        this.redissonClient = redissonClient;
+        this.rateLimitService = rateLimitService;
     }
 
-    // AI总结接口(分布式锁 + 限流 + MQ)
+    // AI总结接口(幂等键 + 限流 + MQ)
     @GetMapping("/ai")
     public Result<String> aiAnalyze(@RequestParam Long id) {
-        //【Redisson 分布式锁】防瞬时并发连点
-        String lockKey = "lock:analyze:" + id;
-        org.redisson.api.RLock lock = redissonClient.getLock(lockKey);
+        MediaFile file = mediaFileMapper.selectById(id);
+        if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在");
+
+        // 提交侧幂等键：内容级（contentHash），setIfAbsent 原子抢，抢不到直接拒（替代原 mediaId 分布式锁）
+        String contentHash = AnalysisTaskKeys.normalizeContentHash(id, file.getFileMd5());
+        String activeKey = AnalysisTaskKeys.active(contentHash);
+        Boolean accepted = redisTemplate.opsForValue().setIfAbsent(activeKey, String.valueOf(id), ACTIVE_TTL);
+        if (!Boolean.TRUE.equals(accepted)) {
+            throw new BusinessException(ErrorCode.CONFLICT, "任务提交中，请勿重复提交");
+        }
 
         try {
-            if (!lock.tryLock(0, -1, TimeUnit.SECONDS)) {
-                throw new BusinessException(ErrorCode.CONFLICT, "任务提交中，请勿重复点击");
-            }
+            // 双层限流：用户级 + 全局级（真超限 429，Redis 异常 503）
+            rateLimitService.requireAiQuota(file.getUserId());
 
-            // 全局限制每分钟只能分析 10 次 (防止费用爆炸)
-            String limitKey = "limit:ai:global";
-            org.redisson.api.RRateLimiter rateLimiter = redissonClient.getRateLimiter(limitKey);
-            //初始化：每 1 分钟产生 10 个令牌 (RateType.OVERALL 全局, OVER_CLIENT 是单机)
-            rateLimiter.trySetRate(org.redisson.api.RateType.OVERALL, 10, 1, org.redisson.api.RateIntervalUnit.MINUTES);
-
-            //尝试获取 1 个令牌
-            if (!rateLimiter.tryAcquire(1)) {
-                throw new BusinessException(ErrorCode.RATE_LIMITED, "系统繁忙，请 1 分钟后再试");
-            }
-
-            //查库校验
-            MediaFile file = mediaFileMapper.selectById(id);
-            if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在");
             String aiSt = file.getAiStatus();
             if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
                 throw new BusinessException(ErrorCode.CONFLICT, "任务已在后台运行，无需重复提交");
@@ -90,20 +87,16 @@ public class DebugController {
             String userIdKey = (file.getUserId() == null) ? "anon" : String.valueOf(file.getUserId());
             redisTemplate.delete("media:list:user:" + userIdKey);
 
-            //发送消息
-            AnalysisTaskMsg msg = new AnalysisTaskMsg(id, "START_ANALYSIS");
+            //发送消息（携带内容指纹，消费侧用 contentHash 做内容级锁 / 幂等）
+            AnalysisTaskMsg msg = new AnalysisTaskMsg(id, "START_ANALYSIS", contentHash);
             rocketMQTemplate.convertAndSend("video-analysis-topic", msg);
 
             return Result.ok("任务已投递至 RocketMQ");
 
-        } catch (InterruptedException e) {
-            // tryLock 等待锁时被中断：恢复中断标志，按内部错误处理
-            Thread.currentThread().interrupt();
-            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "任务提交被中断，请稍后重试");
-        } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
+        } catch (RuntimeException e) {
+            // 任何失败（限流超限 / 状态冲突 / 发 MQ 异常）：回滚幂等键，允许稍后重试
+            redisTemplate.delete(activeKey);
+            throw e;
         }
     }
 
@@ -117,6 +110,9 @@ public class DebugController {
         if (AiStatus.PROCESSING.name().equals(mediaFile.getTranscriptStatus())) {
             throw new BusinessException(ErrorCode.CONFLICT, "任务已在后台运行，无需重复提交");
         }
+
+        // 文字提取配额：用户级 + 全局级双层限流
+        rateLimitService.requireTranscribeQuota(mediaFile.getUserId());
 
         // 更新状态为 PROCESSING，并失效缓存让前端立即感知
         mediaFile.setTranscriptStatus(AiStatus.PROCESSING.name());
@@ -162,4 +158,5 @@ public class DebugController {
                 .contentType(MediaType.parseMediaType("audio/mpeg"))
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + encodedName)
                 .body(resource);
-    }}
+    }
+}

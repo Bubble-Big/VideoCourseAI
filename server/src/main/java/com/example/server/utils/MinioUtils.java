@@ -12,7 +12,6 @@ import io.minio.messages.DeleteObject;
 import io.minio.messages.Item;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -41,34 +40,6 @@ public class MinioUtils {
 
     /** 获取存储桶名称 */
     public String getBucketName() { return bucketName; }
-
-    /**
-     * 上传文件并返回访问 URL
-     */
-    public String uploadFile(MultipartFile file) throws Exception {
-        // 1. 生成新文件名 (UUID防止重名)
-        String originalFilename = file.getOriginalFilename();
-        String suffix = "";
-        if (originalFilename != null && originalFilename.contains(".")) {
-            suffix = originalFilename.substring(originalFilename.lastIndexOf("."));
-        }
-        String newFilename = UUID.randomUUID().toString() + suffix;
-
-        // 2. 上传到 MinIO
-        try (InputStream inputStream = file.getInputStream()) {
-            minioClient.putObject(
-                    PutObjectArgs.builder()
-                            .bucket(bucketName)
-                            .object(newFilename)
-                            .stream(inputStream, file.getSize(), -1)
-                            .contentType(file.getContentType())
-                            .build()
-            );
-        }
-
-        // 3. 拼接返回 Public 访问地址
-        return endpoint + "/" + bucketName + "/" + newFilename;
-    }
 
     /**
      * 【新增】从 MinIO 删除文件

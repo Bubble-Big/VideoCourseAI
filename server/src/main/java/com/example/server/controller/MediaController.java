@@ -11,7 +11,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
 import java.time.LocalDateTime;
@@ -51,47 +50,6 @@ public class MediaController {
         return ResponseEntity.ok(uploadId);
     }
 
-
-    @PostMapping("/upload")
-    public ResponseEntity<String> upload(@RequestParam("file") MultipartFile file,
-                                         @RequestParam(value = "userId", required = false) Long userId) {
-        if (file == null || file.isEmpty()) {
-            return ResponseEntity.badRequest().body("Upload failed: file is empty");
-        }
-        if (mediaFileMapper == null) {
-            return ResponseEntity.status(500).body("Upload failed: database not ready");
-        }
-        try {
-            System.out.println("Uploading to MinIO...");
-            String fileUrl = minioUtils.uploadFile(file);
-            System.out.println("MinIO upload success, url: " + fileUrl);
-
-            MediaFile mediaFile = new MediaFile();
-            mediaFile.setFilename(file.getOriginalFilename());
-            mediaFile.setFilePath(fileUrl);
-            mediaFile.setStatus("COMPLETED");
-            mediaFile.setUploadTime(LocalDateTime.now());
-
-            if (userId != null) {
-                mediaFile.setUserId(userId);
-            }
-
-            mediaFileMapper.insert(mediaFile);
-
-            if (userId != null) {
-                String cacheKey = "media:list:user:" + userId;
-                redisTemplate.delete(cacheKey);
-                System.out.println("Cache cleared: " + cacheKey);
-            }
-
-            return ResponseEntity.ok("Upload success");
-
-        } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.status(500).body("Upload failed: " + e.getMessage());
-        }
-    }
-
     @PostMapping("/upload-url")
     public org.springframework.http.ResponseEntity<String> uploadUrl(@RequestParam("url") String url,
                                                                      @RequestParam(value = "userId", required = false) Long userId) {
@@ -107,12 +65,32 @@ public class MediaController {
 
             tempFile = ytDlpUtils.downloadVideo(url);
 
+            String fileMd5 = mediaService.calculateMd5(tempFile);   // 先算内容指纹
+
+            // MD5 去重：同用户已有相同内容的已完成记录 → 复用旧记录，不重复上传/入库
+            if (userId != null) {
+                QueryWrapper<MediaFile> dupQuery = new QueryWrapper<>();
+                dupQuery.eq("user_id", userId)
+                        .eq("file_md5", fileMd5)
+                        .eq("status", "COMPLETED");
+                MediaFile existing = mediaFileMapper.selectOne(dupQuery);
+                if (existing != null) {
+                    // MD5 相同 → 复用旧记录，刷新上传时间并失效缓存，不重复上传 MinIO
+                    existing.setUploadTime(LocalDateTime.now());
+                    mediaFileMapper.updateById(existing);
+                    redisTemplate.delete("media:list:user:" + userId);
+                    System.out.println("MD5 去重命中，复用已有记录 mediaId=" + existing.getId());
+                    return ResponseEntity.ok("Upload success (deduplicated)");
+                }
+            }
+
             String fileUrl = minioUtils.uploadLocalFile(tempFile);
 
             MediaFile mediaFile = new MediaFile();
             mediaFile.setFilename("WEB_" + tempFile.getName());
             mediaFile.setFilePath(fileUrl);
             mediaFile.setStatus("COMPLETED");
+            mediaFile.setFileMd5(fileMd5);
             mediaFile.setUploadTime(LocalDateTime.now());
 
             if (userId != null) {

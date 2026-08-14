@@ -5,8 +5,6 @@ import { useNotice } from './useNotice.js'
 import { useMedia } from './useMedia.js'
 import * as api from '../api/index.js'
 
-const CHUNK_THRESHOLD = 5 * 1024 * 1024 // 5MB，小于此走旧整文件接口
-
 // ---- 模块级状态（单例） ----
 const file = ref(null)
 const videoUrl = ref('')
@@ -159,29 +157,7 @@ async function uploadFile() {
 
   const userId = currentUser.value ? currentUser.value.id : null
 
-  // 小于 5MB：走旧的整文件上传
-  if (file.value.size < CHUNK_THRESHOLD) {
-    message.value = '正在建立加密通道并上传数据...'
-    const formData = new FormData()
-    formData.append('file', file.value)
-    if (userId) formData.append('userId', userId)
-
-    try {
-      const res = await api.uploadMedia(formData)
-      const text = await res.text()
-      if (!res.ok) throw new Error(text || 'Upload failed')
-      showMsg('✅ 本地上传完成')
-      fetchList()
-    } catch (error) {
-      console.error(error)
-      showMsg('❌ 上传失败: ' + error.message, true)
-    } finally {
-      uploading.value = false
-    }
-    return
-  }
-
-  // 大于等于 5MB：走分片上传
+  // 所有文件统一走分片上传（小于 5MB 的小文件只有一片）
   // 场景二：检查是否存在该文件的历史上传记录（文件重新选择后自动识别）
   message.value = '正在核对已上传分片...'
   const resumeInfo = await matchUpload(file.value)
