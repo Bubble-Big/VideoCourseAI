@@ -1,28 +1,28 @@
 ---
 name: analyze-video
-description: Walk through the complete video analysis pipeline — upload a video, trigger AI summarization, and view the result.
+description: 走一遍完整的视频分析链路 —— 上传视频、触发 AI 总结、查看结果。
 ---
 
-# Analyze Video
+# 分析视频
 
-Guides the user through uploading a video and running AI analysis on it.
+引导用户上传视频并对其运行 AI 分析。
 
-## Prerequisites
+## 前置条件
 
-- Dev environment must be running (use `/start-dev`).
-- User must be logged in (register/login via the frontend at http://localhost:5173).
+- 开发环境需已启动（使用 `/start-dev`）。
+- 用户需已登录（通过前端 http://localhost:5173 注册/登录）。
 
-## Pipeline
+## 链路
 
-1. **Upload**: POST to `/media/upload` (local file) or `/media/upload-url` (Bilibili/YouTube link). Note the returned media ID.
+1. **上传**：POST 到 `/media/upload`（本地文件）或 `/media/upload-url`（Bilibili/YouTube 链接）。记下返回的 media ID。
 
-2. **Trigger AI Analysis**: `GET /debug/ai?id={mediaId}`. This is async — returns immediately after enqueuing to RocketMQ.
+2. **触发 AI 分析**：`GET /debug/ai?id={mediaId}`。这是异步的 —— 写入 RocketMQ 后立即返回。
 
-3. **Monitor**: The frontend polls `GET /media/list` every 3 seconds. Analysis is complete when `aiSummary` contains `##` (Markdown heading).
+3. **监控**：前端每 3 秒轮询 `GET /media/list`。当 `aiSummary` 包含 `##`（Markdown 标题）时分析完成。
 
-4. **View**: Results display in the sidebar panel as rendered Markdown. Transcript text is available separately.
+4. **查看**：结果以渲染后的 Markdown 显示在侧边栏面板中。转录文本单独提供。
 
-## Gotchas
+## 已知陷阱
 
-- If `aiSummary` shows `❌ AI 请求失败`, the AI API call failed and the error was written to the database. The user cannot retry from the UI — manually clear `aiSummary` in the DB to re-enable the button.
-- Analysis may take several minutes. The Redisson WatchDog keeps the distributed lock alive during long FFmpeg + AI processing.
+- 若 `aiSummary` 显示 `❌ AI 请求失败`，说明 AI API 调用失败且错误已写入数据库。用户无法从 UI 重试 —— 需在数据库中手动清空 `aiSummary` 以重新启用按钮。
+- 分析可能需要数分钟。Redisson WatchDog 在长时间的 FFmpeg + AI 处理期间保持分布式锁存活。

@@ -27,7 +27,7 @@ cd client && npm install && npm run dev
 - **小文件 (< 5MB)**：`POST /media/upload` → MultipartFile → MinIO 直传 → 写 DB → 返回
 - **大文件 (≥ 5MB)**：`POST /media/api/chunk/init` → (5MB 切片 × N) `POST /media/api/chunk/upload` → `POST /media/api/chunk/merge` → MinIO composeObject 服务端合并 → 计算全文件 MD5 → 写 DB → 清理分片
 - 分片上传关键 Redis Key：`upload:meta:{uploadId}` (Hash, 48h TTL)、`upload:chunks:{uploadId}` (Set, 已完成序号)
-- 合并使用 Redisson 分布式锁 `lock:merge:{uploadId}` (120s lease)，幂等检查防止重复合并
+- 合并使用 Redisson 分布式锁 `lock:merge:{uploadId}` (看门狗自动续期)，幂等检查防止重复合并
 - 前端并发 3 片上传，每片 3 次指数退避重试，localStorage 持久化 uploadId 支持页面刷新后恢复
 
 ### AI 异步分析

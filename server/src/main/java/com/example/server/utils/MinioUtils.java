@@ -1,7 +1,7 @@
 package com.example.server.utils;
 
-import io.minio.ComposeObjectArgs;
-import io.minio.ComposeSource;
+import io.minio.GetObjectArgs;
+import io.minio.GetObjectResponse;
 import io.minio.ListObjectsArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
@@ -15,6 +15,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -109,6 +111,32 @@ public class MinioUtils {
         return endpoint + "/" + bucketName + "/" + file.getName();
     }
 
+    /**
+     * 【新增】上传本地临时文件到 MinIO，使用 UUID + 原始文件名后缀生成唯一对象名。
+     * 用于分片合并后把本地临时文件写入 MinIO（与 DOVideoAI 流程一致）。
+     */
+    public String uploadLocalFile(java.io.File file, String originalFilename) throws Exception {
+        if (file == null || !file.isFile()) throw new IllegalArgumentException("本地文件不存在");
+        String suffix = "";
+        if (originalFilename != null && originalFilename.contains(".")) {
+            suffix = originalFilename.substring(originalFilename.lastIndexOf("."));
+        }
+        String objectName = UUID.randomUUID().toString() + suffix;
+        String contentType = Files.probeContentType(file.toPath());
+        if (contentType == null) contentType = "application/octet-stream";
+        try (java.io.FileInputStream inputStream = new java.io.FileInputStream(file)) {
+            minioClient.putObject(
+                    PutObjectArgs.builder()
+                            .bucket(bucketName)
+                            .object(objectName)
+                            .stream(inputStream, file.length(), -1)
+                            .contentType(contentType)
+                            .build()
+            );
+        }
+        return endpoint + "/" + bucketName + "/" + objectName;
+    }
+
     // ============================================================
     // 分片上传重构：新增方法
     // ============================================================
@@ -131,37 +159,6 @@ public class MinioUtils {
                         .object(objectName)
                         .stream(inputStream, size, -1)
                         .contentType("application/octet-stream")
-                        .build()
-        );
-    }
-
-    /**
-     * 【分片合并】将指定 uploadId 的所有分片在 MinIO 服务端合并为一个完整文件
-     * 使用 composeObject API，零下载带宽，最多支持 1000 个源分片
-     * @param uploadId          上传任务会话ID
-     * @param totalChunks       总分片数
-     * @param targetObjectName  合并后的目标对象名 (如 "{uuid}.mp4")
-     */
-    public void composeObjects(String uploadId, int totalChunks, String targetObjectName) throws Exception {
-        if (totalChunks > 1000) {
-            throw new IllegalArgumentException("单次合并最多支持 1000 个分片，当前: " + totalChunks);
-        }
-
-        List<ComposeSource> sources = new ArrayList<>(totalChunks);
-        for (int i = 0; i < totalChunks; i++) {
-            sources.add(
-                    ComposeSource.builder()
-                            .bucket(bucketName)
-                            .object(CHUNK_PREFIX + uploadId + "/" + i)
-                            .build()
-            );
-        }
-
-        minioClient.composeObject(
-                ComposeObjectArgs.builder()
-                        .bucket(bucketName)
-                        .object(targetObjectName)
-                        .sources(sources)
                         .build()
         );
     }
@@ -223,17 +220,21 @@ public class MinioUtils {
     }
 
     /**
-     * 【工具方法】从 MinIO 获取对象输入流(用于 MD5 计算等)
-     * @param objectName 对象名
-     * @return 对象输入流，调用方负责关闭
+     * 【分片合并】将指定对象从 MinIO 流式拷贝到输出流。
+     * 用于合并分片时逐个下载分片到本地临时文件（配合 DigestOutputStream 边写边算 MD5）。
+     * @param objectName   MinIO 对象名
+     * @param outputStream 目标输出流
      */
-    public InputStream getObjectStream(String objectName) throws Exception {
-        return minioClient.getObject(
-                io.minio.GetObjectArgs.builder()
+    public void copyObjectTo(String objectName, OutputStream outputStream) {
+        try (GetObjectResponse inputStream = minioClient.getObject(
+                GetObjectArgs.builder()
                         .bucket(bucketName)
                         .object(objectName)
-                        .build()
-        );
+                        .build())) {
+            inputStream.transferTo(outputStream);
+        } catch (Exception e) {
+            throw new IllegalStateException("MinIO 文件读取失败: " + objectName, e);
+        }
     }
 
 }

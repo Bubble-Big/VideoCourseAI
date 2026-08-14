@@ -1,34 +1,34 @@
 ---
 name: start-dev
-description: Start the full development environment — Docker middleware, backend, and frontend — for VideoCourseAI.
+description: 启动完整开发环境 —— Docker 中间件、后端、前端 —— 用于 VideoCourseAI。
 ---
 
-# Start Dev Environment
+# 启动开发环境
 
-Launch all services needed to work on VideoCourseAI locally.
+启动本地开发 VideoCourseAI 所需的全部服务。
 
-## Steps
+## 步骤
 
-1. Start Docker middleware (if not already running):
+1. 启动 Docker 中间件（若尚未运行）：
    ```bash
    docker-compose up -d
    ```
-   Wait for MySQL, Redis, MinIO, RocketMQ to be healthy (~30s).
+   等待 MySQL、Redis、MinIO、RocketMQ 健康就绪（约 30 秒）。
 
-2. Start the Spring Boot backend (terminal 1):
+2. 启动 Spring Boot 后端（终端 1）：
    ```bash
    cd server && mvn clean spring-boot:run
    ```
-   Confirm: `Started VideoCourseAIApplication in X.XXX seconds` on port 9090.
+   确认：`Started VideoCourseAIApplication in X.XXX seconds`，端口 9090。
 
-3. Start the Vue frontend (terminal 2):
+3. 启动 Vue 前端（终端 2）：
    ```bash
    cd client && npm install && npm run dev
    ```
-   Opens on http://localhost:5173.
+   打开 http://localhost:5173。
 
-## Verify
+## 验证
 
-- Backend health: `curl http://localhost:9090/media/list`
-- RocketMQ console: http://localhost:8180
-- MinIO console: http://localhost:9001 (minioadmin / minioadmin)
+- 后端健康检查：`curl http://localhost:9090/media/list`
+- RocketMQ 控制台：http://localhost:8180
+- MinIO 控制台：http://localhost:9001（minioadmin / minioadmin）

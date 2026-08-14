@@ -11,8 +11,13 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.InputStream;
+import java.io.BufferedOutputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.DigestOutputStream;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +39,7 @@ public class ChunkUploadService {
     private static final String META_KEY_PREFIX = "upload:meta:";
     private static final String CHUNKS_KEY_PREFIX = "upload:chunks:";
     private static final String LOCK_MERGE_PREFIX = "lock:merge:";
+    private static final String CHUNK_OBJECT_PREFIX = "chunks/";
     private static final long META_TTL_HOURS = 48;
 
     private final StringRedisTemplate redis;
@@ -210,8 +216,8 @@ public class ChunkUploadService {
         String lockKey = LOCK_MERGE_PREFIX + uploadId;
         RLock lock = redissonClient.getLock(lockKey);
 
-        // 1. 抢分布式锁
-        if (!lock.tryLock(0, 120, TimeUnit.SECONDS)) {
+        // 1. 抢分布式锁（无参 tryLock：leaseTime=-1，走看门狗自动续期，避免合并耗时超过 120s 后锁被提前释放）
+        if (!lock.tryLock()) {
             ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
             resp.setStatus("MERGING");
             return resp; // 已有其他线程在合并
@@ -249,21 +255,32 @@ public class ChunkUploadService {
                         "分片未集齐: 已完成 " + completedCount + "/" + totalChunks + "，缺失: " + missing);
             }
 
-            // 4. 生成最终文件名并执行 MinIO composeObject
+            // 4. 合并分片到本地临时文件，边写边算 MD5（与 DOVideoAI 一致，一次 IO 完成合并与哈希）
             String fileName = (String) meta.get("fileName");
             String suffix = "";
             if (fileName != null && fileName.contains(".")) {
                 suffix = fileName.substring(fileName.lastIndexOf("."));
             }
-            String targetObjectName = UUID.randomUUID().toString() + suffix;
 
-            minioUtils.composeObjects(uploadId, totalChunks, targetObjectName);
-            String fileUrl = minioUtils.getEndpoint() + "/" + minioUtils.getBucketName() + "/" + targetObjectName;
+            String fileMd5 = null;
+            String fileUrl = null;
+            Path mergedFile = Files.createTempFile("videocourse-merged-", suffix);
+            MessageDigest digest = md5Digest();
+            try {
+                try (OutputStream fileOutput = Files.newOutputStream(mergedFile);
+                     DigestOutputStream digestOutput = new DigestOutputStream(fileOutput, digest);
+                     BufferedOutputStream output = new BufferedOutputStream(digestOutput)) {
+                    for (int i = 0; i < totalChunks; i++) {
+                        minioUtils.copyObjectTo(chunkObjectName(uploadId, i), output);
+                    }
+                }
+                fileMd5 = HexFormat.of().formatHex(digest.digest());
+                fileUrl = minioUtils.uploadLocalFile(mergedFile.toFile(), fileName);
+            } finally {
+                Files.deleteIfExists(mergedFile);
+            }
 
-            // 4.5 计算全文件 MD5（从 MinIO 流式读取，不占用服务器磁盘）
-            String fileMd5 = computeFileMd5(targetObjectName);
-
-            // 4.6 坚持上传的去重逻辑：MD5 比对同名文件
+            // 4.5 坚持上传的去重逻辑：MD5 比对同名文件
             String finalFileName = fileName;
             boolean isForce = "1".equals(meta.get("forceUpload"));
             if (isForce && userId != null) {
@@ -370,26 +387,20 @@ public class ChunkUploadService {
     }
 
     /**
-     * 流式计算 MinIO 中已合并文件的 MD5
+     * 分片对象在 MinIO 中的对象名。
      */
-    private String computeFileMd5(String objectName) {
-        try (InputStream is = minioUtils.getObjectStream(objectName)) {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = is.read(buffer)) != -1) {
-                md.update(buffer, 0, read);
-            }
-            // 完成哈希计算
-            byte[] digest = md.digest();
-            StringBuilder sb = new StringBuilder(32);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            System.err.println("全文件 MD5 计算失败，使用空值: " + e.getMessage());
-            return null;
+    private String chunkObjectName(String uploadId, int chunkIndex) {
+        return CHUNK_OBJECT_PREFIX + uploadId + "/" + chunkIndex;
+    }
+
+    /**
+     * 获取 MD5 摘要器（与 DOVideoAI 一致，缺失时视为服务端故障，抛出异常而非静默降级）。
+     */
+    private MessageDigest md5Digest() {
+        try {
+            return MessageDigest.getInstance("MD5");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 算法不可用", e);
         }
     }
 
