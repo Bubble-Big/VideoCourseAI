@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS media_files (
     upload_time     DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间(数据库自动填充)',
     PRIMARY KEY (id),
     KEY idx_user_id (user_id),
-    KEY idx_user_md5 (user_id, file_md5)
+    KEY idx_user_md5 (user_id, file_md5),
+    KEY idx_file_md5 (file_md5)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='媒体文件表';
 
 -- ============================================================

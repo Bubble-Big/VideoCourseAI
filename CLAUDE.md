@@ -46,7 +46,7 @@ cd client && npm install && npm run dev
 
 - **统一响应体** `Result<T>` (code/message/data) + **`ErrorCode`**（含 `httpStatus` 显式映射）+ **`ApiExceptionHandler`** (@RestControllerAdvice)
 - **状态字段化**：`AiStatus` 枚举（替代「状态混在文案里」）；`AiAnalysisException(retryable)` 异常分层；失败台账 `FailedAnalysisTask`
-- **MD5 内容身份化**：`AnalysisTaskKeys`（key 集中 + `normalizeContentHash` 标准化回退 `media-{id}`）；`MediaService.contentHash(mediaId)`（Redis 缓存 `media:md5:{mediaId}` → DB `fileMd5` → 标准化）
+- **MD5 内容身份化**：`AnalysisTaskKeys`（key 集中 + `normalizeContentHash` 标准化回退 `media-{id}` + `isRealMd5` 判断）；`MediaService.contentHash(mediaId)`（Redis 缓存 `media:md5:{mediaId}` → DB `fileMd5` → 标准化）；归属复用（`analysis:completed-owner` / `analysis:context-owner`，7 天 TTL）过期后回退 DB 按 `file_md5` 反查（`idx_file_md5` 普通索引）实现持久复用
 - **双层限流**：`RateLimitService`（AI 5/30、提取 10/60，区分真超限 429 与 Redis 异常 503）
 - **Redisson 3.52.0**（原 3.23.5 与 Spring Boot 3.5.x 不兼容导致 StackOverflowError）
 

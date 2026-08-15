@@ -203,15 +203,24 @@ public class AiService {
             return mediaFile.getTranscriptText();
         }
         Long ownerMediaId = transcriptOwner(contentHash);
+        MediaFile owner = null;
         if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
-            MediaFile owner = mediaFileMapper.selectById(ownerMediaId);
-            if (isSuccessTranscript(owner)) {
-                mediaFile.setTranscriptText(owner.getTranscriptText());
-                mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-                mediaFileMapper.updateById(mediaFile);
-                return owner.getTranscriptText();
+            owner = mediaFileMapper.selectById(ownerMediaId);
+            if (!isSuccessTranscript(owner)) {
+                redisTemplate.delete(AnalysisTaskKeys.contextOwner(contentHash)); // 归属失效，清掉
+                owner = null;
             }
-            redisTemplate.delete(AnalysisTaskKeys.contextOwner(contentHash)); // 归属失效，清掉
+        }
+        // Redis 归属未命中/失效 → 回退 DB 按 file_md5 反查（归属的权威数据源是 MySQL，Redis 只是 7 天缓存）
+        if (owner == null && AnalysisTaskKeys.isRealMd5(contentHash)) {
+            owner = mediaFileMapper.selectCompletedTranscriptByMd5(contentHash, mediaFile.getId());
+        }
+        if (owner != null) {
+            mediaFile.setTranscriptText(owner.getTranscriptText());
+            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
+            mediaFileMapper.updateById(mediaFile);
+            rememberTranscriptOwner(contentHash, owner.getId()); // 回填归属缓存，下次走 Redis 快速路径
+            return owner.getTranscriptText();
         }
         return null;
     }
@@ -229,31 +238,49 @@ public class AiService {
     }
 
     /**
+     * 分析结果是否真正可用：状态为 SUCCESS 且 summary 非空。
+     * <p>与 {@link #isSuccessTranscript} 同理，不能只判非空，否则会把失败受控文案当有效结果复用。</p>
+     */
+    private boolean isSuccessAnalysis(MediaFile mediaFile) {
+        return mediaFile != null
+                && AiStatus.SUCCESS.name().equals(mediaFile.getAiStatus())
+                && mediaFile.getAiSummary() != null
+                && !mediaFile.getAiSummary().isBlank();
+    }
+
+    /**
      * 结果复用查询：本 mediaId 已有成功结果（幂等），或内容级归属可复用（换 mediaId 重复上传），返回 true；否则 false。
      */
     private boolean resolveAnalysisResult(MediaFile mediaFile, String contentHash) {
         // 本 mediaId 已有成功结果 → 幂等直接返回（MQ 重投等）
-        if (AiStatus.SUCCESS.name().equals(mediaFile.getAiStatus())
-                && mediaFile.getAiSummary() != null && !mediaFile.getAiSummary().isBlank()) {
+        if (isSuccessAnalysis(mediaFile)) {
             return true;
         }
         // 内容级归属可复用：换 mediaId 重复上传的场景
         Long ownerMediaId = analysisResultOwner(contentHash);
+        MediaFile owner = null;
         if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
-            MediaFile owner = mediaFileMapper.selectById(ownerMediaId);
-            if (owner != null && AiStatus.SUCCESS.name().equals(owner.getAiStatus())
-                    && owner.getAiSummary() != null && !owner.getAiSummary().isBlank()) {
-                mediaFile.setAiSummary(owner.getAiSummary());
-                mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-                // 转写文本一并复用（owner 分析成功必有转写）
-                if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
-                    mediaFile.setTranscriptText(owner.getTranscriptText());
-                    mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-                }
-                mediaFileMapper.updateById(mediaFile);
-                return true;
+            owner = mediaFileMapper.selectById(ownerMediaId);
+            if (!isSuccessAnalysis(owner)) {
+                redisTemplate.delete(AnalysisTaskKeys.completedOwner(contentHash)); // 归属失效，清掉
+                owner = null;
             }
-            redisTemplate.delete(AnalysisTaskKeys.completedOwner(contentHash)); // 归属失效，清掉
+        }
+        // Redis 归属未命中/失效 → 回退 DB 按 file_md5 反查（归属的权威数据源是 MySQL，Redis 只是 7 天缓存）
+        if (owner == null && AnalysisTaskKeys.isRealMd5(contentHash)) {
+            owner = mediaFileMapper.selectCompletedAnalysisByMd5(contentHash, mediaFile.getId());
+        }
+        if (owner != null) {
+            mediaFile.setAiSummary(owner.getAiSummary());
+            mediaFile.setAiStatus(AiStatus.SUCCESS.name());
+            // 转写文本一并复用（owner 分析成功必有转写）
+            if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
+                mediaFile.setTranscriptText(owner.getTranscriptText());
+                mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
+            }
+            mediaFileMapper.updateById(mediaFile);
+            rememberAnalysisResult(contentHash, owner.getId()); // 回填归属缓存，下次走 Redis 快速路径
+            return true;
         }
         return false;
     }

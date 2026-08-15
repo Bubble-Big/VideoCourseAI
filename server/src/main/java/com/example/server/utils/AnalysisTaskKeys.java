@@ -25,6 +25,11 @@ public final class AnalysisTaskKeys {
         return "media-" + mediaId;
     }
 
+    /** 判断 contentHash 是否为真实 MD5（非 media-{id} 回退值）。只有真实 MD5 才能按 file_md5 反查 DB 兜底复用。 */
+    public static boolean isRealMd5(String contentHash) {
+        return contentHash != null && MD5_PATTERN.matcher(contentHash).matches();
+    }
+
     /** 任务级分析锁：内容级，跨 mediaId 串行（同一内容只跑一次完整分析）。 */
     public static String analysisLock(String contentHash) {
         return "lock:analysis:" + contentHash;
