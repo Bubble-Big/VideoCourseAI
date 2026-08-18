@@ -77,6 +77,10 @@ public class DebugController {
             return Result.ok("任务提交中，请稍候");
         }
 
+        String userIdKey = (file.getUserId() == null) ? "anon" : String.valueOf(file.getUserId());
+        // 记录变更前的状态与旧结果，用于 MQ 投递失败时回滚，避免任务卡死在 PENDING
+        String prevAiStatus = file.getAiStatus();
+        String prevAiSummary = file.getAiSummary();
         try {
             // 双层限流：用户级 + 全局级（真超限 429，Redis 异常 503）
             rateLimitService.requireAiQuota(file.getUserId());
@@ -85,7 +89,6 @@ public class DebugController {
             file.setAiStatus(AiStatus.PENDING.name());
             file.setAiSummary(null);
             mediaFileMapper.updateById(file);
-            String userIdKey = (file.getUserId() == null) ? "anon" : String.valueOf(file.getUserId());
             redisTemplate.delete("media:list:user:" + userIdKey);
 
             //发送消息（携带内容指纹，消费侧用 contentHash 做内容级锁 / 幂等）
@@ -95,7 +98,12 @@ public class DebugController {
             return Result.ok("任务已投递至 RocketMQ");
 
         } catch (RuntimeException e) {
-            // 任何失败（限流超限 / 状态冲突 / 发 MQ 异常）：回滚幂等键，允许稍后重试
+            // 任何失败（限流超限 / 状态冲突 / 发 MQ 异常）：回滚幂等键 + 回滚 aiStatus/aiSummary，允许稍后重试。
+            // 否则发 MQ 失败后 aiStatus 已落库 PENDING，前置幂等校验会误判「任务已在运行」，任务永久卡死。
+            file.setAiStatus(prevAiStatus);
+            file.setAiSummary(prevAiSummary);
+            mediaFileMapper.updateById(file);
+            redisTemplate.delete("media:list:user:" + userIdKey);
             redisTemplate.delete(activeKey);
             throw e;
         }

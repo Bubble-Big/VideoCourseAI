@@ -50,17 +50,18 @@ public class AiService {
      * <p>成功写 SUCCESS；失败先 {@link #markFailed} 落库，再把异常上抛给消费层决定重试或收敛。</p>
      */
     public void asyncAnalyze(Long mediaId) {
-        MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
-        if (mediaFile == null) {
-            throw new AiAnalysisException("文件不存在: " + mediaId, false);
-        }
-        log.info("开始 AI 分析任务, mediaId={}", mediaId);
-
-        // 进入处理态（不删缓存，避免中间态触发多余的 DB 查询）
-        mediaFile.setAiStatus(AiStatus.PROCESSING.name());
-        mediaFileMapper.updateById(mediaFile);
-
+        MediaFile mediaFile = null;
         try {
+            mediaFile = mediaFileMapper.selectById(mediaId);
+            if (mediaFile == null) {
+                throw new AiAnalysisException("文件不存在: " + mediaId, false);
+            }
+            log.info("开始 AI 分析任务, mediaId={}", mediaId);
+
+            // 进入处理态（不删缓存，避免中间态触发多余的 DB 查询）
+            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
+            mediaFileMapper.updateById(mediaFile);
+
             String contentHash = mediaService.contentHash(mediaId);
 
             // 【结果复用】同一内容已分析完成 → 复制 summary 直接返回，不再烧 ASR + LLM
@@ -92,14 +93,16 @@ public class AiService {
             // 只有确定不再重试的失败（retryable=false）才落 FAILED；
             // 可重试失败与未预期异常保持 PROCESSING 上抛重投，重投成功后前端能看到 SUCCESS
             if (e instanceof AiAnalysisException ae && !ae.isRetryable()) {
-                markFailed(mediaFile, e);   // 永久失败，落 FAILED
+                if (mediaFile != null) {
+                    markFailed(mediaFile, e);   // 永久失败，落 FAILED（文件不存在时 mediaFile 为 null，无行可落）
+                }
                 throw ae;
             }
             if (e instanceof AiAnalysisException ae) {
-                log.warn("AI 分析瞬时失败，保持 PROCESSING 等待重投, mediaId={}, err={}", mediaFile.getId(), e.getMessage());
+                log.warn("AI 分析瞬时失败，保持 PROCESSING 等待重投, mediaId={}, err={}", mediaId, e.getMessage());
                 throw ae;
             }
-            log.error("AI 分析未预期异常，保持 PROCESSING 等待重投, mediaId={}", mediaFile.getId(), e);
+            log.error("AI 分析未预期异常，保持 PROCESSING 等待重投, mediaId={}", mediaId, e);
             throw new AiAnalysisException("AI 分析失败", true, e);
         }
     }

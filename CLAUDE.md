@@ -31,11 +31,11 @@ cd client && npm install && npm run dev
 - 前端并发 3 片上传，每片 3 次指数退避重试，localStorage 持久化 uploadId 支持页面刷新后恢复
 
 ### AI 异步分析
-提交侧 `GET /debug/ai?id={id}`：查库拿 `file` → 校验 `aiStatus`（PENDING/PROCESSING → 幂等返回成功，不重复投递）→ 提交侧幂等键 `setIfAbsent(analysis:active:{contentHash}, 30s)`（抢不到 → 幂等返回成功；失败回滚）→ 双层限流 `requireAiQuota`（用户 5 次/分 + 全局 30 次/分，真超限 429 / Redis 异常 503）→ 置 PENDING → 发 `AnalysisTaskMsg`（携带 contentHash）到 topic `video-analysis-topic` → 立即返回。
+提交侧 `GET /debug/ai?id={id}`：查库拿 `file` → 校验 `aiStatus`（PENDING/PROCESSING → 幂等返回成功，不重复投递）→ 提交侧幂等键 `setIfAbsent(analysis:active:{contentHash}, 30s)`（抢不到 → 幂等返回成功；失败回滚）→ 双层限流 `requireAiQuota`（用户 5 次/分 + 全局 30 次/分，真超限 429 / Redis 异常 503）→ 置 PENDING → 发 `AnalysisTaskMsg`（携带 contentHash）到 topic `video-analysis-topic` → 立即返回；发 MQ 失败时 catch 回滚 `aiStatus`/`aiSummary`（连同幂等键一起），避免任务卡死在 PENDING。
 
 消费侧 `VideoAnalysisConsumer`：**同步消费**（不再 runAsync 立即 ACK）→ 内容级锁 `lock:analysis:{contentHash}` `tryLock()`（抢不到静默 ACK 跳过）→ `AiService.asyncAnalyze()`：结果复用 → 转写（`lock:analysis-context:{contentHash}` + 归属复用 `analysis:context-owner:{contentHash}`）→ `generateSummaryFromText` 总结 → 写 DB → 删缓存 `media:list:user:{userId}`。
 
-**异常决策**：`AiAnalysisException(retryable)` —— 永久失败（retryable=false）写台账 `failed_analysis_task` + 正常 ACK；瞬时失败（retryable=true）上抛触发 RocketMQ 重投（`maxReconsumeTimes=2`）。
+**异常决策**：`AiAnalysisException(retryable)` —— 永久失败（retryable=false）写台账 `failed_analysis_task` + 正常 ACK；瞬时失败（retryable=true）上抛触发 RocketMQ 重投（`maxReconsumeTimes=2`）。`asyncAnalyze` 的 `selectById` + 空校验 + 首次 PROCESSING 落库均在 try 内，统一走上述异常分层（异常不绕过 `markFailed`）。
 
 **状态字段**：`aiStatus` / `transcriptStatus`（枚举 `AiStatus`：NONE/PENDING/PROCESSING/SUCCESS/FAILED），前端 3s 轮询 `GET /media/list` 按状态字段判断，不再靠文案 `includes` 猜测。
 
@@ -49,6 +49,8 @@ cd client && npm install && npm run dev
 - **MD5 内容身份化**：`AnalysisTaskKeys`（key 集中 + `normalizeContentHash` 标准化回退 `media-{id}` + `isRealMd5` 判断）；`MediaService.contentHash(mediaId)`（Redis 缓存 `media:md5:{mediaId}` → DB `fileMd5` → 标准化）；归属复用（`analysis:completed-owner` / `analysis:context-owner`，7 天 TTL）过期后回退 DB 按 `file_md5` 反查（`idx_file_md5` 普通索引）实现持久复用
 - **双层限流**：`RateLimitService`（AI 5/30、提取 10/60，区分真超限 429 与 Redis 异常 503）
 - **Redisson 3.52.0**（原 3.23.5 与 Spring Boot 3.5.x 不兼容导致 StackOverflowError）
+- **锁嵌套顺序**：固定 `lock:analysis:{contentHash}` → `lock:analysis-context:{contentHash}`；`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁
+- **幂等键生命周期**：`analysis:active:{contentHash}` 失败回滚删除、成功靠 30s TTL 自然过期（避免误删他人重设的键），重复提交由前置 `aiStatus` 校验 + 幂等键双重吞掉（均返回成功，前端轮询等待结果）
 
 ## 已知陷阱
 
@@ -56,5 +58,4 @@ cd client && npm install && npm run dev
 - **API 密钥明文** 在 [application.properties](server/src/main/resources/application.properties) 中已提交 Git。
 - **MinIO 分片生命周期**需在控制台手动配置：`http://127.0.0.1:9001` → Buckets → media → Lifecycle → Prefix `chunks/`, Expiry 2 days
 - **@RequestBody 反序列化**：因 fastjson2 对静态内部类存在兼容性问题，ChunkController 使用 `Map<String, Object>` 接收 JSON 后手动提取字段
-- **锁嵌套顺序**：固定 `lock:analysis:{contentHash}` → `lock:analysis-context:{contentHash}`；`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁
-- **幂等键生命周期**：`analysis:active:{contentHash}` 失败回滚删除、成功靠 30s TTL 自然过期（避免误删他人重设的键），重复提交由前置 `aiStatus` 校验 + 幂等键双重吞掉（均返回成功，前端轮询等待结果）
+- **AI 分析死信无人兜底**：瞬时失败（retryable=true）重投耗尽（`maxReconsumeTimes=2` = 最多 3 次投递）后消息进 RocketMQ 默认死信队列 `%DLQ%video-group`，当前**无死信消费者**，`aiStatus` 会永久卡在 PENDING/PROCESSING，前端无限转圈。需增设 DLQ 消费者（监听 `%DLQ%video-group`、独立 consumerGroup 如 `video-group-dlq`）兜底落 `FAILED`（如 `AiService.markFailedFinal`）
