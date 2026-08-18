@@ -110,6 +110,7 @@ async function transcribe(id) {
     const data = await res.json()
     if (data.code !== 0) {
       showMsg(data.message || '提交失败', true)
+      sidebar.value.content = data.message || '提交失败'
       sidebar.value.loading = false
       return
     }
@@ -156,7 +157,7 @@ async function aiAnalyze(id) {
     // 4. 检查后端返回：code 非 0 → 限流/锁/报错，任务被拒绝
     if (data.code !== 0) {
       showMsg(data.message || '提交失败', true)
-      sidebar.value.visible = false
+      sidebar.value.content = data.message || '提交失败'
       sidebar.value.loading = false
       return
     }
@@ -175,37 +176,24 @@ function startPolling(id, type) {
   if (pollingTimers.value[id]) clearInterval(pollingTimers.value[id].timer)
   console.log(`[轮询] 开始监听任务 ID: ${id}, 类型: ${type}`)
 
+  // 未启动兜底计数：连续 NONE 的轮询次数（10 轮 × 3s ≈ 30s，对齐提交侧幂等键 TTL）
+  let stalledCount = 0
+
   const timer = setInterval(async () => {
     // 1. 强制刷新列表（带时间戳防缓存）
     await fetchList()
     const item = list.value.find(i => i.id === id)
     if (!item) return
 
-    let isFinished = false
-    let result = ''
+    const st = type === 'ai' ? (item.aiStatus || 'NONE') : (item.transcriptStatus || 'NONE')
 
-    if (type === 'ai') {
-      const st = item.aiStatus || 'NONE'
-      if (st === 'SUCCESS' || st === 'FAILED') {
-        isFinished = true
-        result = item.aiSummary || ''
-      }
-    } else if (type === 'text') {
-      const st = item.transcriptStatus || 'NONE'
-      if (st === 'SUCCESS' || st === 'FAILED') {
-        isFinished = true
-        result = item.transcriptText || ''
-      }
-    }
-
-    // 2. 结算
-    if (isFinished) {
+    // 2. 终态结算
+    if (st === 'SUCCESS' || st === 'FAILED') {
       if (sidebar.value.visible && sidebar.value.id === id) {
-        sidebar.value.content = result
+        sidebar.value.content = type === 'ai' ? (item.aiSummary || '') : (item.transcriptText || '')
         sidebar.value.loading = false
       }
 
-      const st = type === 'ai' ? (item.aiStatus || 'NONE') : (item.transcriptStatus || 'NONE')
       if (st === 'FAILED') {
         showMsg("⚠️ 任务结束，但存在错误", true)
       } else {
@@ -214,14 +202,32 @@ function startPolling(id, type) {
 
       clearInterval(timer)
       delete pollingTimers.value[id]
-    } else if (sidebar.value.visible && sidebar.value.id === id) {
-      // 进行中：按状态实时刷新转圈文案
+      return
+    }
+
+    // 3. 未启动兜底：一直 NONE（未进入 PENDING/PROCESSING）→ 任务未真正启动（如并发提交失败被误报成功）
+    if (st === 'NONE') {
+      stalledCount++
+      if (stalledCount >= 10) {
+        clearInterval(timer)
+        delete pollingTimers.value[id]
+        if (sidebar.value.visible && sidebar.value.id === id) {
+          sidebar.value.content = '任务未能启动，请重试'
+          sidebar.value.loading = false
+        }
+        showMsg('⚠️ 任务未能启动，请重试', true)
+      }
+      // 未达阈值：保持「资源请求成功...」转圈，本轮不更新文案
+      return
+    }
+
+    // 4. 进行中（PENDING/PROCESSING）：清零未启动计数，按状态刷新转圈文案
+    stalledCount = 0
+    if (sidebar.value.visible && sidebar.value.id === id) {
       if (type === 'ai') {
-        const st = item.aiStatus || 'NONE'
         if (st === 'PENDING') sidebar.value.content = 'AI调用中...'
         else if (st === 'PROCESSING') sidebar.value.content = 'AI分析中...'
       } else {
-        const st = item.transcriptStatus || 'NONE'
         if (st === 'PROCESSING') sidebar.value.content = '文字转写中...'
       }
       sidebar.value.loading = true
@@ -230,11 +236,16 @@ function startPolling(id, type) {
 
   pollingTimers.value[id] = { timer, type }
 
-  // 10 分钟强制兜底停止
+  // 10 分钟强制兜底停止：触发时若侧栏仍停留在此任务，给出超时提示避免卡死转圈
   setTimeout(() => {
     if (pollingTimers.value[id]) {
       clearInterval(pollingTimers.value[id].timer)
       delete pollingTimers.value[id]
+      if (sidebar.value.visible && sidebar.value.id === id) {
+        sidebar.value.content = '任务超时未完成，请稍后重试'
+        sidebar.value.loading = false
+      }
+      showMsg('⚠️ 任务超时未完成', true)
     }
   }, 600000)
 }

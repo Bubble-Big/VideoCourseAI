@@ -61,24 +61,25 @@ public class DebugController {
     @GetMapping("/ai")
     public Result<String> aiAnalyze(@RequestParam Long id) {
         MediaFile file = mediaFileMapper.selectById(id);
-        if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在");
+        if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在，请检查后重试");
 
-        // 提交侧幂等键：内容级（contentHash），setIfAbsent 原子抢，抢不到直接拒（替代原 mediaId 分布式锁）
+        // 幂等：任务已在后台运行 → 不重复投递，返回成功让前端轮询等待结果
+        String aiSt = file.getAiStatus();
+        if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
+            return Result.ok("任务已在后台运行");
+        }
+
+        // 提交侧幂等键：内容级（contentHash），setIfAbsent 原子抢；抢不到说明并发提交中，吞掉重复投递
         String contentHash = AnalysisTaskKeys.normalizeContentHash(id, file.getFileMd5());
         String activeKey = AnalysisTaskKeys.active(contentHash);
         Boolean accepted = redisTemplate.opsForValue().setIfAbsent(activeKey, String.valueOf(id), ACTIVE_TTL);
         if (!Boolean.TRUE.equals(accepted)) {
-            throw new BusinessException(ErrorCode.CONFLICT, "任务提交中，请勿重复提交");
+            return Result.ok("任务提交中，请稍候");
         }
 
         try {
             // 双层限流：用户级 + 全局级（真超限 429，Redis 异常 503）
             rateLimitService.requireAiQuota(file.getUserId());
-
-            String aiSt = file.getAiStatus();
-            if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
-                throw new BusinessException(ErrorCode.CONFLICT, "任务已在后台运行，无需重复提交");
-            }
 
             //更新状态：投递 MQ 进入 PENDING；清空旧结果避免残留
             file.setAiStatus(AiStatus.PENDING.name());
@@ -104,11 +105,11 @@ public class DebugController {
     @GetMapping("/transcribe")
     public Result<String> transcribe(@RequestParam Long id) {
         MediaFile mediaFile = mediaFileMapper.selectById(id);
-        if (mediaFile == null) throw new BusinessException(ErrorCode.NOT_FOUND, "找不到文件记录");
+        if (mediaFile == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在，请检查后重试");
 
-        // 防重复提交：正在提取时直接拒绝
+        // 幂等：正在提取时不重复提交，返回成功让前端轮询等待结果
         if (AiStatus.PROCESSING.name().equals(mediaFile.getTranscriptStatus())) {
-            throw new BusinessException(ErrorCode.CONFLICT, "任务已在后台运行，无需重复提交");
+            return Result.ok("任务已在后台运行");
         }
 
         // 文字提取配额：用户级 + 全局级双层限流

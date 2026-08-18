@@ -288,10 +288,16 @@ VideoCourseAI-main/
 前端点击 "AI智能总结" ──► GET /debug/ai?id={mediaId}
                               │
                               ▼
+                    ┌─ 校验 aiStatus ───────────┐
+                    │ PENDING/PROCESSING         │
+                    │ → 幂等返回成功（不重复投递） │
+                    └────────┬──────────────────┘
+                             │ 非运行中
+                             ▼
                     ┌─ 提交侧幂等键 ────────────┐
                     │ setIfAbsent(analysis:      │
                     │   active:{contentHash})    │
-                    │ (30s TTL, 抢不到 409)      │
+                    │ (30s TTL, 抢不到→返回成功)  │
                     └────────┬──────────────────┘
                              │ 获取成功
                              ▼
@@ -300,11 +306,6 @@ VideoCourseAI-main/
                     │ (真超限 429 / Redis 异常 503)│
                     └────────┬──────────────────┘
                              │ 获取令牌成功
-                             ▼
-                    ┌─ 校验 aiStatus ───────────┐
-                    │ PENDING/PROCESSING → 409  │
-                    └────────┬──────────────────┘
-                             │
                              ▼
                     ┌─ 置 PENDING ─────────────┐
                     │ 发送 AnalysisTaskMsg      │
@@ -435,7 +436,7 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | `upload:meta:{uploadId}` | Hash | 48 小时 | 分片上传元数据 (fileName, fileSize, totalChunks, userId, status, forceUpload, createdAt, mediaId) |
 | `upload:chunks:{uploadId}` | Set | 48 小时 | 已完成分片序号集合 |
 | `lock:merge:{uploadId}` | Redisson RLock | WatchDog | 分片合并分布式锁（按会话） |
-| `analysis:active:{contentHash}` | String (SET NX) | 30s | 提交侧幂等键，抢不到 409，失败回滚 |
+| `analysis:active:{contentHash}` | String (SET NX) | 30s | 提交侧幂等键，抢不到→返回成功，失败回滚 |
 | `lock:analysis:{contentHash}` | Redisson RLock | WatchDog | 消费侧内容级分析锁 |
 | `lock:analysis-context:{contentHash}` | Redisson RLock | WatchDog | 内容级转写锁 |
 | `analysis:context-owner:{contentHash}` | String | 7 天 | 转写结果归属（跨 mediaId 复用转写文本） |
@@ -648,7 +649,7 @@ contentHash = normalizeContentHash(mediaId, fileMd5)   // 合法 MD5 小写；�
 - **赛博朋克风格**：自定义 CSS 变量、SVG 噪点背景、霓虹绿 (#c5f946) 主题色
 - **响应式状态**：Vue 3 Composition API (`ref`, `computed`, `watch`, `onMounted`)
 - **Markdown 渲染**：`marked` 库解析 AI 返回的总结内容
-- **轮询机制**：3秒间隔轮询后端 `/media/list`，按 `aiStatus` / `transcriptStatus` 状态字段判断完成（SUCCESS/FAILED 结算，PENDING/PROCESSING 持续转圈），10分钟强制超时兜底
+- **轮询机制**：3秒间隔轮询后端 `/media/list`，按 `aiStatus` / `transcriptStatus` 状态字段判断（SUCCESS/FAILED 结算，PENDING/PROCESSING 持续转圈）；连续 NONE 未启动约 30s 判定「任务未能启动」，10 分钟兜底判定「任务超时未完成」
 
 ### 10.2 前端功能模块
 

@@ -1,9 +1,10 @@
 package com.example.server.service;
 
+import java.time.Duration;
+
 import com.example.server.common.ErrorCode;
 import com.example.server.exception.BusinessException;
 import org.redisson.api.RRateLimiter;
-import org.redisson.api.RateIntervalUnit;
 import org.redisson.api.RateType;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
@@ -35,33 +36,33 @@ public class RateLimitService {
     /** AI 分析配额：用户级 + 全局级双层。超限抛 RATE_LIMITED，Redis 异常抛 SERVICE_UNAVAILABLE。 */
     public void requireAiQuota(Long userId) {
         tryAcquire("limit:ai:user:", "limit:ai:global",
-                AI_USER_PER_MINUTE, AI_GLOBAL_PER_MINUTE, userId);
+                AI_USER_PER_MINUTE, AI_GLOBAL_PER_MINUTE, userId, "AI 分析");
     }
 
     /** 文字提取配额：用户级 + 全局级双层。 */
     public void requireTranscribeQuota(Long userId) {
         tryAcquire("limit:transcribe:user:", "limit:transcribe:global",
-                TRANSCRIBE_USER_PER_MINUTE, TRANSCRIBE_GLOBAL_PER_MINUTE, userId);
+                TRANSCRIBE_USER_PER_MINUTE, TRANSCRIBE_GLOBAL_PER_MINUTE, userId, "文字提取");
     }
 
     private void tryAcquire(String userKeyPrefix, String globalKey,
-                            int userRate, int globalRate, Long userId) {
+                            int userRate, int globalRate, Long userId, String label) {
         try {
             RRateLimiter userLimiter = redissonClient.getRateLimiter(userKeyPrefix + uid(userId));
-            userLimiter.trySetRate(RateType.OVERALL, userRate, 1, RateIntervalUnit.MINUTES);
+            userLimiter.trySetRate(RateType.OVERALL, userRate, Duration.ofMinutes(1));
             if (!userLimiter.tryAcquire()) {
-                throw new BusinessException(ErrorCode.RATE_LIMITED, "AI 请求过于频繁，请稍后再试");
+                throw new BusinessException(ErrorCode.RATE_LIMITED, label + "请求过于频繁，请稍后再试");
             }
             RRateLimiter globalLimiter = redissonClient.getRateLimiter(globalKey);
-            globalLimiter.trySetRate(RateType.OVERALL, globalRate, 1, RateIntervalUnit.MINUTES);
+            globalLimiter.trySetRate(RateType.OVERALL, globalRate, Duration.ofMinutes(1));
             if (!globalLimiter.tryAcquire()) {
                 throw new BusinessException(ErrorCode.RATE_LIMITED, "系统繁忙，请稍后再试");
             }
         } catch (BusinessException e) {
             throw e; // 真超限，原样抛出
         } catch (RuntimeException e) {
-            log.warn("ai_rate_limiter_unavailable userId={}", userId, e);
-            throw new BusinessException(ErrorCode.SERVICE_UNAVAILABLE, "AI 服务限流器暂不可用，请稍后再试");
+            log.warn("rate_limiter_unavailable label={} userId={}", label, userId, e);
+            throw new BusinessException(ErrorCode.SERVICE_UNAVAILABLE, label + "限流器暂不可用，请稍后再试");
         }
     }
 

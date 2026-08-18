@@ -31,7 +31,7 @@ cd client && npm install && npm run dev
 - 前端并发 3 片上传，每片 3 次指数退避重试，localStorage 持久化 uploadId 支持页面刷新后恢复
 
 ### AI 异步分析
-提交侧 `GET /debug/ai?id={id}`：查库拿 `contentHash` → 提交侧幂等键 `setIfAbsent(analysis:active:{contentHash}, 30s)`（抢不到 409，失败回滚）→ 双层限流 `requireAiQuota`（用户 5 次/分 + 全局 30 次/分，真超限 429 / Redis 异常 503）→ 校验 `aiStatus`（PENDING/PROCESSING → 409）→ 置 PENDING → 发 `AnalysisTaskMsg`（携带 contentHash）到 topic `video-analysis-topic` → 立即返回。
+提交侧 `GET /debug/ai?id={id}`：查库拿 `file` → 校验 `aiStatus`（PENDING/PROCESSING → 幂等返回成功，不重复投递）→ 提交侧幂等键 `setIfAbsent(analysis:active:{contentHash}, 30s)`（抢不到 → 幂等返回成功；失败回滚）→ 双层限流 `requireAiQuota`（用户 5 次/分 + 全局 30 次/分，真超限 429 / Redis 异常 503）→ 置 PENDING → 发 `AnalysisTaskMsg`（携带 contentHash）到 topic `video-analysis-topic` → 立即返回。
 
 消费侧 `VideoAnalysisConsumer`：**同步消费**（不再 runAsync 立即 ACK）→ 内容级锁 `lock:analysis:{contentHash}` `tryLock()`（抢不到静默 ACK 跳过）→ `AiService.asyncAnalyze()`：结果复用 → 转写（`lock:analysis-context:{contentHash}` + 归属复用 `analysis:context-owner:{contentHash}`）→ `generateSummaryFromText` 总结 → 写 DB → 删缓存 `media:list:user:{userId}`。
 
@@ -40,7 +40,7 @@ cd client && npm install && npm run dev
 **状态字段**：`aiStatus` / `transcriptStatus`（枚举 `AiStatus`：NONE/PENDING/PROCESSING/SUCCESS/FAILED），前端 3s 轮询 `GET /media/list` 按状态字段判断，不再靠文案 `includes` 猜测。
 
 ### 文字提取
-`GET /debug/transcribe?id={id}` → 双层限流 `requireTranscribeQuota`（用户 10 次/分 + 全局 60 次/分）→ 置 PROCESSING → `@Async` 提交 `aiTaskExecutor`（核心4/最大8/队列100）→ `transcribeWithReuse`（内容级转写锁 + 归属复用，同一内容只 ASR 一次）。`@Async` 一次性任务无 MQ 消费层，失败只落 `FAILED` + 受控文案，不上抛不重试。
+`GET /debug/transcribe?id={id}` → 校验 `transcriptStatus`（PROCESSING → 幂等返回成功，不重复提交）→ 双层限流 `requireTranscribeQuota`（用户 10 次/分 + 全局 60 次/分）→ 置 PROCESSING → `@Async` 提交 `aiTaskExecutor`（核心4/最大8/队列100）→ `transcribeWithReuse`（内容级转写锁 + 归属复用，同一内容只 ASR 一次）。`@Async` 一次性任务无 MQ 消费层，失败只落 `FAILED` + 受控文案，不上抛不重试。
 
 ## 新增架构组件
 
@@ -57,4 +57,4 @@ cd client && npm install && npm run dev
 - **MinIO 分片生命周期**需在控制台手动配置：`http://127.0.0.1:9001` → Buckets → media → Lifecycle → Prefix `chunks/`, Expiry 2 days
 - **@RequestBody 反序列化**：因 fastjson2 对静态内部类存在兼容性问题，ChunkController 使用 `Map<String, Object>` 接收 JSON 后手动提取字段
 - **锁嵌套顺序**：固定 `lock:analysis:{contentHash}` → `lock:analysis-context:{contentHash}`；`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁
-- **幂等键生命周期**：`analysis:active:{contentHash}` 失败回滚删除、成功靠 30s TTL 自然过期（避免误删他人重设的键），后续由 `aiStatus` 状态校验接管
+- **幂等键生命周期**：`analysis:active:{contentHash}` 失败回滚删除、成功靠 30s TTL 自然过期（避免误删他人重设的键），重复提交由前置 `aiStatus` 校验 + 幂等键双重吞掉（均返回成功，前端轮询等待结果）
