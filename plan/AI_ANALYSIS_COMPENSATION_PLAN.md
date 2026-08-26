@@ -1,6 +1,6 @@
 # AI 分析补偿式重试改造计划书（消费线程解耦 + DB 状态机定时补偿）
 
-> 状态：**拟实施 / 待评审**（最后更新 2026-08-25）。
+> 状态：**已实施**（最后更新 2026-08-27，含 SQL 迁移已执行 + 编译通过）。
 >
 > 本计划解决的问题：`VideoAnalysisConsumer` 同步消费把 15 分钟级长任务（FFmpeg + ASR + DeepSeek）压在 RocketMQ 监听线程上，导致消费线程被长时间占用、并发失控。改造目标是把「触发」与「执行/重试」解耦。
 
@@ -419,3 +419,29 @@ CLAUDE.md / ARCHITECTURE.md                    # 同步「同步消费 → 触�
 6. `VideoAnalysisDlqConsumer` + `application.properties` 参数。
 7. 编译验证（`compile-server`）+ 按「六、验证方式」回归。
 8. 同步 `CLAUDE.md` / `ARCHITECTURE.md`。
+
+---
+
+## 十、实施记录（相对原计划的关键偏离）
+
+改造已全部落地：8 步实施完成、`mvn compile` 通过、`V4` 迁移已手动执行到 `mysql-media` 容器并验证字段。以下是实际实施与原计划的关键偏离：
+
+| # | 偏离 | 说明 |
+|---|------|------|
+| 1 | 补偿调度器「重试耗尽」分支内联落 FAILED，不走 `markFailedFinal` | 计划书写 `markFailedFinal(f.getId())`；实际在 `compensateOne` 内直接 `setAiStatus(FAILED)+updateById+record`，避免重复 `selectById`。`markFailedFinal` 仅保留给 DLQ 消费者用 |
+| 2 | 补偿参数用 `@Value` 读取配置（带默认值），非纯代码常量 | 计划书示例用常量；实际 `thresholdMinutes`/`maxAttempts` 用 `@Value("${ai.compensation.xxx:默认}")`，`application.properties` 显式配置，缺省也能跑 |
+| 3 | 「扫描间隔」未做成可配置 | 计划书提到「阈值/上限/扫描间隔可配」；实际扫描间隔 `fixedDelay=60_000` 硬编码在 `@Scheduled`，仅阈值和上限可配 |
+| 4 | 单轮扫描上限抽成 `SCAN_LIMIT=100` 常量 | 计划书里硬编码 `selectStalledAnalysis(threshold, 100)` |
+| 5 | 编译期修复一处类型错误 | `failedTaskService.record(mediaId, e)` 的 `e` 为 `Exception` 无法转 `AiAnalysisException`，改为传模式变量 `ae`（`if (e instanceof AiAnalysisException ae ...)` 内） |
+| 6 | `application.properties` 补偿配置段用英文注释 | 该文件编码非 UTF-8，中文注释会乱码，故用英文 |
+
+**验证情况**：
+
+- ✅ 编译通过：`mvn -q -DskipTests compile` 无报错。
+- ✅ SQL 迁移已执行：`SHOW COLUMNS` 确认 `ai_process_at`(datetime NULL)、`ai_attempts`(int NOT NULL default 0) 已加入 `media_files`。
+- ⏳ 运行时链路回归尚未跑：提交→SUCCESS、瞬时失败补偿重试、重试耗尽落 FAILED 三条链路，建议用 `analyze-video` 或调短 `ai.compensation.threshold-minutes` 自测。
+
+**文档同步**：
+
+- `CLAUDE.md` 4 处：消费侧「快进快出」、异常决策改「补偿式重试」、新增架构组件、已知陷阱「死信兜底」。
+- `ARCHITECTURE.md` 13 处：架构图、时序图、异常分层表、锁表、重试说明、生产者-消费者模式、文件清单、总结等。

@@ -185,7 +185,7 @@ VideoCourseAI-main/
     ┌──────────┐                           ┌────────▼────────┐
     │  MinIO   │                           │ VideoAnalysis   │
     │ :9000    │◄──── 文件上传 ────────────│ Consumer        │
-    │ 对象存储  │                           │ (同步消费+内容级锁│
+    │ 对象存储  │                           │ (触发派发+内容级锁│
     └──────────┘                           │  + 失败台账)     │
                                            └────────┬────────┘
                                                     │
@@ -316,14 +316,15 @@ VideoCourseAI-main/
                              ▼
           ┌─────────────────────────────────────┐
           │     VideoAnalysisConsumer           │
-          │     同步消费（异常上抛触发重投）      │
-          │  tryLock(lock:analysis:{contentHash})│
-          │  抢不到 → 静默 ACK 跳过              │
+          │  触发派发（@Async 提交线程池后 ACK） │
+          │  队列满 → 吞异常，交补偿兜底         │
           └────────────────┬────────────────────┘
-                           │
+                           │ @Async
                            ▼
           ┌─────────────────────────────────────┐
           │        AiService.asyncAnalyze()      │
+          │  tryLock(lock:analysis:{contentHash})│
+          │  抢不到 → 跳过（执行时防并发兜底）    │
           │  0. 结果复用(completed-owner)         │
           │  1. 转写(transcribeWithReuse)         │
           │     内容级锁 + 归属复用               │
@@ -331,12 +332,16 @@ VideoCourseAI-main/
           │  3. 写 aiStatus=SUCCESS / markFailed  │
           │  4. 删 Redis 用户列表缓存             │
           └────────────────┬────────────────────┘
-                           │ 异常上抛 → 消费层决策
+                           │ 异常内部消化
                     ┌──────┴────────┐
                     ▼               ▼
               retryable=false   retryable=true
-              写台账 + ACK     上抛 → RocketMQ 重投
-              (maxReconsumeTimes=2)
+              落 FAILED + 台账   保持 PROCESSING
+                               + 刷新 ai_process_at
+                                   │
+                                   ▼
+                    AnalysisCompensationScheduler（每 1min）
+                    扫卡死记录：ai_attempts<3 重新触发 / >=3 落 FAILED
                            │
                            ▼
               前端 3秒轮询 aiStatus ──► 侧边栏展示 Markdown
@@ -359,12 +364,12 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | L1 工具层 | `DeepSeekUtils` / `AliyunAsrUtils` | 模型级 3 次重试 + 语义化抛 `AiAnalysisException(retryable)` |
 | L2 策略层 | `AliyunDeepSeekStrategy` | 编排 FFmpeg/ASR/DeepSeek，异常透传 |
 | L3 服务层 | `AiService` | 状态机落库（SUCCESS/markFailed）+ 异常继续上抛 |
-| L4 消费层 | `VideoAnalysisConsumer` | 最终决策：永久失败 → 台账 + ACK；瞬时失败 → 上抛重投 |
+| L4 消费层 | `VideoAnalysisConsumer` | 只做触发派发 + ACK，异常决策下沉到 `AiService` + `AnalysisCompensationScheduler` |
 | L5 Controller | `DebugController` | 统一 `Result` + `BusinessException` |
 
 **关键文件**：
 - `DebugController.java:60-101` — AI 分析入口（幂等键 + 双层限流 + 发 MQ）
-- `VideoAnalysisConsumer.java:35-72` — MQ 消费者（内容级锁 + 异常决策）
+- `VideoAnalysisConsumer.java` — MQ 消费者（触发派发 + ACK，异常决策下沉）
 - `AiService.java:52-105` — 异步分析核心逻辑（状态机 + 结果/转写复用）
 - `AiService.java:154-179` — 转写复用 `transcribeWithReuse`（内容级锁 + 归属复用）
 - `AliyunDeepSeekStrategy.java:29-74` — FFmpeg + ASR + 总结策略实现
@@ -437,7 +442,7 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | `upload:chunks:{uploadId}` | Set | 48 小时 | 已完成分片序号集合 |
 | `lock:merge:{uploadId}` | Redisson RLock | WatchDog | 分片合并分布式锁（按会话） |
 | `analysis:active:{contentHash}` | String (SET NX) | 30s | 提交侧幂等键，抢不到→返回成功，失败回滚 |
-| `lock:analysis:{contentHash}` | Redisson RLock | WatchDog | 消费侧内容级分析锁 |
+| `lock:analysis:{contentHash}` | Redisson RLock | WatchDog | 执行侧内容级分析锁（`asyncAnalyze` 内） |
 | `lock:analysis-context:{contentHash}` | Redisson RLock | WatchDog | 内容级转写锁 |
 | `analysis:context-owner:{contentHash}` | String | 7 天 | 转写结果归属（跨 mediaId 复用转写文本） |
 | `analysis:completed-owner:{contentHash}` | String | 7 天 | 分析结果归属（跨 mediaId 复用 summary） |
@@ -448,7 +453,7 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 
 **Topic**: `video-analysis-topic`  
 **ConsumerGroup**: `video-group`  
-**重试**: `maxReconsumeTimes=2`（2 次重投 = 最多 3 次投递，耗尽进默认 `%DLQ%`）  
+**重试**: 补偿式重试（`AnalysisCompensationScheduler` 扫卡死记录重新触发，`ai_attempts` 上限 3）；`maxReconsumeTimes=2` 仅作消息异常防御  
 **消息体** (`AnalysisTaskMsg.java`):
 ```java
 {
@@ -482,17 +487,17 @@ AiAnalysisStrategy (接口)
 ```
 DebugController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consumer)
                                                │
-                                          同步消费
+                                        触发派发（@Async）
                                                │
                                       AiService.asyncAnalyze()
 ```
 
 - **解耦**：Controller 发送消息后立即返回，耗时分析异步进行
-- **削峰填谷**：MQ 缓冲任务，消费侧内容级锁串行（同一内容只跑一次）
-- **同步消费**：异常在 `onMessage` 内上抛，交给 RocketMQ 按 `maxReconsumeTimes=2` 重投（替代原 `CompletableFuture.runAsync` 立即 ACK 吞异常）
-- **文件**：`DebugController.java`, `VideoAnalysisConsumer.java`
+- **削峰填谷**：MQ 缓冲任务，消费线程快进快出（只派发不执行），执行在 `aiTaskExecutor`
+- **补偿式重试**：失败不靠 MQ 重投，瞬时失败保持 PROCESSING + 刷新 `ai_process_at`，由 `AnalysisCompensationScheduler` 定时扫卡死记录重试（`ai_attempts` 上限 3）
+- **文件**：`DebugController.java`, `VideoAnalysisConsumer.java`, `AnalysisCompensationScheduler.java`
 
-> 注：`aiTaskExecutor` 线程池（核心4/最大8/队列100）现仅用于 `@Async` 的文字提取 `asyncTranscribe`，不再承接 MQ 消费。
+> 注：`aiTaskExecutor` 线程池（核心4/最大8/队列100，拒绝策略 `AbortPolicy`）同时承接 AI 分析 `asyncAnalyze` 与文字提取 `asyncTranscribe` 两个 `@Async` 任务。
 
 ### 7.3 缓存策略 (Cache-Aside)
 
@@ -507,7 +512,7 @@ DebugController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consum
 
 ```
 提交侧：setIfAbsent("analysis:active:" + contentHash, 30s)   // 幂等键，非 RLock
-消费侧：tryLock("lock:analysis:" + contentHash)               // 内容级锁，看门狗
+执行侧：tryLock("lock:analysis:" + contentHash)               // 内容级锁，看门狗（asyncAnalyze 内）
 转写侧：tryLock("lock:analysis-context:" + contentHash)       // 内容级转写锁
 ```
 
@@ -515,7 +520,7 @@ DebugController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consum
 - **提交侧用幂等键**：秒级 TTL + 失败回滚，替代原 mediaId RLock（防重复点击）
 - **WatchDog 机制**：长耗时任务（AI 调用可达数分钟）自动续期，防止锁过期释放
 - **锁嵌套顺序**：`lock:analysis` → `lock:analysis-context`，`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁
-- **文件**：`DebugController.java:66-72`, `VideoAnalysisConsumer.java:41-47`, `AiService.java:154-179`
+- **文件**：`DebugController.java`（提交侧幂等键）, `AiService.java`（asyncAnalyze 内容级锁 + transcribeWithReuse 转写锁）
 
 ### 7.5 令牌桶限流 (双层)
 
@@ -526,7 +531,7 @@ AI 分析：  limit:ai:user:{userId} (5/分)  + limit:ai:global (30/分)
 
 - **双层**：用户级 + 全局级，防止单用户刷爆配额 + 整体费用爆炸
 - **真超限 vs 异常**：真超限抛 `RATE_LIMITED`(429)；Redis 异常抛 `SERVICE_UNAVAILABLE`(503)，由 `ApiExceptionHandler` 按 `ErrorCode.httpStatus` 映射
-- **限流在提交侧（准入）**，锁在消费侧（执行互斥），身份统一为 contentHash
+- **限流在提交侧（准入）**，锁在执行侧（`asyncAnalyze` 内互斥），身份统一为 contentHash
 - **文件**：`RateLimitService.java`
 
 ### 7.6 统一响应体 (Result<T>)
@@ -779,7 +784,9 @@ rocketmq.producer.group=video-analysis-group
 | `service/AiService.java` | 300 | 异步 AI 分析（状态机 + 内容复用） |
 | `service/RateLimitService.java` | 71 | 双层令牌桶限流 (新增) |
 | `service/FailedAnalysisTaskService.java` | 44 | 失败台账服务（record） (新增) |
-| `consumer/VideoAnalysisConsumer.java` | 73 | RocketMQ 消费者（同步消费 + 内容级锁） |
+| `service/AnalysisCompensationScheduler.java` | 76 | 补偿式重试调度器（扫卡死记录重新触发/落失败） (新增) |
+| `consumer/VideoAnalysisConsumer.java` | 38 | RocketMQ 消费者（触发派发 + ACK） |
+| `consumer/VideoAnalysisDlqConsumer.java` | 33 | AI 分析死信兜底（落 FAILED） (新增) |
 | `exception/BusinessException.java` | 20 | 业务异常 (新增) |
 | `exception/AiAnalysisException.java` | 27 | 带 retryable 标志的 AI 异常 (新增) |
 | `strategy/AiAnalysisStrategy.java` | 26 | AI 分析策略接口 |
@@ -787,7 +794,7 @@ rocketmq.producer.group=video-analysis-group
 | `dto/AnalysisTaskMsg.java` | 30 | RocketMQ 消息体（+contentHash） |
 | `dto/ChunkUploadDTO.java` | 116 | 分片上传请求/响应 DTO (新增) |
 | `entity/User.java` | 27 | 用户实体 |
-| `entity/MediaFile.java` | 35 | 媒体文件实体（+file_size/md5/ai_status/transcript_status） |
+| `entity/MediaFile.java` | 37 | 媒体文件实体（+file_size/md5/ai_status/transcript_status/ai_process_at/ai_attempts） |
 | `entity/FailedAnalysisTask.java` | 26 | AI 失败台账实体 (新增) |
 | `mapper/UserMapper.java` | 9 | 用户 DAO |
 | `mapper/MediaFileMapper.java` | 9 | 媒体文件 DAO |
@@ -828,7 +835,7 @@ rocketmq.producer.group=video-analysis-group
 
 VideoCourseAI 是一个设计思路清晰的 **视频 + AI 异步处理平台**，核心亮点在于：
 
-1. **全链路异步化**：通过 RocketMQ + 同步消费 + 状态字段化，将长耗时的 AI 分析从主请求链路剥离，失败可重投、可台账
+1. **全链路异步化**：通过 RocketMQ + 触发派发（消费线程快进快出）+ 状态字段化 + 补偿式重试，将长耗时的 AI 分析从主请求链路剥离，失败可补偿、可台账
 2. **分片上传 + 断点续传**：5MB 固定切片，本地合并（`DigestOutputStream` 边写边算 MD5），Redis 维护上传状态；双场景续传（内存 File 横幅一键继续 + 文件指纹匹配自动恢复）；三层去重（init 轻量提示 + force 坚持上传 MD5 比对 + merge 精确 MD5）
 3. **内容身份化**：以 MD5 作为视频内容指纹（contentHash），锁 / 幂等 / 复用全链路以 contentHash 为身份，实现跨 mediaId / 跨用户的串行化与复用
 4. **分布式防护**：Redisson 分布式锁 (3.52.0) + 提交侧幂等键 + 双层令牌桶限流（真超限 429 / Redis 异常 503）

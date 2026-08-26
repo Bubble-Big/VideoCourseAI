@@ -25,9 +25,9 @@ public class ThreadPoolConfig {
         // 4. 线程名称前缀：方便在日志里看是谁干的活
         executor.setThreadNamePrefix("AI-Thread-");
 
-        // 5. 拒绝策略：如果队伍排满了(100个)，还有新任务咋办？
-        // CallerRunsPolicy: 让发任务的老板(主线程)自己去干，别把任务扔了。
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        // 5. 拒绝策略：队列排满（100）后新任务直接抛异常，由调用方捕获处理。
+        // 不用 CallerRunsPolicy：它会把任务回退到调用线程（MQ 监听线程）同步执行，重新阻塞监听线程。
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
 
         executor.initialize();
         return executor;

@@ -16,6 +16,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -32,25 +33,37 @@ public class AiService {
     private final StringRedisTemplate redisTemplate;
     private final RedissonClient redissonClient;
     private final MediaService mediaService;
+    private final FailedAnalysisTaskService failedTaskService;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                      StringRedisTemplate redisTemplate,
                      RedissonClient redissonClient,
-                     MediaService mediaService) {
+                     MediaService mediaService,
+                     FailedAnalysisTaskService failedTaskService) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.redisTemplate = redisTemplate;
         this.redissonClient = redissonClient;
         this.mediaService = mediaService;
+        this.failedTaskService = failedTaskService;
     }
 
     /**
-     * AI 分析：落库保证前端可见 + 异常上抛保证 MQ 可决策（两者解耦）。
-     * <p>成功写 SUCCESS；失败先 {@link #markFailed} 落库，再把异常上抛给消费层决定重试或收敛。</p>
+     * AI 分析（@Async 异步执行）：落库保证前端可见 + 异常内部消化。
+     * <p>成功写 SUCCESS；永久失败落 FAILED + 台账；瞬时失败保持 PROCESSING + 刷新时间戳，
+     * 由 {@code AnalysisCompensationScheduler} 定时补偿重试（不再上抛给 MQ 重投）。</p>
      */
+    @Async("aiTaskExecutor")
     public void asyncAnalyze(Long mediaId) {
         MediaFile mediaFile = null;
+        // ① 内容级锁：从消费层移到这里（执行在异步线程，锁跟随执行线程）
+        String contentHash = mediaService.contentHash(mediaId);
+        RLock lock = redissonClient.getLock(AnalysisTaskKeys.analysisLock(contentHash));
+        if (!lock.tryLock()) {
+            log.info("分析任务已在执行，跳过 mediaId={} contentHash={}", mediaId, contentHash);
+            return;   // 同一内容已在跑（并发触发 / 补偿重复），跳过
+        }
         try {
             mediaFile = mediaFileMapper.selectById(mediaId);
             if (mediaFile == null) {
@@ -58,11 +71,10 @@ public class AiService {
             }
             log.info("开始 AI 分析任务, mediaId={}", mediaId);
 
-            // 进入处理态（不删缓存，避免中间态触发多余的 DB 查询）
+            // ② 进入处理态：只置 PROCESSING + 刷新时间戳（ai_attempts 由补偿触发侧统一 +1，这里不计数）
             mediaFile.setAiStatus(AiStatus.PROCESSING.name());
+            mediaFile.setAiProcessAt(LocalDateTime.now());
             mediaFileMapper.updateById(mediaFile);
-
-            String contentHash = mediaService.contentHash(mediaId);
 
             // 【结果复用】同一内容已分析完成 → 复制 summary 直接返回，不再烧 ASR + LLM
             if (resolveAnalysisResult(mediaFile, contentHash)) {
@@ -90,21 +102,41 @@ public class AiService {
             log.info("AI 分析完成, mediaId={}", mediaId);
 
         } catch (Exception e) {
-            // 只有确定不再重试的失败（retryable=false）才落 FAILED；
-            // 可重试失败与未预期异常保持 PROCESSING 上抛重投，重投成功后前端能看到 SUCCESS
+            // @Async 隔离了异常传播，异常不再能抛回消费层，必须内部消化：
+            // 永久失败落 FAILED + 台账；瞬时失败保持 PROCESSING + 刷新时间戳，交补偿重试
             if (e instanceof AiAnalysisException ae && !ae.isRetryable()) {
                 if (mediaFile != null) {
                     markFailed(mediaFile, e);   // 永久失败，落 FAILED（文件不存在时 mediaFile 为 null，无行可落）
                 }
-                throw ae;
+                failedTaskService.record(mediaId, ae);
+                return;
+            }
+            if (mediaFile != null) {
+                // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
+                mediaFile.setAiStatus(AiStatus.PROCESSING.name());
+                mediaFile.setAiProcessAt(LocalDateTime.now());
+                mediaFileMapper.updateById(mediaFile);
             }
             if (e instanceof AiAnalysisException ae) {
-                log.warn("AI 分析瞬时失败，保持 PROCESSING 等待重投, mediaId={}, err={}", mediaId, e.getMessage());
-                throw ae;
+                failedTaskService.record(mediaId, ae);
             }
-            log.error("AI 分析未预期异常，保持 PROCESSING 等待重投, mediaId={}", mediaId, e);
-            throw new AiAnalysisException("AI 分析失败", true, e);
+            log.warn("AI 分析瞬时失败，保持 PROCESSING 等待补偿重试, mediaId={}, err={}", mediaId, e.getMessage());
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
+    }
+
+    /**
+     * 落失败（供补偿调度器 / DLQ 兜底调用）：绕过可重试判断，直接写 FAILED + 受控文案。
+     */
+    public void markFailedFinal(Long mediaId) {
+        MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
+        if (mediaFile == null) {
+            return;
+        }
+        markFailed(mediaFile, new AiAnalysisException("重试耗尽，判定失败", false));
     }
 
     /**

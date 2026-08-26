@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS media_files (
     transcript_text TEXT         DEFAULT NULL COMMENT '语音转写全文',
     cover_url       VARCHAR(1024) DEFAULT NULL COMMENT '封面URL',
     upload_time     DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间(数据库自动填充)',
+    ai_process_at   DATETIME     DEFAULT NULL COMMENT '最近一次 AI 分析尝试时间',
+    ai_attempts     INT          NOT NULL DEFAULT 0 COMMENT 'AI 分析已尝试次数',
     PRIMARY KEY (id),
     KEY idx_user_id (user_id),
     KEY idx_user_md5 (user_id, file_md5),

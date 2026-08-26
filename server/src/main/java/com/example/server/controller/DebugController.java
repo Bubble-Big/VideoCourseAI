@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.UUID;
 
 @RestController
@@ -85,9 +86,11 @@ public class DebugController {
             // 双层限流：用户级 + 全局级（真超限 429，Redis 异常 503）
             rateLimitService.requireAiQuota(file.getUserId());
 
-            //更新状态：投递 MQ 进入 PENDING；清空旧结果避免残留
+            //更新状态：投递 MQ 进入 PENDING；清空旧结果避免残留；记录首次触发时间 + 重置尝试计数
             file.setAiStatus(AiStatus.PENDING.name());
             file.setAiSummary(null);
+            file.setAiProcessAt(LocalDateTime.now());
+            file.setAiAttempts(0);
             mediaFileMapper.updateById(file);
             redisTemplate.delete("media:list:user:" + userIdKey);
 

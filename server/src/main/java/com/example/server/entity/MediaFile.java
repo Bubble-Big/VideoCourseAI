@@ -32,4 +32,8 @@ public class MediaFile {
 
     //上传时间由数据库自动记录，Java 不插手，防止报错
     private LocalDateTime uploadTime;
+
+    // AI 分析补偿式重试：最近一次尝试时间 + 已尝试次数（见 plan/AI_ANALYSIS_COMPENSATION_PLAN.md）
+    private LocalDateTime aiProcessAt;
+    private Integer aiAttempts;
 }
