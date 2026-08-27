@@ -72,7 +72,8 @@ public class AnalysisCompensationScheduler {
             f.setAiStatus(AiStatus.FAILED.name());
             f.setAiSummary("❌ 分析失败，请稍后重试");
             mediaFileMapper.updateById(f);
-            failedTaskService.record(f.getId(), new AiAnalysisException("重试耗尽，判定失败", false));
+            failedTaskService.record(f.getId(), new AiAnalysisException("重试耗尽，判定失败", false),
+                    f.getAiAttempts() == null ? 0 : f.getAiAttempts());
             log.warn("分析任务重试耗尽，落失败, mediaId={}", f.getId());
             return;
         }

@@ -2,6 +2,7 @@ package com.example.server.utils;
 
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
+import com.example.server.common.AiFailStage;
 import com.example.server.exception.AiAnalysisException;
 import okhttp3.*;
 import org.slf4j.Logger;
@@ -39,7 +40,7 @@ public class AliyunAsrUtils {
 
     public String audioToText(String filePath) {
         File file = new File(filePath);
-        if (!file.exists()) throw new AiAnalysisException("音频文件不存在: " + filePath, false);
+        if (!file.exists()) throw new AiAnalysisException("音频文件不存在: " + filePath, false, AiFailStage.FILE);
 
         int maxRetries = 3; // 最大重试次数
         String lastError = "";
@@ -86,7 +87,7 @@ public class AliyunAsrUtils {
                             continue;
                         } else {
                             // 如果是 400/401 等客户端错误，直接抛出不重试
-                            throw new AiAnalysisException("ASR 识别失败: " + lastError, false);
+                            throw new AiAnalysisException("ASR 识别失败: " + lastError, false, AiFailStage.ASR);
                         }
                     }
                 }
@@ -100,6 +101,6 @@ public class AliyunAsrUtils {
             }
         }
 
-        throw new AiAnalysisException("ASR 最终失败（已重试 3 次）: " + lastError, true);
+        throw new AiAnalysisException("ASR 最终失败（已重试 3 次）: " + lastError, true, AiFailStage.ASR);
     }
 }

@@ -1,5 +1,6 @@
 package com.example.server.strategy.impl;
 
+import com.example.server.common.AiFailStage;
 import com.example.server.exception.AiAnalysisException;
 import com.example.server.strategy.AiAnalysisStrategy;
 import com.example.server.utils.AliyunAsrUtils;
@@ -45,12 +46,12 @@ public class AliyunDeepSeekStrategy implements AiAnalysisStrategy {
 
     private String processVideoToText(String inputPath) {
         //简单检查
-        if (inputPath == null || inputPath.isEmpty()) throw new AiAnalysisException("视频路径为空", false);
+        if (inputPath == null || inputPath.isEmpty()) throw new AiAnalysisException("视频路径为空", false, AiFailStage.FILE);
 
         //如果是本地路径且不存在，报错；如果是 http 链接，跳过检查直接交给 FFmpeg
         if (!inputPath.startsWith("http")) {
             File localFile = new File(inputPath);
-            if (!localFile.exists()) throw new AiAnalysisException("磁盘找不到文件: " + inputPath, false);
+            if (!localFile.exists()) throw new AiAnalysisException("磁盘找不到文件: " + inputPath, false, AiFailStage.FILE);
         }
 
         //准备临时 MP3 路径 (放在系统临时目录下)
@@ -61,7 +62,7 @@ public class AliyunDeepSeekStrategy implements AiAnalysisStrategy {
 
             // 3. 提取音频 (FFmpeg 原生支持 HTTP URL，这里直接传进去)
             boolean success = FfmpegUtils.extractAudio(inputPath, outputMp3Path);
-            if (!success) throw new AiAnalysisException("FFmpeg 提取音频失败", true);
+            if (!success) throw new AiAnalysisException("FFmpeg 提取音频失败", true, AiFailStage.FFMPEG);
 
             // 4. 语音转文字
             String text = aliyunAsrUtils.audioToText(outputMp3Path);

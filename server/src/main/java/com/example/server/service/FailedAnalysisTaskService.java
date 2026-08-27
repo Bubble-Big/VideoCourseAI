@@ -22,13 +22,20 @@ public class FailedAnalysisTaskService {
         this.failedAnalysisTaskMapper = failedAnalysisTaskMapper;
     }
 
-    public void record(Long mediaId, AiAnalysisException e) {
+    /**
+     * 记录一次失败：errorType 落失败阶段（ASR/LLM/FFMPEG/...），attempts 落真实补偿重试次数。
+     *
+     * @param mediaId  关联媒体
+     * @param e        携带失败阶段语义的异常
+     * @param attempts 补偿重试次数（0=首次失败未重试，N=补偿重试 N 次）
+     */
+    public void record(Long mediaId, AiAnalysisException e, int attempts) {
         try {
             FailedAnalysisTask task = new FailedAnalysisTask();
             task.setMediaId(mediaId);
-            task.setErrorType(e.getClass().getSimpleName());
+            task.setErrorType(e.getStage().name());
             task.setErrorMsg(truncate(e.getMessage()));
-            task.setAttempts(1);
+            task.setAttempts(attempts);
             failedAnalysisTaskMapper.insert(task);
         } catch (Exception ex) {
             log.warn("失败台账写入失败, mediaId={}, err={}", mediaId, ex.getMessage());

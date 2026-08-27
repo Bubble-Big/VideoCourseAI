@@ -19,8 +19,8 @@ public class FailedAnalysisTask {
     private Long id;
 
     private Long mediaId;          // 关联 media_files.id
-    private String errorType;      // 异常类型（AiAnalysisException / Exception 等）
+    private String errorType;      // 失败阶段（AiFailStage：ASR/LLM/FFMPEG/FILE/LOCK/UNKNOWN）
     private String errorMsg;       // 错误摘要（受控，不含堆栈）
-    private Integer attempts;      // 累计投递次数
+    private Integer attempts;      // 补偿重试次数（0=首次失败未重试，N=补偿重试 N 次）
     private LocalDateTime createdAt; // 首次失败时间（数据库自动填充）
 }

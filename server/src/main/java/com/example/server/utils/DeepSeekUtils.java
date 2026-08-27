@@ -3,6 +3,7 @@ package com.example.server.utils;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
+import com.example.server.common.AiFailStage;
 import com.example.server.exception.AiAnalysisException;
 import okhttp3.*;
 import org.slf4j.Logger;
@@ -142,14 +143,14 @@ public class DeepSeekUtils {
                         JSONArray choices = jsonObject.getJSONArray("choices");
                         if (choices == null || choices.isEmpty()) {
                             // 200 却无 choices：确定性异常（被过滤/模型配置问题），判永久失败避免整链路重跑 3 次
-                            throw new AiAnalysisException("DeepSeek 响应无有效内容", false);
+                            throw new AiAnalysisException("DeepSeek 响应无有效内容", false, AiFailStage.LLM);
                         }
                         String content = choices.getJSONObject(0)
                                 .getJSONObject("message")
                                 .getString("content");
                         if (content == null || content.isBlank()) {
                             // 输入文本已非空，空 content 属服务侧确定性异常，判永久失败避免整链路重跑 3 次
-                            throw new AiAnalysisException("DeepSeek 响应无有效内容", false);
+                            throw new AiAnalysisException("DeepSeek 响应无有效内容", false, AiFailStage.LLM);
                         }
                         return content;
                     } else {
@@ -162,7 +163,7 @@ public class DeepSeekUtils {
                             Thread.sleep(2000);
                             continue;
                         } else {
-                            throw new AiAnalysisException("DeepSeek 请求被拒绝: " + lastError, false);
+                            throw new AiAnalysisException("DeepSeek 请求被拒绝: " + lastError, false, AiFailStage.LLM);
                         }
                     }
                 }
@@ -176,6 +177,6 @@ public class DeepSeekUtils {
             }
         }
 
-        throw new AiAnalysisException("DeepSeek 请求失败，已重试 " + maxRetries + " 次: " + lastError, true);
+        throw new AiAnalysisException("DeepSeek 请求失败，已重试 " + maxRetries + " 次: " + lastError, true, AiFailStage.LLM);
     }
 }

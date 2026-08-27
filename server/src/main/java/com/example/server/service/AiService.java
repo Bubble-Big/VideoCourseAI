@@ -1,5 +1,6 @@
 package com.example.server.service;
 
+import com.example.server.common.AiFailStage;
 import com.example.server.common.AiStatus;
 import com.example.server.entity.MediaFile;
 import com.example.server.exception.AiAnalysisException;
@@ -72,7 +73,7 @@ public class AiService {
         try {
             mediaFile = mediaFileMapper.selectById(mediaId);
             if (mediaFile == null) {
-                throw new AiAnalysisException("文件不存在: " + mediaId, false);
+                throw new AiAnalysisException("文件不存在: " + mediaId, false, AiFailStage.FILE);
             }
             log.info("开始 AI 分析任务, mediaId={}", mediaId);
 
@@ -91,7 +92,7 @@ public class AiService {
             // 1. 语音转文字：内容级锁 + 归属复用（同一内容只真正转写一次）
             String text = transcribeWithReuse(mediaFile, contentHash, true);
             if (text == null) {
-                throw new AiAnalysisException("等待转写锁超时，稍后重试", true);
+                throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
             }
             mediaFile.setTranscriptText(text);
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
@@ -124,7 +125,7 @@ public class AiService {
                 if (mediaFile != null) {
                     markFailed(mediaFile, e);   // 永久失败，落 FAILED（文件不存在时 mediaFile 为 null，无行可落）
                 }
-                failedTaskService.record(mediaId, ae);
+                failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
                 return;
             }
             if (mediaFile != null) {
@@ -134,7 +135,7 @@ public class AiService {
                 mediaFileMapper.updateById(mediaFile);
             }
             if (e instanceof AiAnalysisException ae) {
-                failedTaskService.record(mediaId, ae);
+                failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
             }
             log.warn("AI 分析瞬时失败，保持 PROCESSING 等待补偿重试, mediaId={}, err={}", mediaId, e.getMessage());
         } finally {
@@ -369,6 +370,13 @@ public class AiService {
         mediaFileMapper.updateById(mediaFile);
         evictCache(mediaFile);
         log.error("AI 分析失败, mediaId={}, err={}", mediaFile.getId(), e.getMessage(), e);
+    }
+
+    /**
+     * 台账 attempts 取值：直传补偿重试次数（首次失败未重试为 0），文件不存在时兜底 0。
+     */
+    private int attemptsOf(MediaFile mediaFile) {
+        return mediaFile == null || mediaFile.getAiAttempts() == null ? 0 : mediaFile.getAiAttempts();
     }
 
     /**
