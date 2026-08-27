@@ -27,6 +27,11 @@ public class AiService {
     /** 等待别人转写完成的窗口（分析依赖转写结果做总结，可等待；独立转写不等待）。 */
     private static final long CONTEXT_LOCK_WAIT_SECONDS = 300;
 
+    /** 无语音内容时的转写受控文案（前端文字提取直接展示）。 */
+    private static final String NO_SPEECH_TRANSCRIPT = "视频未提取到有效语音信息";
+    /** 无语音内容时的分析受控文案（前端 AI 分析直接展示）。 */
+    private static final String NO_SPEECH_SUMMARY = "视频未提取到有效信息，无法分析";
+
     private final MediaFileMapper mediaFileMapper;
     private final AiAnalysisStrategy aiAnalysisStrategy;
     // 【关键】必须注入 Redis 工具！
@@ -90,6 +95,17 @@ public class AiService {
             }
             mediaFile.setTranscriptText(text);
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
+
+            if (NO_SPEECH_TRANSCRIPT.equals(text)) {
+                // 无语音内容：跳过 LLM，直接落受控总结文案
+                mediaFile.setAiSummary(NO_SPEECH_SUMMARY);
+                mediaFile.setAiStatus(AiStatus.SUCCESS.name());
+                mediaFileMapper.updateById(mediaFile);
+                rememberAnalysisResult(contentHash, mediaFile.getId());
+                evictCache(mediaFile);
+                log.info("视频无语音内容，跳过 LLM, mediaId={}", mediaId);
+                return;
+            }
 
             // 2. 智能总结：复用已转写文本，避免重复提取音频 + ASR
             String summary = aiAnalysisStrategy.generateSummaryFromText(text);
@@ -200,6 +216,9 @@ public class AiService {
 
             // 抢到锁且无归属：真正转写一次
             String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
+            if (text == null || text.isBlank()) {
+                text = NO_SPEECH_TRANSCRIPT;   // 无语音：算成功，落受控文案
+            }
             mediaFile.setTranscriptText(text);
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
             mediaFileMapper.updateById(mediaFile);

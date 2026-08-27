@@ -141,13 +141,15 @@ public class DeepSeekUtils {
                         JSONObject jsonObject = JSON.parseObject(resultJson);
                         JSONArray choices = jsonObject.getJSONArray("choices");
                         if (choices == null || choices.isEmpty()) {
-                            throw new AiAnalysisException("DeepSeek 响应无有效内容", true);
+                            // 200 却无 choices：确定性异常（被过滤/模型配置问题），判永久失败避免整链路重跑 3 次
+                            throw new AiAnalysisException("DeepSeek 响应无有效内容", false);
                         }
                         String content = choices.getJSONObject(0)
                                 .getJSONObject("message")
                                 .getString("content");
                         if (content == null || content.isBlank()) {
-                            throw new AiAnalysisException("DeepSeek 响应无有效内容", true);
+                            // 输入文本已非空，空 content 属服务侧确定性异常，判永久失败避免整链路重跑 3 次
+                            throw new AiAnalysisException("DeepSeek 响应无有效内容", false);
                         }
                         return content;
                     } else {

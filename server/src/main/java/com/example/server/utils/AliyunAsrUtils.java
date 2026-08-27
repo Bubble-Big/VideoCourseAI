@@ -68,7 +68,9 @@ public class AliyunAsrUtils {
                         JSONObject jsonObject = JSON.parseObject(resultJson);
                         String text = jsonObject.getString("text");
                         if (text == null || text.isBlank()) {
-                            throw new AiAnalysisException("ASR 返回空文本", true);
+                            // 无语音内容：返回空串（成功但无内容），由上层落库受控文案并短路 LLM
+                            log.info("🎤 [ASR] 未识别到语音内容，返回空文本");
+                            return "";
                         }
                         return text;
                     } else {
