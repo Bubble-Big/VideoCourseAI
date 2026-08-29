@@ -12,6 +12,7 @@ import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -40,19 +41,23 @@ public class AiService {
     private final RedissonClient redissonClient;
     private final MediaService mediaService;
     private final FailedAnalysisTaskService failedTaskService;
+    /** 分析锁等待时长（秒）：抢不到锁时阻塞等待首个持锁任务完成以便复用结果，对齐 ASR readTimeout，非无限等待。 */
+    private final long analysisLockWaitSeconds;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                      StringRedisTemplate redisTemplate,
                      RedissonClient redissonClient,
                      MediaService mediaService,
-                     FailedAnalysisTaskService failedTaskService) {
+                     FailedAnalysisTaskService failedTaskService,
+                     @Value("${ai.analysis-lock-wait-seconds:600}") long analysisLockWaitSeconds) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.redisTemplate = redisTemplate;
         this.redissonClient = redissonClient;
         this.mediaService = mediaService;
         this.failedTaskService = failedTaskService;
+        this.analysisLockWaitSeconds = analysisLockWaitSeconds;
     }
 
     /**
@@ -66,9 +71,18 @@ public class AiService {
         // ① 内容级锁：从消费层移到这里（执行在异步线程，锁跟随执行线程）
         String contentHash = mediaService.contentHash(mediaId);
         RLock lock = redissonClient.getLock(AnalysisTaskKeys.analysisLock(contentHash));
-        if (!lock.tryLock()) {
-            log.info("分析任务已在执行，跳过 mediaId={} contentHash={}", mediaId, contentHash);
-            return;   // 同一内容已在跑（并发触发 / 补偿重复），跳过
+        boolean locked;
+        try {
+            // 抢不到锁则阻塞等待首个持锁任务完成（最多 analysisLockWaitSeconds），复用其结果，避免 20 分钟补偿延迟
+            locked = lock.tryLock(analysisLockWaitSeconds, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("等待分析锁被中断，跳过 mediaId={} contentHash={}", mediaId, contentHash);
+            return;   // 被中断等同让位，交补偿兜底
+        }
+        if (!locked) {
+            log.info("等待分析锁超时，跳过 mediaId={} contentHash={}", mediaId, contentHash);
+            return;   // 超时仍抢不到才放弃，交补偿兜底
         }
         try {
             mediaFile = mediaFileMapper.selectById(mediaId);
