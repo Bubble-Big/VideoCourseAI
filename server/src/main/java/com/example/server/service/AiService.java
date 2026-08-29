@@ -91,20 +91,20 @@ public class AiService {
             }
             log.info("开始 AI 分析任务, mediaId={}", mediaId);
 
-            // ② 进入处理态：只置 PROCESSING + 刷新时间戳（ai_attempts 由补偿触发侧统一 +1，这里不计数）
-            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
-            mediaFile.setAiProcessAt(LocalDateTime.now());
-            mediaFileMapper.updateById(mediaFile);
-
-            // 【结果复用】同一内容已分析完成 → 复制 summary 直接返回，不再烧 ASR + LLM
+            // 【结果复用】先查复用（用 selectById 读到的原始状态判断幂等，此时 aiStatus 尚未被覆盖）
             if (resolveAnalysisResult(mediaFile, contentHash)) {
                 evictCache(mediaFile);
                 log.info("AI 分析结果复用, mediaId={} contentHash={}", mediaId, contentHash);
                 return;
             }
 
+            // ② 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳（ai_attempts 由补偿触发侧统一 +1，这里不计数）
+            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
+            mediaFile.setAiProcessAt(LocalDateTime.now());
+            mediaFileMapper.updateById(mediaFile);
+
             // 1. 语音转文字：内容级锁 + 归属复用（同一内容只真正转写一次）
-            String text = transcribeWithReuse(mediaFile, contentHash, true);
+            String text = transcribeWithReuse(mediaFile, contentHash);
             if (text == null) {
                 throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
             }
@@ -183,12 +183,15 @@ public class AiService {
         log.info("开始全文提取任务, mediaId={}", mediaId);
 
         try {
-            // 内容级锁 + 归属复用：同一内容只转写一次；抢不到锁且无归属可复用则跳过
+            // 内容级锁 + 归属复用：同一内容只转写一次；抢不到锁则等待他人转写完成后复用（对齐 AI 分析）
             String contentHash = mediaService.contentHash(mediaId);
-            String text = transcribeWithReuse(mediaFile, contentHash, false);
+            String text = transcribeWithReuse(mediaFile, contentHash);
             if (text == null) {
-                // 没抢到内容级锁且无归属可复用：别人正在转写，跳过；结果最终落库，前端轮询可见
-                log.info("同一内容已在转写中，跳过 mediaId={} contentHash={}", mediaId, contentHash);
+                // 等待转写锁超时仍未复用：回滚到 NONE 允许重试，避免永久卡 PROCESSING
+                mediaFile.setTranscriptStatus(AiStatus.NONE.name());
+                mediaFileMapper.updateById(mediaFile);
+                evictCache(mediaFile);
+                log.info("等待转写锁超时，回滚待重试, mediaId={} contentHash={}", mediaId, contentHash);
                 return;
             }
             // transcribeWithReuse 内部已落库 transcriptText / transcriptStatus 并登记归属
@@ -214,16 +217,13 @@ public class AiService {
      *
      * @param mediaFile   目标记录
      * @param contentHash 内容指纹
-     * @param wait        true=等待别人转写完成（分析链路，依赖转写结果）；false=不等待（独立转写链路）
-     * @return 转写文本；null 表示未抢到锁且无归属可复用（别人正在转写）
+     * @return 转写文本；null 表示等待转写锁超时且无归属可复用
      */
-    private String transcribeWithReuse(MediaFile mediaFile, String contentHash, boolean wait) {
+    private String transcribeWithReuse(MediaFile mediaFile, String contentHash) {
         RLock lock = redissonClient.getLock(AnalysisTaskKeys.contextLock(contentHash));
         boolean locked = false;
         try {
-            locked = wait
-                    ? lock.tryLock(CONTEXT_LOCK_WAIT_SECONDS, TimeUnit.SECONDS)
-                    : lock.tryLock();
+            locked = lock.tryLock(CONTEXT_LOCK_WAIT_SECONDS, TimeUnit.SECONDS);
             // 无论是否抢到锁都先查归属：已有人完成则直接复用
             String reusable = resolveTranscript(mediaFile, contentHash);
             if (reusable != null) return reusable;
