@@ -69,16 +69,16 @@ public class RateLimitService {
 
     private void tryAcquire(String userKeyPrefix, String globalKey, int userRate, Long userId, String label) {
         try {
+            // 全局级：先校验系统繁忙（rate 已在 @PostConstruct 预置），拒绝时不消耗用户配额
+            RRateLimiter globalLimiter = redissonClient.getRateLimiter(globalKey);
+            if (!globalLimiter.tryAcquire()) {
+                throw new BusinessException(ErrorCode.RATE_LIMITED, "系统繁忙，请稍后再试");
+            }
             // 用户级：key 动态，懒初始化；setRate 强制覆盖保证改配置立即生效
             RRateLimiter userLimiter = redissonClient.getRateLimiter(userKeyPrefix + uid(userId));
             userLimiter.setRate(RateType.OVERALL, userRate, Duration.ofMinutes(1));
             if (!userLimiter.tryAcquire()) {
                 throw new BusinessException(ErrorCode.RATE_LIMITED, label + "请求过于频繁，请稍后再试");
-            }
-            // 全局级：rate 已在 @PostConstruct 预置，这里只消费令牌
-            RRateLimiter globalLimiter = redissonClient.getRateLimiter(globalKey);
-            if (!globalLimiter.tryAcquire()) {
-                throw new BusinessException(ErrorCode.RATE_LIMITED, "系统繁忙，请稍后再试");
             }
         } catch (BusinessException e) {
             throw e; // 真超限，原样抛出

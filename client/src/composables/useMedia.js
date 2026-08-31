@@ -86,7 +86,7 @@ async function transcribe(id) {
   // 1. 已完成（成功/失败）→ 直接显示结果
   if (st === 'SUCCESS' || st === 'FAILED') {
     openSidebar('text', '全量文字提取', id)
-    sidebar.value.content = item.transcriptText || ''
+    sidebar.value.content = st === 'FAILED' ? '❌ 提取失败，请稍后重试' : (item.transcriptText || '')
     sidebar.value.loading = false
     return
   }
@@ -130,7 +130,7 @@ async function aiAnalyze(id) {
   // 1. 已完成（成功/失败）→ 直接显示结果
   if (st === 'SUCCESS' || st === 'FAILED') {
     openSidebar('ai', 'AI 智能总结', id)
-    sidebar.value.content = item.aiSummary || ''
+    sidebar.value.content = st === 'FAILED' ? '❌ 分析失败，请稍后重试' : (item.aiSummary || '')
     sidebar.value.loading = false
     return
   }
@@ -190,7 +190,9 @@ function startPolling(id, type) {
     // 2. 终态结算
     if (st === 'SUCCESS' || st === 'FAILED') {
       if (sidebar.value.visible && sidebar.value.id === id) {
-        sidebar.value.content = type === 'ai' ? (item.aiSummary || '') : (item.transcriptText || '')
+        sidebar.value.content = st === 'FAILED'
+          ? (type === 'ai' ? '❌ 分析失败，请稍后重试' : '❌ 提取失败，请稍后重试')
+          : (type === 'ai' ? (item.aiSummary || '') : (item.transcriptText || ''))
         sidebar.value.loading = false
       }
 

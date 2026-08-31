@@ -70,7 +70,7 @@ public class AnalysisCompensationScheduler {
         if (attempts >= maxAttempts) {
             // 重试耗尽 → 落 FAILED + 台账
             f.setAiStatus(AiStatus.FAILED.name());
-            f.setAiSummary("❌ 分析失败，请稍后重试");
+            f.setAiSummary(null); // 失败不塞文案
             mediaFileMapper.updateById(f);
             failedTaskService.record(f.getId(), new AiAnalysisException("重试耗尽，判定失败", false),
                     f.getAiAttempts() == null ? 0 : f.getAiAttempts());

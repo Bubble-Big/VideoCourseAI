@@ -26,9 +26,6 @@ public class AiService {
 
     private static final Logger log = LoggerFactory.getLogger(AiService.class);
 
-    /** 等待别人转写完成的窗口（分析依赖转写结果做总结，可等待；独立转写不等待）。 */
-    private static final long CONTEXT_LOCK_WAIT_SECONDS = 300;
-
     /** 无语音内容时的转写受控文案（前端文字提取直接展示）。 */
     private static final String NO_SPEECH_TRANSCRIPT = "视频未提取到有效语音信息";
     /** 无语音内容时的分析受控文案（前端 AI 分析直接展示）。 */
@@ -43,6 +40,8 @@ public class AiService {
     private final FailedAnalysisTaskService failedTaskService;
     /** 分析锁等待时长（秒）：抢不到锁时阻塞等待首个持锁任务完成以便复用结果，对齐 ASR readTimeout，非无限等待。 */
     private final long analysisLockWaitSeconds;
+    /** 转写锁等待时长（秒）：抢不到转写锁时阻塞等待他人转写完成以便复用结果，对齐 ASR readTimeout。 */
+    private final long contextLockWaitSeconds;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
@@ -50,7 +49,8 @@ public class AiService {
                      RedissonClient redissonClient,
                      MediaService mediaService,
                      FailedAnalysisTaskService failedTaskService,
-                     @Value("${ai.analysis-lock-wait-seconds:600}") long analysisLockWaitSeconds) {
+                     @Value("${ai.analysis-lock-wait-seconds:600}") long analysisLockWaitSeconds,
+                     @Value("${ai.transcribe-lock-wait-seconds:600}") long contextLockWaitSeconds) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.redisTemplate = redisTemplate;
@@ -58,6 +58,7 @@ public class AiService {
         this.mediaService = mediaService;
         this.failedTaskService = failedTaskService;
         this.analysisLockWaitSeconds = analysisLockWaitSeconds;
+        this.contextLockWaitSeconds = contextLockWaitSeconds;
     }
 
     /**
@@ -200,9 +201,9 @@ public class AiService {
 
         } catch (Exception e) {
             log.error("全文提取失败, mediaId={}, err={}", mediaId, e.getMessage(), e);
-            // 失败写状态字段 + 受控文案（不泄漏堆栈），不上抛（@Async 无消费层）
+            // 失败只置状态字段，不塞失败文案进内容字段（由前端按状态渲染）
             mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
-            mediaFile.setTranscriptText("❌ 提取失败，请稍后重试");
+            mediaFile.setTranscriptText(null);
             mediaFileMapper.updateById(mediaFile);
             evictCache(mediaFile);
         }
@@ -223,7 +224,7 @@ public class AiService {
         RLock lock = redissonClient.getLock(AnalysisTaskKeys.contextLock(contentHash));
         boolean locked = false;
         try {
-            locked = lock.tryLock(CONTEXT_LOCK_WAIT_SECONDS, TimeUnit.SECONDS);
+            locked = lock.tryLock(contextLockWaitSeconds, TimeUnit.SECONDS);
             // 无论是否抢到锁都先查归属：已有人完成则直接复用
             String reusable = resolveTranscript(mediaFile, contentHash);
             if (reusable != null) return reusable;
@@ -275,7 +276,12 @@ public class AiService {
         MediaFile owner = null;
         if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
             owner = mediaFileMapper.selectById(ownerMediaId);
-            if (!isSuccessTranscript(owner)) {
+            // 仅当归属真正失效才清除：记录被删 / 转写 FAILED / 文本为空。
+            // PROCESSING（重转写中）但旧文本仍在时保留归属，复用旧结果，避免误删 + 额外 ASR。
+            if (owner == null
+                    || AiStatus.FAILED.name().equals(owner.getTranscriptStatus())
+                    || owner.getTranscriptText() == null
+                    || owner.getTranscriptText().isBlank()) {
                 redisTemplate.delete(AnalysisTaskKeys.contextOwner(contentHash)); // 归属失效，清掉
                 owner = null;
             }
@@ -376,7 +382,7 @@ public class AiService {
      */
     private void markFailed(MediaFile mediaFile, Exception e) {
         mediaFile.setAiStatus(AiStatus.FAILED.name());
-        mediaFile.setAiSummary("❌ 分析失败，请稍后重试");
+        mediaFile.setAiSummary(null); // 失败不塞文案，由前端按状态渲染
         // 若转写阶段尚未成功（即失败发生在 transcribe），同步置 FAILED，避免与 aiStatus 不一致
         if (!AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())) {
             mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
