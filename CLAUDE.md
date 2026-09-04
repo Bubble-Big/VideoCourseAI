@@ -8,6 +8,11 @@ VideoCourseAI — 视频上传（分片续传）→ 本地合并算 MD5 → 提�
 Spring Boot 3.5.9 (Java 21, 端口 9090) + Vue 3 (端口 5173) + Docker 中间件。
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+## Git 提交约定
+
+- 提交信息一律使用中文。
+- 提交信息中不要添加 Claude 署名(不要 `Co-Authored-By: Claude` 等字样)。
+
 ## 工作流程规则
 
 若项目中存在一键启动、一键停止、后端编译等脚本，优先调用脚本快速进行启动与终止。
