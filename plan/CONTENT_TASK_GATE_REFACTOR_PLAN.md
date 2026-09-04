@@ -111,22 +111,30 @@
 
 **Phase 2 详细步骤**（每步独立回滚）：
 ```
-Phase 2.1: 幂等键迁移 (DebugController.aiAnalyze:73-79)
-  → compile-server + analyze-video 验证
+Phase 2.1: 幂等键迁移 (DebugController.aiAnalyze:73-79) ✅ 已完成
+  → gate.tryMarkSubmitting/rollbackSubmitting 接入，legacy 分支保留为 tryMarkSubmittingLegacy
+  → compile-server 验证通过（BUILD SUCCESS）
   → 回滚单元: revert DebugController.java
 
-Phase 2.2: 分析锁迁移 (AiService.asyncAnalyze:74-86)
-  → 回归测试（同MD5并发提交）
+Phase 2.2: 分析锁迁移 (AiService.asyncAnalyze:74-86) ✅ 已完成
+  → asyncAnalyze 改为 gateEnabled 分发器，新增 asyncAnalyzeWithGate（contentTaskGate.inAnalysisLock）与 asyncAnalyzeLegacy
+  → 异常处理抽取为公共 handleAnalysisException(mediaFile, mediaId, e)
+  → compile-server 验证通过（BUILD SUCCESS）
   → 回滚单元: revert AiService.asyncAnalyze
 
-Phase 2.3: 转写锁迁移 (AiService.transcribeWithReuse:224-248)
-  → 回归测试（转写复用场景）
+Phase 2.3: 转写锁迁移 (AiService.transcribeWithReuse:224-248) ✅ 已完成
+  → transcribeWithReuse 改为分发器，新增 transcribeWithReuseGate（contentTaskGate.inTranscribeLock）与 transcribeWithReuseLegacy
+  → 3 处调用方（asyncAnalyzeWithGate/asyncAnalyzeLegacy/asyncTranscribe）无需单独改动，自动遵循 gateEnabled
+  → compile-server 验证通过（BUILD SUCCESS）
   → 回滚单元: revert AiService.transcribeWithReuse
 
-Phase 2.4: 归属复用迁移 (resolve*/remember*)
-  → 全链路验证（换mediaId重复上传）
+Phase 2.4: 归属复用迁移 (resolve*/remember*) ✅ 已完成（随 2.2 一并达成）
+  → asyncAnalyzeWithGate/transcribeWithReuseGate 已直接调用 contentTaskGate.resolveAnalysis/rememberAnalysis/resolveTranscript/rememberTranscript
+  → legacy 专属的 resolveAnalysisResult/rememberAnalysisResult 保留，仅供 asyncAnalyzeLegacy 使用，待 Phase 3 一并删除
   → 回滚单元: revert AiService resolve*/remember*
 ```
+
+**Phase 2 验证记录**：`ContentTaskGateTest` 16/16 通过；`mvn clean compile -DskipTests` 全量编译 BUILD SUCCESS。全链路回归（并发提交去重 / 跨 mediaId 复用 / 锁超时 DEFER / 转写失败回滚）见「五、验证」，待 `/analyze-video` 执行。
 
 ---
 

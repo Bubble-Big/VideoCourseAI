@@ -86,7 +86,8 @@ VideoCourseAI-main/
 │           ├── common/                  # 公共组件 (新增)
 │           │   ├── Result.java          # 统一 API 响应体
 │           │   ├── ErrorCode.java       # 统一错误码枚举
-│           │   └── AiStatus.java        # AI 分析/文字提取状态枚举 (新增)
+│           │   ├── AiStatus.java        # AI 分析/文字提取状态枚举 (新增)
+│           │   └── GateOutcome.java     # ContentTaskGate 三态返回契约 (新增)
 │           ├── config/                  # 配置层
 │           │   ├── MinioConfig.java     # MinIO 客户端配置 (含分片生命周期)
 │           │   ├── ThreadPoolConfig.java# 线程池配置
@@ -101,6 +102,7 @@ VideoCourseAI-main/
 │           │   ├── MediaService.java    # 媒体处理服务 (+contentHash MD5 指纹)
 │           │   ├── ChunkUploadService.java  # 分片上传核心逻辑 (新增)
 │           │   ├── AiService.java       # AI 分析服务 (状态机 + 内容复用)
+│           │   ├── ContentTaskGate.java # 内容级串行原语统一收敛 (新增)
 │           │   ├── RateLimitService.java   # 双层令牌桶限流 (新增)
 │           │   └── FailedAnalysisTaskService.java # 失败台账服务 (新增)
 │           ├── consumer/                # MQ 消费者
@@ -295,8 +297,8 @@ VideoCourseAI-main/
                              │ 非运行中
                              ▼
                     ┌─ 提交侧幂等键 ────────────┐
-                    │ setIfAbsent(analysis:      │
-                    │   active:{contentHash})    │
+                    │ ContentTaskGate            │
+                    │   .tryMarkSubmitting()      │
                     │ (30s TTL, 抢不到→返回成功)  │
                     └────────┬──────────────────┘
                              │ 获取成功
@@ -323,9 +325,9 @@ VideoCourseAI-main/
                            ▼
           ┌─────────────────────────────────────┐
           │        AiService.asyncAnalyze()      │
-          │  tryLock(lock:analysis:{contentHash})│
-          │  抢不到 → 跳过（执行时防并发兜底）    │
-          │  0. 结果复用(completed-owner)         │
+          │  contentTaskGate.inAnalysisLock()    │
+          │  抢不到 → DEFER（让位，交补偿兜底）  │
+          │  0. 结果复用(resolveAnalysis)         │
           │  1. 转写(transcribeWithReuse)         │
           │     内容级锁 + 归属复用               │
           │  2. DeepSeek 总结(generateSummaryFromText)│
@@ -368,10 +370,10 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | L5 Controller | `DebugController` | 统一 `Result` + `BusinessException` |
 
 **关键文件**：
-- `DebugController.java:60-101` — AI 分析入口（幂等键 + 双层限流 + 发 MQ）
+- `DebugController.java` — AI 分析入口（幂等键 + 双层限流 + 发 MQ）
 - `VideoAnalysisConsumer.java` — MQ 消费者（触发派发 + ACK，异常决策下沉）
-- `AiService.java:52-105` — 异步分析核心逻辑（状态机 + 结果/转写复用）
-- `AiService.java:154-179` — 转写复用 `transcribeWithReuse`（内容级锁 + 归属复用）
+- `AiService.java` — 异步分析核心逻辑（状态机 + 结果/转写复用，`asyncAnalyze` 分发 Gate/Legacy）
+- `ContentTaskGate.java` — 内容级串行原语统一抽象（锁语义 + 提交标记 + 归属复用），详见 7.4
 - `AliyunDeepSeekStrategy.java:29-74` — FFmpeg + ASR + 总结策略实现
 - `RateLimitService.java:35-65` — 双层令牌桶限流
 - `AnalysisTaskKeys.java` — 分析任务 Key 定义 + contentHash 标准化
@@ -508,19 +510,23 @@ DebugController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consum
 
 - **文件**：`MediaController.java:139-170` (列表查询缓存), `AiService.java:47-59` (分析完成后清除缓存)
 
-### 7.4 分布式锁 (Redisson + WatchDog)
+### 7.4 分布式锁 (Redisson + WatchDog) 与 ContentTaskGate 收敛
 
 ```
-提交侧：setIfAbsent("analysis:active:" + contentHash, 30s)   // 幂等键，非 RLock
-执行侧：tryLock("lock:analysis:" + contentHash)               // 内容级锁，看门狗（asyncAnalyze 内）
-转写侧：tryLock("lock:analysis-context:" + contentHash)       // 内容级转写锁
+提交侧：contentTaskGate.tryMarkSubmitting(contentHash)   // 幂等键，非 RLock，30s TTL
+执行侧：contentTaskGate.inAnalysisLock(contentHash, action)   // 内容级分析锁，看门狗
+转写侧：contentTaskGate.inTranscribeLock(contentHash, action) // 内容级转写锁
 ```
 
+- **统一收敛**：原先分散在 `DebugController`/`AiService` 的「幂等键抢占/回滚」「锁获取/等待/释放」「归属复用查询/登记」六套语义，收敛为 `ContentTaskGate` 服务，用 `GateOutcome`（`PROCEED`/`REUSE`/`DEFER`）作为唯一返回契约
+- **强制不变量**：「跳过 ⇒ 复用或回滚」——`DEFER` 时调用方必须显式复用他人结果或回滚到可重试态，禁止静默成功
 - **身份 = contentHash**：锁以内容指纹为身份，而非 mediaId，实现跨 mediaId / 跨用户的串行化（换 mediaId 重复上传也被拦截）
 - **提交侧用幂等键**：秒级 TTL + 失败回滚，替代原 mediaId RLock（防重复点击）
 - **WatchDog 机制**：长耗时任务（AI 调用可达数分钟）自动续期，防止锁过期释放
-- **锁嵌套顺序**：`lock:analysis` → `lock:analysis-context`，`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁
-- **文件**：`DebugController.java`（提交侧幂等键）, `AiService.java`（asyncAnalyze 内容级锁 + transcribeWithReuse 转写锁）
+- **锁嵌套顺序**：`lock:analysis` → `lock:analysis-context`，固化进 `ContentTaskGate`（`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁）
+- **特性开关**：`content.gate.enabled`（默认 true）控制走新 Gate 路径或原 Legacy 路径（`tryMarkSubmittingLegacy`/`asyncAnalyzeLegacy`/`transcribeWithReuseLegacy`），用于渐进式收敛与快速回滚，稳定运行后删除
+- **文件**：`common/GateOutcome.java`（三态枚举）, `service/ContentTaskGate.java`（锁语义 + 提交标记 + 归属复用）, `controller/DebugController.java`（提交侧）, `service/AiService.java`（执行侧分析锁 + 转写锁）
+- **详见**：`plan/CONTENT_TASK_GATE_REFACTOR_PLAN.md`（收敛方案设计与迁移记录）
 
 ### 7.5 令牌桶限流 (双层)
 
@@ -771,6 +777,7 @@ rocketmq.producer.group=video-analysis-group
 | `common/Result.java` | 32 | 统一 API 响应体 (record) |
 | `common/ErrorCode.java` | 37 | 统一错误码枚举（含 httpStatus 显式映射） |
 | `common/AiStatus.java` | 22 | AI 分析/文字提取状态枚举 (新增) |
+| `common/GateOutcome.java` | 15 | ContentTaskGate 三态返回契约 (新增) |
 | `config/MinioConfig.java` | 76 | MinIO 客户端初始化 + 桶策略 + 生命周期 |
 | `config/ThreadPoolConfig.java` | 35 | AI 任务线程池配置（@Async 文字提取用） |
 | `config/WebConfig.java` | 24 | CORS 全局跨域配置 |
@@ -781,7 +788,8 @@ rocketmq.producer.group=video-analysis-group
 | `controller/ApiExceptionHandler.java` | 105 | 全局异常处理 (新增) |
 | `service/MediaService.java` | 99 | 媒体处理服务（+calculateMd5/contentHash） |
 | `service/ChunkUploadService.java` | 449 | 分片上传核心逻辑（本地合并） |
-| `service/AiService.java` | 300 | 异步 AI 分析（状态机 + 内容复用） |
+| `service/AiService.java` | 300 | 异步 AI 分析（状态机 + 内容复用，Gate/Legacy 双路径） |
+| `service/ContentTaskGate.java` | 220 | 内容级串行原语统一收敛（锁语义+提交标记+归属复用） (新增) |
 | `service/RateLimitService.java` | 71 | 双层令牌桶限流 (新增) |
 | `service/FailedAnalysisTaskService.java` | 44 | 失败台账服务（record） (新增) |
 | `service/AnalysisCompensationScheduler.java` | 76 | 补偿式重试调度器（扫卡死记录重新触发/落失败） (新增) |

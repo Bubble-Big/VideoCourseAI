@@ -2,6 +2,7 @@ package com.example.server.service;
 
 import com.example.server.common.AiFailStage;
 import com.example.server.common.AiStatus;
+import com.example.server.common.GateOutcome;
 import com.example.server.entity.MediaFile;
 import com.example.server.exception.AiAnalysisException;
 import com.example.server.mapper.MediaFileMapper;
@@ -38,10 +39,14 @@ public class AiService {
     private final RedissonClient redissonClient;
     private final MediaService mediaService;
     private final FailedAnalysisTaskService failedTaskService;
+    private final ContentTaskGate contentTaskGate;
     /** 分析锁等待时长（秒）：抢不到锁时阻塞等待首个持锁任务完成以便复用结果，对齐 ASR readTimeout，非无限等待。 */
     private final long analysisLockWaitSeconds;
     /** 转写锁等待时长（秒）：抢不到转写锁时阻塞等待他人转写完成以便复用结果，对齐 ASR readTimeout。 */
     private final long contextLockWaitSeconds;
+
+    @Value("${content.gate.enabled:true}")
+    private boolean gateEnabled;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
@@ -49,6 +54,7 @@ public class AiService {
                      RedissonClient redissonClient,
                      MediaService mediaService,
                      FailedAnalysisTaskService failedTaskService,
+                     ContentTaskGate contentTaskGate,
                      @Value("${ai.analysis-lock-wait-seconds:600}") long analysisLockWaitSeconds,
                      @Value("${ai.transcribe-lock-wait-seconds:600}") long contextLockWaitSeconds) {
         this.mediaFileMapper = mediaFileMapper;
@@ -57,6 +63,7 @@ public class AiService {
         this.redissonClient = redissonClient;
         this.mediaService = mediaService;
         this.failedTaskService = failedTaskService;
+        this.contentTaskGate = contentTaskGate;
         this.analysisLockWaitSeconds = analysisLockWaitSeconds;
         this.contextLockWaitSeconds = contextLockWaitSeconds;
     }
@@ -68,22 +75,96 @@ public class AiService {
      */
     @Async("aiTaskExecutor")
     public void asyncAnalyze(Long mediaId) {
-        MediaFile mediaFile = null;
-        // ① 内容级锁：从消费层移到这里（执行在异步线程，锁跟随执行线程）
         String contentHash = mediaService.contentHash(mediaId);
+
+        if (gateEnabled) {
+            asyncAnalyzeWithGate(mediaId, contentHash);
+        } else {
+            asyncAnalyzeLegacy(mediaId, contentHash);
+        }
+    }
+
+    /**
+     * 新版分析逻辑：使用 ContentTaskGate
+     */
+    private void asyncAnalyzeWithGate(Long mediaId, String contentHash) {
+        GateOutcome outcome = contentTaskGate.inAnalysisLock(contentHash, () -> {
+            MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
+            if (mediaFile == null) {
+                throw new AiAnalysisException("文件不存在: " + mediaId, false, AiFailStage.FILE);
+            }
+
+            // 结果复用：查询并回填已有结果
+            if (contentTaskGate.resolveAnalysis(mediaFile, contentHash)) {
+                evictCache(mediaFile);
+                log.info("AI 分析结果复用, mediaId={} contentHash={}", mediaId, contentHash);
+                return GateOutcome.REUSE;
+            }
+
+            // 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳
+            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
+            mediaFile.setAiProcessAt(LocalDateTime.now());
+            mediaFileMapper.updateById(mediaFile);
+
+            try {
+                // 1. 语音转文字：内容级锁 + 归属复用
+                String text = transcribeWithReuse(mediaFile, contentHash);
+                if (text == null) {
+                    throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
+                }
+                mediaFile.setTranscriptText(text);
+                mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
+
+                if (NO_SPEECH_TRANSCRIPT.equals(text)) {
+                    // 无语音内容：跳过 LLM，直接落受控总结文案
+                    mediaFile.setAiSummary(NO_SPEECH_SUMMARY);
+                    mediaFile.setAiStatus(AiStatus.SUCCESS.name());
+                    mediaFileMapper.updateById(mediaFile);
+                    contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
+                    evictCache(mediaFile);
+                    log.info("视频无语音内容，跳过 LLM, mediaId={}", mediaId);
+                    return GateOutcome.PROCEED;
+                }
+
+                // 2. 智能总结
+                String summary = aiAnalysisStrategy.generateSummaryFromText(text);
+                mediaFile.setAiSummary(summary);
+                mediaFile.setAiStatus(AiStatus.SUCCESS.name());
+                mediaFileMapper.updateById(mediaFile);
+                contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
+                evictCache(mediaFile);
+                log.info("AI 分析完成, mediaId={}", mediaId);
+                return GateOutcome.PROCEED;
+
+            } catch (Exception e) {
+                handleAnalysisException(mediaFile, mediaId, e);
+                return GateOutcome.PROCEED;  // 异常已处理，视为完成
+            }
+        });
+
+        // DEFER：让位，保持 PENDING/PROCESSING 交补偿
+        if (outcome == GateOutcome.DEFER) {
+            log.info("分析锁让位, mediaId={} contentHash={}", mediaId, contentHash);
+        }
+    }
+
+    /**
+     * 旧版分析逻辑（向后兼容，待稳定后删除）
+     */
+    private void asyncAnalyzeLegacy(Long mediaId, String contentHash) {
+        MediaFile mediaFile = null;
         RLock lock = redissonClient.getLock(AnalysisTaskKeys.analysisLock(contentHash));
         boolean locked;
         try {
-            // 抢不到锁则阻塞等待首个持锁任务完成（最多 analysisLockWaitSeconds），复用其结果，避免 20 分钟补偿延迟
             locked = lock.tryLock(analysisLockWaitSeconds, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.info("等待分析锁被中断，跳过 mediaId={} contentHash={}", mediaId, contentHash);
-            return;   // 被中断等同让位，交补偿兜底
+            return;
         }
         if (!locked) {
             log.info("等待分析锁超时，跳过 mediaId={} contentHash={}", mediaId, contentHash);
-            return;   // 超时仍抢不到才放弃，交补偿兜底
+            return;
         }
         try {
             mediaFile = mediaFileMapper.selectById(mediaId);
@@ -92,19 +173,16 @@ public class AiService {
             }
             log.info("开始 AI 分析任务, mediaId={}", mediaId);
 
-            // 【结果复用】先查复用（用 selectById 读到的原始状态判断幂等，此时 aiStatus 尚未被覆盖）
             if (resolveAnalysisResult(mediaFile, contentHash)) {
                 evictCache(mediaFile);
                 log.info("AI 分析结果复用, mediaId={} contentHash={}", mediaId, contentHash);
                 return;
             }
 
-            // ② 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳（ai_attempts 由补偿触发侧统一 +1，这里不计数）
             mediaFile.setAiStatus(AiStatus.PROCESSING.name());
             mediaFile.setAiProcessAt(LocalDateTime.now());
             mediaFileMapper.updateById(mediaFile);
 
-            // 1. 语音转文字：内容级锁 + 归属复用（同一内容只真正转写一次）
             String text = transcribeWithReuse(mediaFile, contentHash);
             if (text == null) {
                 throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
@@ -113,7 +191,6 @@ public class AiService {
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
 
             if (NO_SPEECH_TRANSCRIPT.equals(text)) {
-                // 无语音内容：跳过 LLM，直接落受控总结文案
                 mediaFile.setAiSummary(NO_SPEECH_SUMMARY);
                 mediaFile.setAiStatus(AiStatus.SUCCESS.name());
                 mediaFileMapper.updateById(mediaFile);
@@ -123,41 +200,45 @@ public class AiService {
                 return;
             }
 
-            // 2. 智能总结：复用已转写文本，避免重复提取音频 + ASR
             String summary = aiAnalysisStrategy.generateSummaryFromText(text);
             mediaFile.setAiSummary(summary);
             mediaFile.setAiStatus(AiStatus.SUCCESS.name());
 
             mediaFileMapper.updateById(mediaFile);
-            rememberAnalysisResult(contentHash, mediaFile.getId()); // 完成后登记结果归属
+            rememberAnalysisResult(contentHash, mediaFile.getId());
             evictCache(mediaFile);
             log.info("AI 分析完成, mediaId={}", mediaId);
 
         } catch (Exception e) {
-            // @Async 隔离了异常传播，异常不再能抛回消费层，必须内部消化：
-            // 永久失败落 FAILED + 台账；瞬时失败保持 PROCESSING + 刷新时间戳，交补偿重试
-            if (e instanceof AiAnalysisException ae && !ae.isRetryable()) {
-                if (mediaFile != null) {
-                    markFailed(mediaFile, e);   // 永久失败，落 FAILED（文件不存在时 mediaFile 为 null，无行可落）
-                }
-                failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
-                return;
-            }
-            if (mediaFile != null) {
-                // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
-                mediaFile.setAiStatus(AiStatus.PROCESSING.name());
-                mediaFile.setAiProcessAt(LocalDateTime.now());
-                mediaFileMapper.updateById(mediaFile);
-            }
-            if (e instanceof AiAnalysisException ae) {
-                failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
-            }
-            log.warn("AI 分析瞬时失败，保持 PROCESSING 等待补偿重试, mediaId={}, err={}", mediaId, e.getMessage());
+            handleAnalysisException(mediaFile, mediaId, e);
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
             }
         }
+    }
+
+    /**
+     * 统一异常处理：永久失败落 FAILED，瞬时失败保持 PROCESSING 交补偿
+     */
+    private void handleAnalysisException(MediaFile mediaFile, Long mediaId, Exception e) {
+        if (e instanceof AiAnalysisException ae && !ae.isRetryable()) {
+            if (mediaFile != null) {
+                markFailed(mediaFile, e);
+            }
+            failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
+            return;
+        }
+        if (mediaFile != null) {
+            // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
+            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
+            mediaFile.setAiProcessAt(LocalDateTime.now());
+            mediaFileMapper.updateById(mediaFile);
+        }
+        if (e instanceof AiAnalysisException ae) {
+            failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
+        }
+        log.warn("AI 分析瞬时失败，保持 PROCESSING 等待补偿重试, mediaId={}, err={}", mediaId, e.getMessage());
     }
 
     /**
@@ -221,6 +302,48 @@ public class AiService {
      * @return 转写文本；null 表示等待转写锁超时且无归属可复用
      */
     private String transcribeWithReuse(MediaFile mediaFile, String contentHash) {
+        return gateEnabled
+                ? transcribeWithReuseGate(mediaFile, contentHash)
+                : transcribeWithReuseLegacy(mediaFile, contentHash);
+    }
+
+    /**
+     * 新版转写逻辑：使用 ContentTaskGate
+     */
+    private String transcribeWithReuseGate(MediaFile mediaFile, String contentHash) {
+        String[] resultHolder = new String[1];
+        GateOutcome outcome = contentTaskGate.inTranscribeLock(contentHash, () -> {
+            // 锁内先查复用
+            String reusable = contentTaskGate.resolveTranscript(mediaFile, contentHash);
+            if (reusable != null) {
+                resultHolder[0] = reusable;
+                return GateOutcome.REUSE;
+            }
+
+            // 抢到锁且无归属：真正转写一次
+            String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
+            if (text == null || text.isBlank()) {
+                text = NO_SPEECH_TRANSCRIPT;
+            }
+            mediaFile.setTranscriptText(text);
+            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
+            mediaFileMapper.updateById(mediaFile);
+            contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
+            resultHolder[0] = text;
+            return GateOutcome.PROCEED;
+        });
+
+        // DEFER：让位，未抢到锁也没复用到结果
+        if (outcome == GateOutcome.DEFER) {
+            return null;
+        }
+        return resultHolder[0];
+    }
+
+    /**
+     * 旧版转写逻辑（向后兼容，待稳定后删除）
+     */
+    private String transcribeWithReuseLegacy(MediaFile mediaFile, String contentHash) {
         RLock lock = redissonClient.getLock(AnalysisTaskKeys.contextLock(contentHash));
         boolean locked = false;
         try {

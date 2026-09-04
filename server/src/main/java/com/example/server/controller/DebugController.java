@@ -8,11 +8,13 @@ import com.example.server.common.Result;
 import com.example.server.exception.BusinessException;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
+import com.example.server.service.ContentTaskGate;
 import com.example.server.service.RateLimitService;
 import com.example.server.strategy.AiAnalysisStrategy;
 import com.example.server.utils.AnalysisTaskKeys;
 import com.example.server.utils.FfmpegUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -25,7 +27,6 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -34,28 +35,31 @@ import java.util.UUID;
 @CrossOrigin(originPatterns = "*", allowCredentials = "true")
 public class DebugController {
 
-    /** 提交侧幂等键 TTL：秒级，只覆盖提交逻辑最坏耗时；提交成功后靠 TTL 自然过期，由 aiStatus 状态校验接管。 */
-    private static final Duration ACTIVE_TTL = Duration.ofSeconds(30);
-
     private final MediaFileMapper mediaFileMapper;
     private final AiAnalysisStrategy aiAnalysisStrategy;
     private final AiService aiService;
     private final StringRedisTemplate redisTemplate;
     private final org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate;
     private final RateLimitService rateLimitService;
+    private final ContentTaskGate contentTaskGate;
+
+    @Value("${content.gate.enabled:true}")
+    private boolean gateEnabled;
 
     public DebugController(MediaFileMapper mediaFileMapper,
                            @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                            AiService aiService,
                            StringRedisTemplate redisTemplate,
                            org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate,
-                           RateLimitService rateLimitService) {
+                           RateLimitService rateLimitService,
+                           ContentTaskGate contentTaskGate) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.aiService = aiService;
         this.redisTemplate = redisTemplate;
         this.rocketMQTemplate = rocketMQTemplate;
         this.rateLimitService = rateLimitService;
+        this.contentTaskGate = contentTaskGate;
     }
 
     // AI总结接口(幂等键 + 限流 + MQ)
@@ -70,11 +74,13 @@ public class DebugController {
             return Result.ok("任务已在后台运行");
         }
 
-        // 提交侧幂等键：内容级（contentHash），setIfAbsent 原子抢；抢不到说明并发提交中，吞掉重复投递
+        // 提交侧幂等键：内容级（contentHash），原子抢占；抢不到说明并发提交中，吞掉重复投递
         String contentHash = AnalysisTaskKeys.normalizeContentHash(id, file.getFileMd5());
-        String activeKey = AnalysisTaskKeys.active(contentHash);
-        Boolean accepted = redisTemplate.opsForValue().setIfAbsent(activeKey, String.valueOf(id), ACTIVE_TTL);
-        if (!Boolean.TRUE.equals(accepted)) {
+        boolean accepted = gateEnabled
+                ? contentTaskGate.tryMarkSubmitting(contentHash, id)
+                : tryMarkSubmittingLegacy(contentHash, id);
+
+        if (!accepted) {
             return Result.ok("任务提交中，请稍候");
         }
 
@@ -107,9 +113,24 @@ public class DebugController {
             file.setAiSummary(prevAiSummary);
             mediaFileMapper.updateById(file);
             redisTemplate.delete("media:list:user:" + userIdKey);
-            redisTemplate.delete(activeKey);
+
+            if (gateEnabled) {
+                contentTaskGate.rollbackSubmitting(contentHash);
+            } else {
+                redisTemplate.delete(AnalysisTaskKeys.active(contentHash));
+            }
             throw e;
         }
+    }
+
+    /**
+     * 旧版提交幂等键实现（向后兼容，待 gate 稳定后删除）
+     */
+    private boolean tryMarkSubmittingLegacy(String contentHash, Long mediaId) {
+        String activeKey = AnalysisTaskKeys.active(contentHash);
+        Boolean result = redisTemplate.opsForValue()
+                .setIfAbsent(activeKey, String.valueOf(mediaId), java.time.Duration.ofSeconds(30));
+        return Boolean.TRUE.equals(result);
     }
 
     //纯文字提取接口
