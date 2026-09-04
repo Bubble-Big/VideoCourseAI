@@ -3,7 +3,6 @@
 > 针对「同一目标『同内容同时只处理一次』被拆成多套语义重叠的串行原语」这一代码问题，设计统一收敛方案。
 > 前两条卡死 bug（finding 1/2）的根因正是这些锁的「跳过路径不回填」未被统一处理。
 >
-> 最后更新 2026-08-30，尚未实施。
 
 ---
 
@@ -101,34 +100,37 @@
 | 新增 | `service/ContentTaskGate.java` | 锁语义 + 提交标记 + 归属复用 |
 | 修改 | `controller/DebugController.java` | 幂等键替换为 `gate.tryMarkSubmitting`/`rollbackSubmitting` |
 | 修改 | `service/AiService.java` | 两把锁 + `resolve*`/`remember*` 迁入 gate |
-| 修改 | `utils/AnalysisTaskKeys.java` | 补注释明确 `active`(短窗口) vs `lock:*`(长窗口) |
-| 修改 | `resources/application.properties` | 新增 `ai.submit-active-ttl-seconds=30`、`content.gate.enabled=true` |
-| 不改 | `VideoAnalysisConsumer` / `VideoAnalysisDlqConsumer` / `RateLimitService` / `MediaService` / `AnalysisCompensationScheduler` | — |
+| 修改 | `resources/application.properties` | 新增 `content.gate.enabled=true` 特性开关（临时，稳定后删除） |
+| 不改 | `VideoAnalysisConsumer` / `VideoAnalysisDlqConsumer` / `RateLimitService` / `MediaService` / `AnalysisCompensationScheduler` / `AnalysisTaskKeys` | — |
 
 ### 4.2 迁移步骤（向后兼容）
 
 1. **Phase 1 落地抽象**：新增 `GateOutcome` 与 `ContentTaskGate`，内部逻辑与现有三处「逐字等价」；单测覆盖 `PROCEED/REUSE/DEFER` 三分支与 `tryMarkSubmitting`/`rollbackSubmitting`。
-2. **Phase 2 逐处替换**：依次替换幂等键 → 分析锁 → 转写锁 → `resolve*`/`remember*`，每处替换即 `compile-server` 编译 + `analyze-video` 链路回归。
-3. **Phase 3 固化**：gate javadoc 写入不变量；`GateOutcome` 用 `switch` 穷举（缺 `DEFER` 编译告警）；落地 `content.gate.enabled` 特性开关。
+2. **Phase 2 逐处替换**：依次替换幂等键 → 分析锁 → 转写锁 → `resolve*`/`remember*`，每处替换保留旧代码分支（`if (gateEnabled)`），`compile-server` 编译 + `analyze-video` 链路回归后再删除旧代码。
+3. **Phase 3 固化**：gate javadoc 写入不变量；`GateOutcome` 用 `switch` 穷举（缺 `DEFER` 编译告警）；稳定运行1个月后删除 `content.gate.enabled` 开关及旧代码分支。
+
+**Phase 2 详细步骤**（每步独立回滚）：
+```
+Phase 2.1: 幂等键迁移 (DebugController.aiAnalyze:73-79)
+  → compile-server + analyze-video 验证
+  → 回滚单元: revert DebugController.java
+
+Phase 2.2: 分析锁迁移 (AiService.asyncAnalyze:74-86)
+  → 回归测试（同MD5并发提交）
+  → 回滚单元: revert AiService.asyncAnalyze
+
+Phase 2.3: 转写锁迁移 (AiService.transcribeWithReuse:224-248)
+  → 回归测试（转写复用场景）
+  → 回滚单元: revert AiService.transcribeWithReuse
+
+Phase 2.4: 归属复用迁移 (resolve*/remember*)
+  → 全链路验证（换mediaId重复上传）
+  → 回滚单元: revert AiService resolve*/remember*
+```
 
 ---
 
-## 五、风险与防范
-
-> 基于方案细节推导的真实风险，**R1 对生产影响最大**，实施前必须完成对应防范项。
-
-| 等级 | 风险 | 成因 | 防范（实施前必做） |
-|------|------|------|--------------------|
-| **R1（P0）** | 锁内查库的性能放大效应 | `resolve*` 在持有 `RLock` 期间执行 `selectCompleted*ByMd5`，索引缺失或慢 SQL 会长时间占用锁，高并发下拖垮 Redis 连接池与 Tomcat 线程 | ① `EXPLAIN` 两个反查 SQL 确认走 `file_md5` 索引（建议建 `(file_md5, ai_status, id)` 复合索引）；② 慢查询监控；③ 确认 DB 反查仅在 Redis 归属 miss 时触发（降频） |
-| R2（P1） | DEFER 风暴加重补偿调度器 | 锁竞争高峰产生大量 `DEFER`，20 分钟后落入补偿扫表 | 现状非即时风暴（阈值 20min、`SCAN_LIMIT=100`）；缓解：`DEFER` 时刷新 `ai_process_at` 延后，或改用 RocketMQ 延迟消息（见遗留） |
-| R3（P1） | 缓存/DB 最终一致性空窗 | `remember*` 与落库解耦后误用「先写缓存」或落库回滚 → 脏归属 | 硬性写死「先落 DB（SUCCESS 提交）再写缓存」+ 缓存 TTL 7 天自愈 |
-| R4（P2） | 缺特性开关，回滚粒度粗 | 无 Feature Flag，P0 故障只能整体回滚镜像 | `content.gate.enabled` 开关，`false` 走旧三套原语 |
-
-**回滚**：`content.gate.enabled=false` 秒级切回旧逻辑；Phase 1/2 均为等价重构，单点 revert 即可。
-
----
-
-## 六、验证
+## 五、验证
 
 1. **编译**：`compile-server` 通过。
 2. **同内容并发提交**：同 `file_md5` 两个请求，确认只投递一次 MQ，前端轮询出唯一结果。
@@ -136,15 +138,3 @@
 4. **锁超时让位**：调小 `ai.analysis-lock-wait-seconds` 制造锁竞争，确认 `DEFER` 后不卡 `PENDING`，补偿兜底最终 `SUCCESS/FAILED`。
 5. **回归 finding 1/2**：复现原卡死场景，确认「跳过 ⇒ 复用或回滚」生效，无静默成功。
 6. **转写失败回滚**：异步提取抢转写锁超时，确认 `transcriptStatus` 回滚 `NONE`。
-
----
-
-## 七、遗留事项
-
-| 事项 | 说明 |
-|------|------|
-| 幂等键是否可彻底去除 | 若给「置 PENDING」加乐观锁（`ai_status=NONE` 条件更新），可去掉 `analysis:active`，收敛为「单锁 + 状态机」 |
-| 复用线解耦 | gate 依赖 `MediaFileMapper` 后不再是纯 Redis 门；可再拆 `AnalysisOwnerRepository` 隔离 DB 反查 |
-| 补偿显式契约 | 当前靠 `DEFER` 后「不写状态」隐式交补偿；可抽 `DeferAction` 枚举显式表达「交补偿/回滚/落失败」 |
-| 全链路 traceId | 收敛后顺手加 `contentHash` 到日志上下文 |
-| `FfmpegUtils` 抛异常化 | 既有遗留项，本次不动 |
