@@ -1,10 +1,12 @@
 {
+  "env": {
+    "CLAUDE_CODE_NEW_INIT": "1"
+  },
   "permissions": {
     "allow": [
-      "Bash(git init *)"
+      "Bash(git init *)",
+      "Bash(ls -lh /tmp/maven.zip 2>/dev/null && echo \"Maven 下载完成\" || echo \"Maven 仍在下载中\")",
+      "Read(//tmp/**)"
     ]
-  },
-  "env": {
-      "CLAUDE_CODE_NEW_INIT": 1
   }
 }

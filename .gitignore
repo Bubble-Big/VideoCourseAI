@@ -1,6 +1,13 @@
 .idea/
 *.iml
 
+# --- 本地启动脚本 ---
+start-all.bat
+stop-all.bat
+
+# --- 本地化 Claude 配置 ---
+.claude/
+
 # --- Docker runtime data ---
 mysql/data/
 minio/data/

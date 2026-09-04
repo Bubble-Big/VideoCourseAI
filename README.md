@@ -153,8 +153,6 @@ graph TD
 
 
 
-
-
 ## 如何本地部署 
 
 ### 中间件部署 (Docker Compose)
@@ -171,6 +169,8 @@ docker-compose up -d
 
 
 ### 后端配置修改
+
+> **注意**：敏感配置（API 密钥、工具路径）在 `application-local.properties` 进行配置。首次运行请复制 `application-local.properties.example` 为 `application-local.properties` 并修改。
 
 在启动后端前，还原以下配置：
 #### 1. 配置数据库密码

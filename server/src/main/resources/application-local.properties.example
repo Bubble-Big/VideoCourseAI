@@ -1,0 +1,23 @@
+# ==========================================
+# 本地配置模板
+# ==========================================
+# 使用说明：
+# 1. 复制此文件为 application-local.properties
+# 2. 根据你的本地环境修改下面的配置
+# 3. application-local.properties 不会被提交到 Git
+
+# ========== 外部工具路径 ==========
+# Windows 示例（使用正斜杠）：
+# tool.ytdlp.path=C:/Users/YourName/AppData/Local/Microsoft/WinGet/Packages/yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe/yt-dlp.exe
+# tool.ffmpeg.dir=C:/Users/YourName/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-9.0.1-full_build/bin
+
+# Linux/Mac 示例：
+# tool.ytdlp.path=/usr/local/bin/yt-dlp
+# tool.ffmpeg.dir=/usr/local/bin
+
+tool.ytdlp.path=请修改为你的本地路径
+tool.ffmpeg.dir=请修改为你的本地路径
+
+# ========== API 密钥（敏感信息）==========
+ai.deepseek.api-key=your-api-key-here
+ai.aliyun.api-key=your-api-key-here
