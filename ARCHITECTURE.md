@@ -524,7 +524,7 @@ DebugController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consum
 - **提交侧用幂等键**：秒级 TTL + 失败回滚，替代原 mediaId RLock（防重复点击）
 - **WatchDog 机制**：长耗时任务（AI 调用可达数分钟）自动续期，防止锁过期释放
 - **锁嵌套顺序**：`lock:analysis` → `lock:analysis-context`，固化进 `ContentTaskGate`（`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁）
-- **特性开关**：`content.gate.enabled`（默认 true）控制走新 Gate 路径或原 Legacy 路径（`tryMarkSubmittingLegacy`/`asyncAnalyzeLegacy`/`transcribeWithReuseLegacy`），用于渐进式收敛与快速回滚，稳定运行后删除
+- **特性开关已下线**：`content.gate.enabled` 及配套的 Legacy 路径（`tryMarkSubmittingLegacy`/`asyncAnalyzeLegacy`/`transcribeWithReuseLegacy`）已于 2026-09-06 删除，现在只有 `ContentTaskGate` 一套实现
 - **文件**：`common/GateOutcome.java`（三态枚举）, `service/ContentTaskGate.java`（锁语义 + 提交标记 + 归属复用）, `controller/DebugController.java`（提交侧）, `service/AiService.java`（执行侧分析锁 + 转写锁）
 - **详见**：`plan/CONTENT_TASK_GATE_REFACTOR_PLAN.md`（收敛方案设计与迁移记录）
 

@@ -14,7 +14,6 @@ import com.example.server.strategy.AiAnalysisStrategy;
 import com.example.server.utils.AnalysisTaskKeys;
 import com.example.server.utils.FfmpegUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -42,9 +41,6 @@ public class DebugController {
     private final org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate;
     private final RateLimitService rateLimitService;
     private final ContentTaskGate contentTaskGate;
-
-    @Value("${content.gate.enabled:true}")
-    private boolean gateEnabled;
 
     public DebugController(MediaFileMapper mediaFileMapper,
                            @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
@@ -76,9 +72,7 @@ public class DebugController {
 
         // 提交侧幂等键：内容级（contentHash），原子抢占；抢不到说明并发提交中，吞掉重复投递
         String contentHash = AnalysisTaskKeys.normalizeContentHash(id, file.getFileMd5());
-        boolean accepted = gateEnabled
-                ? contentTaskGate.tryMarkSubmitting(contentHash, id)
-                : tryMarkSubmittingLegacy(contentHash, id);
+        boolean accepted = contentTaskGate.tryMarkSubmitting(contentHash, id);
 
         if (!accepted) {
             return Result.ok("任务提交中，请稍候");
@@ -114,23 +108,9 @@ public class DebugController {
             mediaFileMapper.updateById(file);
             redisTemplate.delete("media:list:user:" + userIdKey);
 
-            if (gateEnabled) {
-                contentTaskGate.rollbackSubmitting(contentHash);
-            } else {
-                redisTemplate.delete(AnalysisTaskKeys.active(contentHash));
-            }
+            contentTaskGate.rollbackSubmitting(contentHash);
             throw e;
         }
-    }
-
-    /**
-     * 旧版提交幂等键实现（向后兼容，待 gate 稳定后删除）
-     */
-    private boolean tryMarkSubmittingLegacy(String contentHash, Long mediaId) {
-        String activeKey = AnalysisTaskKeys.active(contentHash);
-        Boolean result = redisTemplate.opsForValue()
-                .setIfAbsent(activeKey, String.valueOf(mediaId), java.time.Duration.ofSeconds(30));
-        return Boolean.TRUE.equals(result);
     }
 
     //纯文字提取接口

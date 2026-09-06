@@ -8,19 +8,14 @@ import com.example.server.exception.AiAnalysisException;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.strategy.AiAnalysisStrategy;
 import com.example.server.utils.AnalysisTaskKeys;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
 @Service
 public class AiService {
@@ -36,36 +31,22 @@ public class AiService {
     private final AiAnalysisStrategy aiAnalysisStrategy;
     // 【关键】必须注入 Redis 工具！
     private final StringRedisTemplate redisTemplate;
-    private final RedissonClient redissonClient;
     private final MediaService mediaService;
     private final FailedAnalysisTaskService failedTaskService;
     private final ContentTaskGate contentTaskGate;
-    /** 分析锁等待时长（秒）：抢不到锁时阻塞等待首个持锁任务完成以便复用结果，对齐 ASR readTimeout，非无限等待。 */
-    private final long analysisLockWaitSeconds;
-    /** 转写锁等待时长（秒）：抢不到转写锁时阻塞等待他人转写完成以便复用结果，对齐 ASR readTimeout。 */
-    private final long contextLockWaitSeconds;
-
-    @Value("${content.gate.enabled:true}")
-    private boolean gateEnabled;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                      StringRedisTemplate redisTemplate,
-                     RedissonClient redissonClient,
                      MediaService mediaService,
                      FailedAnalysisTaskService failedTaskService,
-                     ContentTaskGate contentTaskGate,
-                     @Value("${ai.analysis-lock-wait-seconds:600}") long analysisLockWaitSeconds,
-                     @Value("${ai.transcribe-lock-wait-seconds:600}") long contextLockWaitSeconds) {
+                     ContentTaskGate contentTaskGate) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.redisTemplate = redisTemplate;
-        this.redissonClient = redissonClient;
         this.mediaService = mediaService;
         this.failedTaskService = failedTaskService;
         this.contentTaskGate = contentTaskGate;
-        this.analysisLockWaitSeconds = analysisLockWaitSeconds;
-        this.contextLockWaitSeconds = contextLockWaitSeconds;
     }
 
     /**
@@ -76,18 +57,6 @@ public class AiService {
     @Async("aiTaskExecutor")
     public void asyncAnalyze(Long mediaId) {
         String contentHash = mediaService.contentHash(mediaId);
-
-        if (gateEnabled) {
-            asyncAnalyzeWithGate(mediaId, contentHash);
-        } else {
-            asyncAnalyzeLegacy(mediaId, contentHash);
-        }
-    }
-
-    /**
-     * 新版分析逻辑：使用 ContentTaskGate
-     */
-    private void asyncAnalyzeWithGate(Long mediaId, String contentHash) {
         GateOutcome outcome = contentTaskGate.inAnalysisLock(contentHash, () -> {
             MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
             if (mediaFile == null) {
@@ -145,76 +114,6 @@ public class AiService {
         // DEFER：让位，保持 PENDING/PROCESSING 交补偿
         if (outcome == GateOutcome.DEFER) {
             log.info("分析锁让位, mediaId={} contentHash={}", mediaId, contentHash);
-        }
-    }
-
-    /**
-     * 旧版分析逻辑（向后兼容，待稳定后删除）
-     */
-    private void asyncAnalyzeLegacy(Long mediaId, String contentHash) {
-        MediaFile mediaFile = null;
-        RLock lock = redissonClient.getLock(AnalysisTaskKeys.analysisLock(contentHash));
-        boolean locked;
-        try {
-            locked = lock.tryLock(analysisLockWaitSeconds, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.info("等待分析锁被中断，跳过 mediaId={} contentHash={}", mediaId, contentHash);
-            return;
-        }
-        if (!locked) {
-            log.info("等待分析锁超时，跳过 mediaId={} contentHash={}", mediaId, contentHash);
-            return;
-        }
-        try {
-            mediaFile = mediaFileMapper.selectById(mediaId);
-            if (mediaFile == null) {
-                throw new AiAnalysisException("文件不存在: " + mediaId, false, AiFailStage.FILE);
-            }
-            log.info("开始 AI 分析任务, mediaId={}", mediaId);
-
-            if (resolveAnalysisResult(mediaFile, contentHash)) {
-                evictCache(mediaFile);
-                log.info("AI 分析结果复用, mediaId={} contentHash={}", mediaId, contentHash);
-                return;
-            }
-
-            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
-            mediaFile.setAiProcessAt(LocalDateTime.now());
-            mediaFileMapper.updateById(mediaFile);
-
-            String text = transcribeWithReuse(mediaFile, contentHash);
-            if (text == null) {
-                throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
-            }
-            mediaFile.setTranscriptText(text);
-            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-
-            if (NO_SPEECH_TRANSCRIPT.equals(text)) {
-                mediaFile.setAiSummary(NO_SPEECH_SUMMARY);
-                mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-                mediaFileMapper.updateById(mediaFile);
-                rememberAnalysisResult(contentHash, mediaFile.getId());
-                evictCache(mediaFile);
-                log.info("视频无语音内容，跳过 LLM, mediaId={}", mediaId);
-                return;
-            }
-
-            String summary = aiAnalysisStrategy.generateSummaryFromText(text);
-            mediaFile.setAiSummary(summary);
-            mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-
-            mediaFileMapper.updateById(mediaFile);
-            rememberAnalysisResult(contentHash, mediaFile.getId());
-            evictCache(mediaFile);
-            log.info("AI 分析完成, mediaId={}", mediaId);
-
-        } catch (Exception e) {
-            handleAnalysisException(mediaFile, mediaId, e);
-        } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
         }
     }
 
@@ -302,15 +201,6 @@ public class AiService {
      * @return 转写文本；null 表示等待转写锁超时且无归属可复用
      */
     private String transcribeWithReuse(MediaFile mediaFile, String contentHash) {
-        return gateEnabled
-                ? transcribeWithReuseGate(mediaFile, contentHash)
-                : transcribeWithReuseLegacy(mediaFile, contentHash);
-    }
-
-    /**
-     * 新版转写逻辑：使用 ContentTaskGate
-     */
-    private String transcribeWithReuseGate(MediaFile mediaFile, String contentHash) {
         String[] resultHolder = new String[1];
         GateOutcome outcome = contentTaskGate.inTranscribeLock(contentHash, () -> {
             // 锁内先查复用
@@ -338,165 +228,6 @@ public class AiService {
             return null;
         }
         return resultHolder[0];
-    }
-
-    /**
-     * 旧版转写逻辑（向后兼容，待稳定后删除）
-     */
-    private String transcribeWithReuseLegacy(MediaFile mediaFile, String contentHash) {
-        RLock lock = redissonClient.getLock(AnalysisTaskKeys.contextLock(contentHash));
-        boolean locked = false;
-        try {
-            locked = lock.tryLock(contextLockWaitSeconds, TimeUnit.SECONDS);
-            // 无论是否抢到锁都先查归属：已有人完成则直接复用
-            String reusable = resolveTranscript(mediaFile, contentHash);
-            if (reusable != null) return reusable;
-            if (!locked) return null; // 没抢到且没复用：别人在转写，跳过
-
-            // 抢到锁且无归属：真正转写一次
-            String text = aiAnalysisStrategy.transcribe(mediaFile.getFilePath());
-            if (text == null || text.isBlank()) {
-                text = NO_SPEECH_TRANSCRIPT;   // 无语音：算成功，落受控文案
-            }
-            mediaFile.setTranscriptText(text);
-            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            mediaFileMapper.updateById(mediaFile);
-            rememberTranscriptOwner(contentHash, mediaFile.getId()); // 先落库再登记归属
-            return text;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("等待转写锁被中断", e);
-        } finally {
-            if (locked && lock.isHeldByCurrentThread()) lock.unlock();
-        }
-    }
-
-    /**
-     * 归属读取：返回已完成该内容转写的 mediaId，无则 null。
-     */
-    private Long transcriptOwner(String contentHash) {
-        String value = redisTemplate.opsForValue().get(AnalysisTaskKeys.contextOwner(contentHash));
-        return value == null ? null : Long.valueOf(value);
-    }
-
-    /**
-     * 归属登记：转写落库后写入，7 天 TTL。
-     */
-    private void rememberTranscriptOwner(String contentHash, Long mediaId) {
-        redisTemplate.opsForValue().set(
-                AnalysisTaskKeys.contextOwner(contentHash), String.valueOf(mediaId), Duration.ofDays(7));
-    }
-
-    /**
-     * 复用查询：本 mediaId 已有转写，或内容级归属可复用，返回文本；否则 null。
-     */
-    private String resolveTranscript(MediaFile mediaFile, String contentHash) {
-        // 只有转写成功且文本非空才算可复用；FAILED 文案（如「❌ 提取失败」）不能当有效文本喂给 LLM
-        if (isSuccessTranscript(mediaFile)) {
-            return mediaFile.getTranscriptText();
-        }
-        Long ownerMediaId = transcriptOwner(contentHash);
-        MediaFile owner = null;
-        if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
-            owner = mediaFileMapper.selectById(ownerMediaId);
-            // 仅当归属真正失效才清除：记录被删 / 转写 FAILED / 文本为空。
-            // PROCESSING（重转写中）但旧文本仍在时保留归属，复用旧结果，避免误删 + 额外 ASR。
-            if (owner == null
-                    || AiStatus.FAILED.name().equals(owner.getTranscriptStatus())
-                    || owner.getTranscriptText() == null
-                    || owner.getTranscriptText().isBlank()) {
-                redisTemplate.delete(AnalysisTaskKeys.contextOwner(contentHash)); // 归属失效，清掉
-                owner = null;
-            }
-        }
-        // Redis 归属未命中/失效 → 回退 DB 按 file_md5 反查（归属的权威数据源是 MySQL，Redis 只是 7 天缓存）
-        if (owner == null && AnalysisTaskKeys.isRealMd5(contentHash)) {
-            owner = mediaFileMapper.selectCompletedTranscriptByMd5(contentHash, mediaFile.getId());
-        }
-        if (owner != null) {
-            mediaFile.setTranscriptText(owner.getTranscriptText());
-            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            mediaFileMapper.updateById(mediaFile);
-            rememberTranscriptOwner(contentHash, owner.getId()); // 回填归属缓存，下次走 Redis 快速路径
-            return owner.getTranscriptText();
-        }
-        return null;
-    }
-
-    /**
-     * 转写是否真正可用：状态为 SUCCESS 且文本非空。
-     * <p>失败记录会把受控文案（如「❌ 提取失败」）写进 transcriptText，
-     * 不能只判非空就复用，否则会把错误提示当有效文本喂给总结 LLM。</p>
-     */
-    private boolean isSuccessTranscript(MediaFile mediaFile) {
-        return mediaFile != null
-                && AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())
-                && mediaFile.getTranscriptText() != null
-                && !mediaFile.getTranscriptText().isBlank();
-    }
-
-    /**
-     * 分析结果是否真正可用：状态为 SUCCESS 且 summary 非空。
-     * <p>与 {@link #isSuccessTranscript} 同理，不能只判非空，否则会把失败受控文案当有效结果复用。</p>
-     */
-    private boolean isSuccessAnalysis(MediaFile mediaFile) {
-        return mediaFile != null
-                && AiStatus.SUCCESS.name().equals(mediaFile.getAiStatus())
-                && mediaFile.getAiSummary() != null
-                && !mediaFile.getAiSummary().isBlank();
-    }
-
-    /**
-     * 结果复用查询：本 mediaId 已有成功结果（幂等），或内容级归属可复用（换 mediaId 重复上传），返回 true；否则 false。
-     */
-    private boolean resolveAnalysisResult(MediaFile mediaFile, String contentHash) {
-        // 本 mediaId 已有成功结果 → 幂等直接返回（MQ 重投等）
-        if (isSuccessAnalysis(mediaFile)) {
-            return true;
-        }
-        // 内容级归属可复用：换 mediaId 重复上传的场景
-        Long ownerMediaId = analysisResultOwner(contentHash);
-        MediaFile owner = null;
-        if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
-            owner = mediaFileMapper.selectById(ownerMediaId);
-            if (!isSuccessAnalysis(owner)) {
-                redisTemplate.delete(AnalysisTaskKeys.completedOwner(contentHash)); // 归属失效，清掉
-                owner = null;
-            }
-        }
-        // Redis 归属未命中/失效 → 回退 DB 按 file_md5 反查（归属的权威数据源是 MySQL，Redis 只是 7 天缓存）
-        if (owner == null && AnalysisTaskKeys.isRealMd5(contentHash)) {
-            owner = mediaFileMapper.selectCompletedAnalysisByMd5(contentHash, mediaFile.getId());
-        }
-        if (owner != null) {
-            mediaFile.setAiSummary(owner.getAiSummary());
-            mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-            // 转写文本一并复用（owner 分析成功必有转写）
-            if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
-                mediaFile.setTranscriptText(owner.getTranscriptText());
-                mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            }
-            mediaFileMapper.updateById(mediaFile);
-            rememberAnalysisResult(contentHash, owner.getId()); // 回填归属缓存，下次走 Redis 快速路径
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * 结果归属读取：返回已完成该内容分析的 mediaId，无则 null。
-     */
-    private Long analysisResultOwner(String contentHash) {
-        String value = redisTemplate.opsForValue().get(AnalysisTaskKeys.completedOwner(contentHash));
-        return value == null ? null : Long.valueOf(value);
-    }
-
-    /**
-     * 结果归属登记：分析落库后写入，7 天 TTL。
-     */
-    private void rememberAnalysisResult(String contentHash, Long mediaId) {
-        redisTemplate.opsForValue().set(
-                AnalysisTaskKeys.completedOwner(contentHash), String.valueOf(mediaId), Duration.ofDays(7));
     }
 
     /**
