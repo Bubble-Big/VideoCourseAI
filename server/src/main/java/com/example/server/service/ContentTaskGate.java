@@ -1,5 +1,6 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.common.AiStatus;
 import com.example.server.common.GateOutcome;
 import com.example.server.entity.MediaFile;
@@ -200,11 +201,17 @@ public class ContentTaskGate {
             mediaFile.setAiSummary(owner.getAiSummary());
             mediaFile.setAiStatus(AiStatus.SUCCESS.name());
             // 转写文本一并复用（owner 分析成功必有转写）
+            LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, mediaFile.getId())
+                .set(MediaFile::getAiSummary, owner.getAiSummary())
+                .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name());
             if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
                 mediaFile.setTranscriptText(owner.getTranscriptText());
                 mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
+                wrapper.set(MediaFile::getTranscriptText, owner.getTranscriptText())
+                       .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name());
             }
-            mediaFileMapper.updateById(mediaFile);
+            mediaFileMapper.update(null, wrapper);
             rememberAnalysis(contentHash, owner.getId()); // 回填归属缓存
             return true;
         }
@@ -283,7 +290,10 @@ public class ContentTaskGate {
         if (owner != null) {
             mediaFile.setTranscriptText(owner.getTranscriptText());
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            mediaFileMapper.updateById(mediaFile);
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, mediaFile.getId())
+                .set(MediaFile::getTranscriptText, owner.getTranscriptText())
+                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
             rememberTranscript(contentHash, owner.getId()); // 回填归属缓存
             return owner.getTranscriptText();
         }

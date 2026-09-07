@@ -1,5 +1,6 @@
 package com.example.server.controller;
 
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.entity.MediaFile;
 import com.example.server.common.AiStatus;
@@ -90,8 +91,16 @@ public class DebugController {
             file.setAiStatus(AiStatus.PENDING.name());
             file.setAiSummary(null);
             file.setAiProcessAt(LocalDateTime.now());
+            // 问题 5：用户手动重试视为全新一轮，aiAttempts 与 compensationAttempts 均清零
             file.setAiAttempts(0);
-            mediaFileMapper.updateById(file);
+            file.setCompensationAttempts(0);
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, file.getId())
+                .set(MediaFile::getAiStatus, AiStatus.PENDING.name())
+                .set(MediaFile::getAiSummary, null)
+                .set(MediaFile::getAiProcessAt, LocalDateTime.now())
+                .set(MediaFile::getAiAttempts, 0)
+                .set(MediaFile::getCompensationAttempts, 0));
             redisTemplate.delete("media:list:user:" + userIdKey);
 
             //发送消息（携带内容指纹，消费侧用 contentHash 做内容级锁 / 幂等）
@@ -103,9 +112,12 @@ public class DebugController {
         } catch (RuntimeException e) {
             // 任何失败（限流超限 / 状态冲突 / 发 MQ 异常）：回滚幂等键 + 回滚 aiStatus/aiSummary，允许稍后重试。
             // 否则发 MQ 失败后 aiStatus 已落库 PENDING，前置幂等校验会误判「任务已在运行」，任务永久卡死。
-            file.setAiStatus(prevAiStatus);
-            file.setAiSummary(prevAiSummary);
-            mediaFileMapper.updateById(file);
+
+            // 使用 LambdaUpdateWrapper 只更新需要的字段，避免乐观锁冲突
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, file.getId())
+                .set(MediaFile::getAiStatus, prevAiStatus)
+                .set(MediaFile::getAiSummary, prevAiSummary));
             redisTemplate.delete("media:list:user:" + userIdKey);
 
             contentTaskGate.rollbackSubmitting(contentHash);
@@ -128,8 +140,10 @@ public class DebugController {
         rateLimitService.requireTranscribeQuota(mediaFile.getUserId());
 
         // 更新状态为 PROCESSING，并失效缓存让前端立即感知
-        mediaFile.setTranscriptStatus(AiStatus.PROCESSING.name());
-        mediaFileMapper.updateById(mediaFile);
+        // 使用 LambdaUpdateWrapper 只更新需要的字段，避免乐观锁冲突
+        mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+            .eq(MediaFile::getId, mediaFile.getId())
+            .set(MediaFile::getTranscriptStatus, AiStatus.PROCESSING.name()));
         String userIdKey = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
         redisTemplate.delete("media:list:user:" + userIdKey);
 

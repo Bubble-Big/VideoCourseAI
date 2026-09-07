@@ -1,6 +1,7 @@
 package com.example.server.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.dto.ChunkUploadDTO;
 import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
@@ -295,7 +296,9 @@ public class ChunkUploadService {
                     // MD5 相同 → 同一文件，删除新文件，更新旧文件时间
                     minioUtils.removeFile(fileUrl);
                     existing.setUploadTime(LocalDateTime.now());
-                    mediaFileMapper.updateById(existing);
+                    mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                        .eq(MediaFile::getId, existing.getId())
+                        .set(MediaFile::getUploadTime, LocalDateTime.now()));
                     // 返回已有记录
                     redis.opsForHash().put(metaKey, "status", "COMPLETED");
                     redis.opsForHash().put(metaKey, "mediaId", String.valueOf(existing.getId()));

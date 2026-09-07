@@ -1,6 +1,7 @@
 package com.example.server.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.MediaService;
@@ -77,7 +78,9 @@ public class MediaController {
                 if (existing != null) {
                     // MD5 相同 → 复用旧记录，刷新上传时间并失效缓存，不重复上传 MinIO
                     existing.setUploadTime(LocalDateTime.now());
-                    mediaFileMapper.updateById(existing);
+                    mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                        .eq(MediaFile::getId, existing.getId())
+                        .set(MediaFile::getUploadTime, LocalDateTime.now()));
                     redisTemplate.delete("media:list:user:" + userId);
                     System.out.println("MD5 去重命中，复用已有记录 mediaId=" + existing.getId());
                     return ResponseEntity.ok("Upload success (deduplicated)");

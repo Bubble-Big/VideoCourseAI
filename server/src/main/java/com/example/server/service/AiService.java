@@ -1,5 +1,6 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.common.AiFailStage;
 import com.example.server.common.AiStatus;
 import com.example.server.common.GateOutcome;
@@ -16,6 +17,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.CompletableFuture;
 
 @Service
 public class AiService {
@@ -53,9 +55,11 @@ public class AiService {
      * AI 分析（@Async 异步执行）：落库保证前端可见 + 异常内部消化。
      * <p>成功写 SUCCESS；永久失败落 FAILED + 台账；瞬时失败保持 PROCESSING + 刷新时间戳，
      * 由 {@code AnalysisCompensationScheduler} 定时补偿重试（不再上抛给 MQ 重投）。</p>
+     *
+     * @return CompletableFuture 包装的 GateOutcome，用于补偿调度器判断是否真正执行
      */
     @Async("aiTaskExecutor")
-    public void asyncAnalyze(Long mediaId) {
+    public CompletableFuture<GateOutcome> asyncAnalyze(Long mediaId) {
         String contentHash = mediaService.contentHash(mediaId);
         GateOutcome outcome = contentTaskGate.inAnalysisLock(contentHash, () -> {
             MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
@@ -73,7 +77,10 @@ public class AiService {
             // 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳
             mediaFile.setAiStatus(AiStatus.PROCESSING.name());
             mediaFile.setAiProcessAt(LocalDateTime.now());
-            mediaFileMapper.updateById(mediaFile);
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, mediaFile.getId())
+                .set(MediaFile::getAiStatus, AiStatus.PROCESSING.name())
+                .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
 
             try {
                 // 1. 语音转文字：内容级锁 + 归属复用
@@ -88,7 +95,10 @@ public class AiService {
                     // 无语音内容：跳过 LLM，直接落受控总结文案
                     mediaFile.setAiSummary(NO_SPEECH_SUMMARY);
                     mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-                    mediaFileMapper.updateById(mediaFile);
+                    mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                        .eq(MediaFile::getId, mediaFile.getId())
+                        .set(MediaFile::getAiSummary, NO_SPEECH_SUMMARY)
+                        .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
                     contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
                     evictCache(mediaFile);
                     log.info("视频无语音内容，跳过 LLM, mediaId={}", mediaId);
@@ -99,7 +109,10 @@ public class AiService {
                 String summary = aiAnalysisStrategy.generateSummaryFromText(text);
                 mediaFile.setAiSummary(summary);
                 mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-                mediaFileMapper.updateById(mediaFile);
+                mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                    .eq(MediaFile::getId, mediaFile.getId())
+                    .set(MediaFile::getAiSummary, summary)
+                    .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
                 contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
                 evictCache(mediaFile);
                 log.info("AI 分析完成, mediaId={}", mediaId);
@@ -115,6 +128,7 @@ public class AiService {
         if (outcome == GateOutcome.DEFER) {
             log.info("分析锁让位, mediaId={} contentHash={}", mediaId, contentHash);
         }
+        return CompletableFuture.completedFuture(outcome);
     }
 
     /**
@@ -132,7 +146,10 @@ public class AiService {
             // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
             mediaFile.setAiStatus(AiStatus.PROCESSING.name());
             mediaFile.setAiProcessAt(LocalDateTime.now());
-            mediaFileMapper.updateById(mediaFile);
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, mediaFile.getId())
+                .set(MediaFile::getAiStatus, AiStatus.PROCESSING.name())
+                .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
         }
         if (e instanceof AiAnalysisException ae) {
             failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
@@ -170,7 +187,9 @@ public class AiService {
             if (text == null) {
                 // 等待转写锁超时仍未复用：回滚到 NONE 允许重试，避免永久卡 PROCESSING
                 mediaFile.setTranscriptStatus(AiStatus.NONE.name());
-                mediaFileMapper.updateById(mediaFile);
+                mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                    .eq(MediaFile::getId, mediaFile.getId())
+                    .set(MediaFile::getTranscriptStatus, AiStatus.NONE.name()));
                 evictCache(mediaFile);
                 log.info("等待转写锁超时，回滚待重试, mediaId={} contentHash={}", mediaId, contentHash);
                 return;
@@ -184,7 +203,10 @@ public class AiService {
             // 失败只置状态字段，不塞失败文案进内容字段（由前端按状态渲染）
             mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
             mediaFile.setTranscriptText(null);
-            mediaFileMapper.updateById(mediaFile);
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, mediaFile.getId())
+                .set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name())
+                .set(MediaFile::getTranscriptText, null));
             evictCache(mediaFile);
         }
     }
@@ -217,7 +239,10 @@ public class AiService {
             }
             mediaFile.setTranscriptText(text);
             mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            mediaFileMapper.updateById(mediaFile);
+            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+                .eq(MediaFile::getId, mediaFile.getId())
+                .set(MediaFile::getTranscriptText, text)
+                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
             contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
             resultHolder[0] = text;
             return GateOutcome.PROCEED;
@@ -238,10 +263,15 @@ public class AiService {
         mediaFile.setAiStatus(AiStatus.FAILED.name());
         mediaFile.setAiSummary(null); // 失败不塞文案，由前端按状态渲染
         // 若转写阶段尚未成功（即失败发生在 transcribe），同步置 FAILED，避免与 aiStatus 不一致
+        LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
+            .eq(MediaFile::getId, mediaFile.getId())
+            .set(MediaFile::getAiStatus, AiStatus.FAILED.name())
+            .set(MediaFile::getAiSummary, null);
         if (!AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())) {
             mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
+            wrapper.set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name());
         }
-        mediaFileMapper.updateById(mediaFile);
+        mediaFileMapper.update(null, wrapper);
         evictCache(mediaFile);
         log.error("AI 分析失败, mediaId={}, err={}", mediaFile.getId(), e.getMessage(), e);
     }
