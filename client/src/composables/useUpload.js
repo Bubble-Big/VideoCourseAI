@@ -3,6 +3,7 @@ import { useChunkedUpload } from './useChunkedUpload.js'
 import { useAuth } from './useAuth.js'
 import { useNotice } from './useNotice.js'
 import { useMedia } from './useMedia.js'
+import { useConfirm } from './useConfirm.js'
 import * as api from '../api/index.js'
 
 // ---- 模块级状态（单例） ----
@@ -11,7 +12,6 @@ const videoUrl = ref('')
 const uploading = ref(false)
 const isDragOver = ref(false)
 const resumeBanner = ref({ visible: false, fileName: '', progress: 0 })
-const duplicateBanner = ref({ visible: false, fileName: '' })
 
 const {
   uploadState: chunkState,
@@ -25,6 +25,7 @@ const {
 const { currentUser, openAuthModal } = useAuth()
 const { message, showMsg } = useNotice()
 const { fetchList } = useMedia()
+const { confirm } = useConfirm()
 
 // 监听分片上传状态变化
 watch(() => chunkState.value.status, (newStatus) => {
@@ -59,27 +60,33 @@ watch(() => chunkState.value.status, (newStatus) => {
   }
 })
 
-// HINT_DUPLICATE：去重提示横幅
-watch(() => chunkState.value.duplicateMediaId, (mediaId) => {
+// HINT_DUPLICATE：去重提示弹框
+watch(() => chunkState.value.duplicateMediaId, async (mediaId) => {
   if (mediaId) {
     uploading.value = false
-    duplicateBanner.value = {
-      visible: true,
-      fileName: chunkState.value.fileName,
+    const fileName = chunkState.value.fileName
+    const confirmed = await confirm(
+      `同名视频文件「${fileName}」资料库中已存在，可能为重复文件，是否继续上传？`,
+      '重复文件提醒',
+      '坚持上传',
+      '跳过'
+    )
+    if (confirmed) {
+      await handleDuplicateForce()
+    } else {
+      await handleDuplicateSkip()
     }
   }
 })
 
-// ---- 去重横幅操作 ----
+// ---- 去重操作 ----
 
 async function handleDuplicateSkip() {
-  duplicateBanner.value.visible = false
   file.value = null
   showMsg('已跳过重复文件')
 }
 
 async function handleDuplicateForce() {
-  duplicateBanner.value.visible = false
   uploading.value = true
   message.value = '正在上传（已确认忽略重复提示）...'
   const userId = currentUser.value ? currentUser.value.id : null
@@ -163,11 +170,11 @@ async function uploadFile() {
   const resumeInfo = await matchUpload(file.value)
 
   if (resumeInfo) {
-    const confirmed = confirm(
-      `检测到该文件的未完成上传记录：\n` +
-      `文件：${resumeInfo.fileName}\n` +
-      `已完成：${resumeInfo.completedChunks.size}/${resumeInfo.totalChunks} 片\n\n` +
-      `是否继续上传？（点击"确定"继续，点击"取消"重新开始）`
+    const confirmed = await confirm(
+      `检测到该文件的未完成上传记录：\n文件：${resumeInfo.fileName}\n已完成：${resumeInfo.completedChunks.size}/${resumeInfo.totalChunks} 片\n\n是否继续上传？`,
+      '续传确认',
+      '继续上传',
+      '重新开始'
     )
     if (confirmed) {
       try {
@@ -257,15 +264,12 @@ export function useUpload() {
     uploading,
     isDragOver,
     resumeBanner,
-    duplicateBanner,
     chunkState,
     handleFileChange,
     handleDrop,
     handleUrlUpload,
     handleResumeContinue,
     handleResumeRestart,
-    handleDuplicateForce,
-    handleDuplicateSkip,
     cancelChunk,
     installBeforeUnload,
     uninstallBeforeUnload,

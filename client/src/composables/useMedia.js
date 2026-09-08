@@ -2,6 +2,7 @@ import { ref, computed, watch } from 'vue'
 import { marked } from 'marked'
 import { useAuth } from './useAuth.js'
 import { useNotice } from './useNotice.js'
+import { useConfirm } from './useConfirm.js'
 import * as api from '../api/index.js'
 
 // ---- 模块级状态（单例） ----
@@ -11,6 +12,7 @@ const pollingTimers = ref({})
 
 const { currentUser } = useAuth()
 const { showMsg } = useNotice()
+const { confirm } = useConfirm()
 
 // 列表随用户态联动：登录 → 刷新，登出 → 清空（避免与 useAuth 形成循环依赖）
 watch(currentUser, (user) => {
@@ -42,7 +44,13 @@ async function fetchList() {
 }
 
 async function deleteItem(item) {
-  if (!confirm(`确认要永久删除 "${item.filename}" 吗？`)) return
+  const confirmed = await confirm(
+    `确认要永久删除 "${item.filename}" 吗？`,
+    '删除确认',
+    '确认删除',
+    '取消'
+  )
+  if (!confirmed) return
   try {
     const res = await api.deleteMedia(item.id, currentUser.value ? currentUser.value.id : null)
     const text = await res.text()
@@ -75,7 +83,7 @@ async function downloadAudio(item) {
     window.URL.revokeObjectURL(downloadUrl)
     showMsg('✅ 下载完成')
   } catch (e) {
-    alert("下载失败")
+    showMsg('❌ 下载请求失败', true)
   }
 }
 

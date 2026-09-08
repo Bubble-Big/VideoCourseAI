@@ -1,5 +1,4 @@
 <template>
-  <div class="sidebar-backdrop" v-if="sidebar.visible" @click="closeSidebar"></div>
   <div class="sidebar-panel" :class="{ 'is-open': sidebar.visible }">
     <div class="sidebar-header">
       <div class="sidebar-title">

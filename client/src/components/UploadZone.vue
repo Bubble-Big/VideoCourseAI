@@ -104,20 +104,6 @@
         </div>
       </div>
     </transition>
-
-    <!-- 去重提示横幅（红色警告体系） -->
-    <transition name="toast-pop">
-      <div v-if="duplicateBanner.visible" class="duplicate-banner">
-        <div class="resume-info">
-          <span class="resume-icon">⚠️</span>
-          <span>同名视频文件「{{ duplicateBanner.fileName }}」资料库中已存在，可能为重复文件，是否继续上传？</span>
-        </div>
-        <div class="resume-actions">
-          <button class="resume-btn force" @click="handleDuplicateForce">坚持上传</button>
-          <button class="resume-btn restart" @click="handleDuplicateSkip">跳过</button>
-        </div>
-      </div>
-    </transition>
   </section>
 </template>
 
@@ -131,15 +117,12 @@ const {
   uploading,
   isDragOver,
   resumeBanner,
-  duplicateBanner,
   chunkState,
   handleFileChange,
   handleDrop,
   handleUrlUpload,
   handleResumeContinue,
   handleResumeRestart,
-  handleDuplicateForce,
-  handleDuplicateSkip,
   cancelChunk,
 } = useUpload()
 
