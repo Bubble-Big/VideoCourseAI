@@ -3,6 +3,7 @@ package com.example.server.entity;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.baomidou.mybatisplus.annotation.Version;
 import lombok.Data;
 import java.time.LocalDateTime;
 
@@ -36,4 +37,11 @@ public class MediaFile {
     // AI 分析补偿式重试：最近一次尝试时间 + 已尝试次数（见 plan/AI_ANALYSIS_COMPENSATION_PLAN.md）
     private LocalDateTime aiProcessAt;
     private Integer aiAttempts;
+
+    // 乐观锁版本号（问题 1：防补偿调度器与原任务写入竞态覆盖）
+    @Version
+    private Integer version;
+
+    // 补偿调度器专属重试计数（问题 5：与用户手动重试 aiAttempts 语义分离）
+    private Integer compensationAttempts;
 }

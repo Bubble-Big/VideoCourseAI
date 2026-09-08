@@ -80,10 +80,12 @@ public class AliyunAsrUtils {
                         lastError = "HTTP " + response.code() + ": " + errBody;
                         log.warn("⚠️ ASR 失败 ({}/{}): {}", i + 1, maxRetries, lastError);
 
-                        // 遇到 500/502/503 或 408/429 等服务端错误，等待 2 秒再重试
+                        // 遇到 500/502/503 或 408/429 等服务端错误，指数退避重试
                         int code = response.code();
                         if (code >= 500 || code == 408 || code == 429) {
-                            Thread.sleep(2000);
+                            long backoffMs = 1_000L << i;   // 指数退避：i=0→1s, i=1→2s, i=2→4s
+                            log.info("🎤 [ASR] 触发退避，等待 {}ms 后重试", backoffMs);
+                            Thread.sleep(backoffMs);
                             continue;
                         } else {
                             // 如果是 400/401 等客户端错误，直接抛出不重试

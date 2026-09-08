@@ -160,7 +160,9 @@ public class DeepSeekUtils {
 
                         int code = response.code();
                         if (code >= 500 || code == 408 || code == 429) {
-                            Thread.sleep(2000);
+                            long backoffMs = 1_000L << i;   // 指数退避：i=0→1s, i=1→2s, i=2→4s
+                            log.info("[DeepSeek] 触发退避，等待 {}ms 后重试", backoffMs);
+                            Thread.sleep(backoffMs);
                             continue;
                         } else {
                             throw new AiAnalysisException("DeepSeek 请求被拒绝: " + lastError, false, AiFailStage.LLM);
