@@ -148,9 +148,9 @@ grep -rn "setTranscriptStatus\|transcriptStatus.*=" server/src/main --include="*
 
 #### 5.1 功能测试
 - [ ] 单实例场景
-  - [ ] AI 分析: NONE → PENDING → PROCESSING → SUCCESS
-  - [ ] 文字提取: NONE → PROCESSING → SUCCESS
-  - [ ] 失败场景: PROCESSING → FAILED
+  - [x] AI 分析: NONE → PENDING → PROCESSING → SUCCESS（已通过，2026-09-11）
+  - [x] 文字提取: NONE → PROCESSING → SUCCESS（已通过，2026-09-11）
+  - [x] 失败场景: PROCESSING → FAILED（已通过，2026-09-11，详见下方记录）
   - [ ] 死信兜底: DLQ 消费 → FAILED
   - [ ] 结果复用: 复用他人结果 → SUCCESS (无 PROCESSING)
 - [ ] 多实例场景 (启动两个后端实例)
@@ -177,6 +177,25 @@ grep -rn "setTranscriptStatus\|transcriptStatus.*=" server/src/main --include="*
   - [ ] 服务端连接数峰值
   - [ ] Redis Pub/Sub 消息延迟 (目标 < 50ms)
   - [ ] JVM 堆内存 / CPU 使用率
+
+**测试记录（2026-09-11）**:
+
+| 场景 | 事件序列 | 结果 |
+|------|---------|------|
+| AI 分析成功 | NONE → PENDING → PROCESSING → SUCCESS | ✅ 通过 |
+| 文字提取成功 | NONE → PROCESSING → SUCCESS | ✅ 通过 |
+| AI 分析失败（API Key 错误） | NONE → PENDING → PROCESSING → FAILED | ✅ 通过 |
+
+失败场景验证细节：
+- 触发方式：`application-local.properties` 中 DeepSeek API Key 末尾追加无效字符
+- 实测 SSE 事件流（mediaId=56）：
+  ```
+  state: NONE      terminal: false  (初始状态)
+  state: PENDING   terminal: false  (MQ 投递后约 15ms)
+  state: PROCESSING terminal: false  (Consumer 消费)
+  state: FAILED    terminal: true   error: "DeepSeek 请求被拒绝: HTTP 401: {\"code\":30014,\"message\":\"Token is invalid.\"}"
+  ```
+- FAILED 事件中 `terminal: true`，SSE 连接自动关闭，符合预期
 
 **验证标准**:
 - 所有测试用例通过
@@ -335,7 +354,7 @@ if (USE_SSE) {
 | Phase 2 | 1 天 | 0.5 天 | ✅ 已完成 | 2026-09-10 | SSE 端点已暴露，集成测试待补充 |
 | Phase 3 | 1.5 天 | 0.5 天 | ✅ 已完成 | 2026-09-10 | AiService、ContentTaskGate 所有状态变更点已集成 SSE 推送 |
 | Phase 4 | 2 天 | 0.5 天 | ✅ 已完成 | 2026-09-10 | 创建 useTaskEvents.js，改造 useMedia.js 替换轮询为 SSE |
-| Phase 5 | 1.5 天 | - | 🔄 当前阶段 | - | 待端到端验证 |
+| Phase 5 | 1.5 天 | 0.5 天 | 🔄 进行中 | 2026-09-11 | 成功/失败场景已通过，DLQ/复用待测 |
 | Phase 6 | 2 周 | - | ⚪ 未开始 | - | - |
 | Phase 7 | 1 天 | - | ⚪ 未开始 | - | - |
 
