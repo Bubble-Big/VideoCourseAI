@@ -151,7 +151,7 @@ grep -rn "setTranscriptStatus\|transcriptStatus.*=" server/src/main --include="*
   - [x] AI 分析: NONE → PENDING → PROCESSING → SUCCESS（已通过，2026-09-11）
   - [x] 文字提取: NONE → PROCESSING → SUCCESS（已通过，2026-09-11）
   - [x] 失败场景: PROCESSING → FAILED（已通过，2026-09-11，详见下方记录）
-  - [ ] 死信兜底: DLQ 消费 → FAILED
+  - [x] 死信兜底: DLQ 消费 → FAILED（已通过，2026-09-11，详见下方记录）
   - [ ] 结果复用: 复用他人结果 → SUCCESS (无 PROCESSING)
 - [ ] 多实例场景 (启动两个后端实例)
   - [ ] 实例 A 提交任务
@@ -185,6 +185,7 @@ grep -rn "setTranscriptStatus\|transcriptStatus.*=" server/src/main --include="*
 | AI 分析成功 | NONE → PENDING → PROCESSING → SUCCESS | ✅ 通过 |
 | 文字提取成功 | NONE → PROCESSING → SUCCESS | ✅ 通过 |
 | AI 分析失败（API Key 错误） | NONE → PENDING → PROCESSING → FAILED | ✅ 通过 |
+| DLQ 死信兜底 | NONE → PENDING → FAILED | ✅ 通过 |
 
 失败场景验证细节：
 - 触发方式：`application-local.properties` 中 DeepSeek API Key 末尾追加无效字符
@@ -196,6 +197,22 @@ grep -rn "setTranscriptStatus\|transcriptStatus.*=" server/src/main --include="*
   state: FAILED    terminal: true   error: "DeepSeek 请求被拒绝: HTTP 401: {\"code\":30014,\"message\":\"Token is invalid.\"}"
   ```
 - FAILED 事件中 `terminal: true`，SSE 连接自动关闭，符合预期
+
+DLQ 兜底场景验证细节：
+- 触发方式：`VideoAnalysisConsumer.onMessage` 临时抛 `RuntimeException`，强制 MQ 消费失败
+- MQ 重试链路（mediaId=56）：
+  ```
+  21:47:24 第 1 次消费失败
+  21:47:44 第 2 次重试（20s 延迟）
+  21:48:14 第 3 次重试（30s 延迟）
+  21:48:24 DLQ Consumer 兜底处理
+  ```
+- 实测 SSE 事件流：
+  ```
+  state: PENDING   terminal: false  (MQ 投递)
+  state: FAILED    terminal: true   error: "重试耗尽，判定失败"
+  ```
+- `VideoAnalysisDlqConsumer` 正确消费死信，调用 `AiService.markFailedFinal`，SSE 推送 FAILED
 
 **验证标准**:
 - 所有测试用例通过
