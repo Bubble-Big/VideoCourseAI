@@ -251,6 +251,68 @@ if (USE_SSE) {
 
 ---
 
+### 🔒 Phase 8: 安全与健壮性修复（待处理）
+
+**目标**：消除已识别的安全漏洞与竞态问题，提升生产可用性
+
+#### P0 — 上线前必须修复
+
+- [ ] **SSE 端点无权限校验（信息泄漏）**
+  - 文件：`DebugController.java:176-199`
+  - 问题：`/debug/task-events` 仅校验 `type` 参数与文件存在性，未验证当前用户是否有权访问该 `mediaId`
+  - 风险：任意用户猜到有效 ID 即可订阅他人的 AI 摘要与转录全文
+  - 修复方向：在查询 `MediaFile` 后校验 `file.getUserId()` 是否与当前 Session 用户一致，不匹配返回 403
+
+#### P1 — 高优先级
+
+- [ ] **`subscribe()` 存在事件丢失竞态窗口**
+  - 文件：`TaskEventService.java:83-92`
+  - 问题：先推送初始状态、再注册到连接池，两步之间 Redis Pub/Sub 消息若恰好到达则该 emitter 永远收不到终态，连接挂满 30 分钟
+  - 修复方向：调换顺序——先注册 emitter，再推送初始状态；或订阅后额外做一次数据库状态补偿检查
+
+- [ ] **`redisAvailable` 无恢复路径**
+  - 文件：`TaskEventService.java:147-151`
+  - 问题：Redis 异常时将 `redisAvailable` 置为 `false`，但永不恢复（`@PostConstruct` 只在启动时执行），一次抖动导致实例永久降级至本地单实例模式
+  - 修复方向：增加定期探活任务（如每 30 秒尝试 `convertAndSend`），成功时将标志重置为 `true`
+
+#### P2 — 中优先级
+
+- [ ] **`@PostConstruct` 测试消息触发自身监听导致 NPE 日志**
+  - 文件：`TaskEventService.java:61`，`onMessage:160`
+  - 问题：启动 ping 消息被自身 `onMessage` 接收，解析后 `key` 为 `null`，`ConcurrentHashMap.get(null)` 抛 NPE 被吞，每次启动产生 error 日志
+  - 修复方向：`onMessage` 中增加 `if (key == null) return;` 守卫
+
+- [ ] **前端 `onerror` 对 5xx 误判为终态不重连**
+  - 文件：`useTaskEvents.js:49-58`
+  - 问题：`readyState === CLOSED` 包含 5xx，服务端临时不可用也会停止重试
+  - 修复方向：EventSource 规范下无法直接获取 HTTP 状态码，可改为通过 `fetch` 预检或依赖响应体约定区分 4xx/5xx；至少对超时型关闭允许重连
+
+- [ ] **已完成任务的新订阅者 emitter 悬挂 30 分钟**
+  - 文件：`TaskEventService.java:78-106`
+  - 问题：初始状态已是 `SUCCESS/FAILED` 时，emitter 仍被注册进连接池，终态不再推送，连接空占内存直到超时
+  - 修复方向：`subscribe()` 推送初始事件后检查 `initialEvent.isTerminal()`，若为终态则立即调用 `emitter.complete()` 并跳过注册
+
+#### P3 — 低优先级 / 优化
+
+- [ ] **终态时 emitter 重复清理（并发冗余）**
+  - 文件：`TaskEventService.java:196-207`
+  - `emitter.complete()` 触发 `onCompletion` → `removeEmitter()`，之后再执行 `emitterPool.remove(key)`，存在重复写操作
+  - 修复方向：终态处理中直接使用 `emitterPool.remove(key)` 批量清理，不依赖回调
+
+- [ ] **`@CrossOrigin` 配置过于宽松**
+  - 文件：`DebugController.java:38`
+  - `allowCredentials = "true"` + `originPatterns = "*"` 在生产环境不安全，需明确指定允许的源
+
+- [ ] **缺少心跳机制**
+  - 长连接在经过反向代理（Nginx 默认 60s 超时）后实际已断开，但服务端 30 分钟内不清理，造成"僵尸连接"积压
+  - 修复方向：每 20-25 秒向所有 emitter 推送一条 `: keepalive` 注释行；推送失败时立即移除
+
+**验证标准**：
+- P0 修复后 SSE 端点需通过越权访问测试（访问非本人文件返回 403）
+- P1 竞态修复后在高并发场景下事件不丢失
+
+---
+
 ## 风险控制
 
 ### 回滚方案
