@@ -36,19 +36,22 @@ public class AiService {
     private final MediaService mediaService;
     private final FailedAnalysisTaskService failedTaskService;
     private final ContentTaskGate contentTaskGate;
+    private final TaskEventService taskEventService;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                      StringRedisTemplate redisTemplate,
                      MediaService mediaService,
                      FailedAnalysisTaskService failedTaskService,
-                     ContentTaskGate contentTaskGate) {
+                     ContentTaskGate contentTaskGate,
+                     TaskEventService taskEventService) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.redisTemplate = redisTemplate;
         this.mediaService = mediaService;
         this.failedTaskService = failedTaskService;
         this.contentTaskGate = contentTaskGate;
+        this.taskEventService = taskEventService;
     }
 
     /**
@@ -82,6 +85,9 @@ public class AiService {
                 .set(MediaFile::getAiStatus, AiStatus.PROCESSING.name())
                 .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
 
+            // SSE 推送：PROCESSING
+            taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
+
             try {
                 // 1. 语音转文字：内容级锁 + 归属复用
                 String text = transcribeWithReuse(mediaFile, contentHash);
@@ -101,6 +107,10 @@ public class AiService {
                         .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
                     contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
                     evictCache(mediaFile);
+
+                    // SSE 推送：SUCCESS（无语音内容）
+                    taskEventService.publishAnalysis(mediaId, AiStatus.SUCCESS.name(), NO_SPEECH_SUMMARY, null);
+
                     log.info("视频无语音内容，跳过 LLM, mediaId={}", mediaId);
                     return GateOutcome.PROCEED;
                 }
@@ -115,6 +125,10 @@ public class AiService {
                     .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
                 contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
                 evictCache(mediaFile);
+
+                // SSE 推送：SUCCESS
+                taskEventService.publishAnalysis(mediaId, AiStatus.SUCCESS.name(), summary, null);
+
                 log.info("AI 分析完成, mediaId={}", mediaId);
                 return GateOutcome.PROCEED;
 
@@ -150,6 +164,9 @@ public class AiService {
                 .eq(MediaFile::getId, mediaFile.getId())
                 .set(MediaFile::getAiStatus, AiStatus.PROCESSING.name())
                 .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
+
+            // SSE 推送：PROCESSING（瞬时失败，等待重试）
+            taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
         }
         if (e instanceof AiAnalysisException ae) {
             failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
@@ -208,6 +225,9 @@ public class AiService {
                 .set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name())
                 .set(MediaFile::getTranscriptText, null));
             evictCache(mediaFile);
+
+            // SSE 推送：transcription FAILED
+            taskEventService.publishTranscription(mediaId, AiStatus.FAILED.name(), null, e.getMessage());
         }
     }
 
@@ -244,6 +264,10 @@ public class AiService {
                 .set(MediaFile::getTranscriptText, text)
                 .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
             contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
+
+            // SSE 推送：transcription SUCCESS
+            taskEventService.publishTranscription(mediaFile.getId(), AiStatus.SUCCESS.name(), text, null);
+
             resultHolder[0] = text;
             return GateOutcome.PROCEED;
         });
@@ -273,6 +297,10 @@ public class AiService {
         }
         mediaFileMapper.update(null, wrapper);
         evictCache(mediaFile);
+
+        // SSE 推送：FAILED
+        taskEventService.publishAnalysis(mediaFile.getId(), AiStatus.FAILED.name(), null, e.getMessage());
+
         log.error("AI 分析失败, mediaId={}, err={}", mediaFile.getId(), e.getMessage(), e);
     }
 

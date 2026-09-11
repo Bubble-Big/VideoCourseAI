@@ -4,11 +4,13 @@ import { useAuth } from './useAuth.js'
 import { useNotice } from './useNotice.js'
 import { useConfirm } from './useConfirm.js'
 import * as api from '../api/index.js'
+import { createTaskStreams } from './useTaskEvents.js'
 
 // ---- 模块级状态（单例） ----
 const list = ref([])
 const sidebar = ref({ visible: false, type: 'ai', id: null, title: '', content: '', loading: false })
 const pollingTimers = ref({})
+const taskStreams = createTaskStreams()
 
 const { currentUser } = useAuth()
 const { showMsg } = useNotice()
@@ -99,13 +101,12 @@ async function transcribe(id) {
     return
   }
 
-  // 2. 正在处理 → 打开转圈，并恢复/维持轮询
+  // 2. 正在处理 → 打开转圈，订阅 SSE
   if (st === 'PROCESSING') {
     openSidebar('text', '全量文字提取', id)
     sidebar.value.loading = true
     sidebar.value.content = "文字转写中..."
-    const t = pollingTimers.value[id]
-    if (!t || t.type !== 'text') startPolling(id, 'text')
+    startSSEStream(id, 'transcribe')
     return
   }
 
@@ -123,7 +124,7 @@ async function transcribe(id) {
       return
     }
     sidebar.value.content = "资源请求成功！准备接入转写..."
-    startPolling(id, 'text')
+    startSSEStream(id, 'transcribe')
   } catch (e) {
     sidebar.value.content = "Error: " + e
     sidebar.value.loading = false
@@ -143,13 +144,12 @@ async function aiAnalyze(id) {
     return
   }
 
-  // 2. 正在处理 → 打开转圈，并恢复/维持轮询
+  // 2. 正在处理 → 打开转圈，订阅 SSE
   if (st === 'PENDING' || st === 'PROCESSING') {
     openSidebar('ai', 'AI 智能总结', id)
     sidebar.value.loading = true
     sidebar.value.content = st === 'PENDING' ? 'AI调用中...' : 'AI分析中...'
-    const t = pollingTimers.value[id]
-    if (!t || t.type !== 'ai') startPolling(id, 'ai')
+    startSSEStream(id, 'ai')
     return
   }
 
@@ -170,13 +170,63 @@ async function aiAnalyze(id) {
       return
     }
 
-    // 5. 成功投递，开始轮询
-    startPolling(id, 'ai')
+    // 5. 成功投递，开始 SSE
+    startSSEStream(id, 'ai')
     sidebar.value.content = "资源请求成功！准备接入AI..."
   } catch (e) {
     sidebar.value.content = "Error: " + e
     sidebar.value.loading = false
   }
+}
+
+function startSSEStream(id, type) {
+  const sseType = type === 'text' ? 'transcribe' : type  // 统一映射到后端 type 参数
+  taskStreams.stop(id, sseType)  // 关闭同 key 的旧连接
+
+  taskStreams.start(id, sseType, {
+    onEvent(event) {
+      // 同步本地列表
+      const item = list.value.find(i => i.id === event.mediaId)
+      if (item) {
+        if (sseType === 'ai') {
+          item.aiStatus = event.state
+          if (event.aiSummary) item.aiSummary = event.aiSummary
+        } else {
+          item.transcriptStatus = event.state
+          if (event.transcriptText) item.transcriptText = event.transcriptText
+        }
+      }
+
+      // 侧边栏不属于此任务时忽略 UI 更新
+      if (!sidebar.value.visible || sidebar.value.id !== event.mediaId) return
+
+      if (event.state === 'SUCCESS') {
+        sidebar.value.content = sseType === 'ai'
+          ? (event.aiSummary || item?.aiSummary || '')
+          : (event.transcriptText || item?.transcriptText || '')
+        sidebar.value.loading = false
+        showMsg('✅ 任务完成')
+      } else if (event.state === 'FAILED') {
+        sidebar.value.content = sseType === 'ai' ? '❌ 分析失败，请稍后重试' : '❌ 提取失败，请稍后重试'
+        sidebar.value.loading = false
+        showMsg('⚠️ 任务结束，但存在错误', true)
+      } else if (event.state === 'PROCESSING') {
+        sidebar.value.content = sseType === 'ai' ? 'AI分析中...' : '文字转写中...'
+        sidebar.value.loading = true
+      } else if (event.state === 'PENDING') {
+        sidebar.value.content = 'AI调用中...'
+        sidebar.value.loading = true
+      }
+    },
+    onError(err) {
+      console.warn('[SSE] 连接失败:', err)
+      if (sidebar.value.visible && sidebar.value.id === id) {
+        sidebar.value.content = '任务超时未完成，请稍后重试'
+        sidebar.value.loading = false
+      }
+      showMsg('⚠️ 任务超时未完成', true)
+    },
+  })
 }
 
 function startPolling(id, type) {
@@ -270,6 +320,13 @@ function openSidebar(type, title, id) {
 }
 
 function closeSidebar() {
+  // 关闭侧边栏时停止对应的 SSE 连接（若任务仍在进行）
+  const id = sidebar.value.id
+  const type = sidebar.value.type
+  if (id != null) {
+    const sseType = type === 'text' ? 'transcribe' : type
+    taskStreams.stop(id, sseType)
+  }
   sidebar.value.visible = false
 }
 

@@ -8,9 +8,11 @@ import com.example.server.common.ErrorCode;
 import com.example.server.common.Result;
 import com.example.server.exception.BusinessException;
 import com.example.server.mapper.MediaFileMapper;
+import com.example.server.dto.TaskEvent;
 import com.example.server.service.AiService;
 import com.example.server.service.ContentTaskGate;
 import com.example.server.service.RateLimitService;
+import com.example.server.service.TaskEventService;
 import com.example.server.strategy.AiAnalysisStrategy;
 import com.example.server.utils.AnalysisTaskKeys;
 import com.example.server.utils.FfmpegUtils;
@@ -22,6 +24,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.File;
 import java.io.IOException;
@@ -42,6 +45,7 @@ public class DebugController {
     private final org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate;
     private final RateLimitService rateLimitService;
     private final ContentTaskGate contentTaskGate;
+    private final TaskEventService taskEventService;
 
     public DebugController(MediaFileMapper mediaFileMapper,
                            @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
@@ -49,7 +53,8 @@ public class DebugController {
                            StringRedisTemplate redisTemplate,
                            org.apache.rocketmq.spring.core.RocketMQTemplate rocketMQTemplate,
                            RateLimitService rateLimitService,
-                           ContentTaskGate contentTaskGate) {
+                           ContentTaskGate contentTaskGate,
+                           TaskEventService taskEventService) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.aiService = aiService;
@@ -57,6 +62,7 @@ public class DebugController {
         this.rocketMQTemplate = rocketMQTemplate;
         this.rateLimitService = rateLimitService;
         this.contentTaskGate = contentTaskGate;
+        this.taskEventService = taskEventService;
     }
 
     // AI总结接口(幂等键 + 限流 + MQ)
@@ -107,6 +113,9 @@ public class DebugController {
             AnalysisTaskMsg msg = new AnalysisTaskMsg(id, "START_ANALYSIS", contentHash);
             rocketMQTemplate.convertAndSend("video-analysis-topic", msg);
 
+            // SSE 推送：PENDING
+            taskEventService.publishAnalysis(id, AiStatus.PENDING.name(), null, null);
+
             return Result.ok("任务已投递至 RocketMQ");
 
         } catch (RuntimeException e) {
@@ -147,10 +156,47 @@ public class DebugController {
         String userIdKey = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
         redisTemplate.delete("media:list:user:" + userIdKey);
 
+        // SSE 推送：transcription PROCESSING
+        taskEventService.publishTranscription(id, AiStatus.PROCESSING.name(), null, null);
+
         // 调用异步服务
         aiService.asyncTranscribe(id);
 
         return Result.ok("提取任务已后台运行");
+    }
+
+    /**
+     * SSE 任务事件流订阅端点
+     *
+     * @param id 媒体文件 ID
+     * @param type 任务类型：ai（AI 分析）/ transcribe（文字提取）
+     * @return SSE Emitter（text/event-stream）
+     */
+    @GetMapping(value = "/task-events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter subscribeTaskEvents(@RequestParam Long id, @RequestParam String type) {
+        // 验证参数
+        if (!"ai".equals(type) && !"transcribe".equals(type)) {
+            throw new BusinessException(ErrorCode.INVALID_ARGUMENT, "type 参数必须为 ai 或 transcribe");
+        }
+
+        // 查询当前状态
+        MediaFile mediaFile = mediaFileMapper.selectById(id);
+        if (mediaFile == null) {
+            throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在");
+        }
+
+        // 构建初始事件
+        TaskEvent initialEvent;
+        if ("ai".equals(type)) {
+            String state = mediaFile.getAiStatus() != null ? mediaFile.getAiStatus() : AiStatus.NONE.name();
+            initialEvent = TaskEvent.analysis(id, state, mediaFile.getAiSummary(), null);
+        } else {
+            String state = mediaFile.getTranscriptStatus() != null ? mediaFile.getTranscriptStatus() : AiStatus.NONE.name();
+            initialEvent = TaskEvent.transcription(id, state, mediaFile.getTranscriptText(), null);
+        }
+
+        // 订阅并返回 SSE 连接
+        return taskEventService.subscribe(id, type, initialEvent);
     }
 
     //下载音频接口

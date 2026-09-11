@@ -45,6 +45,7 @@ public class ContentTaskGate {
     private final RedissonClient redissonClient;
     private final StringRedisTemplate redisTemplate;
     private final MediaFileMapper mediaFileMapper;
+    private final TaskEventService taskEventService;
 
     @Value("${ai.analysis-lock-wait-seconds:600}")
     private int analysisLockWaitSeconds;
@@ -213,6 +214,13 @@ public class ContentTaskGate {
             }
             mediaFileMapper.update(null, wrapper);
             rememberAnalysis(contentHash, owner.getId()); // 回填归属缓存
+
+            // SSE 推送：复用结果 SUCCESS
+            taskEventService.publishAnalysis(mediaFile.getId(), AiStatus.SUCCESS.name(), owner.getAiSummary(), null);
+            if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
+                taskEventService.publishTranscription(mediaFile.getId(), AiStatus.SUCCESS.name(), owner.getTranscriptText(), null);
+            }
+
             return true;
         }
         return false;
@@ -295,6 +303,10 @@ public class ContentTaskGate {
                 .set(MediaFile::getTranscriptText, owner.getTranscriptText())
                 .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
             rememberTranscript(contentHash, owner.getId()); // 回填归属缓存
+
+            // SSE 推送：复用转写结果 SUCCESS
+            taskEventService.publishTranscription(mediaFile.getId(), AiStatus.SUCCESS.name(), owner.getTranscriptText(), null);
+
             return owner.getTranscriptText();
         }
         return null;

@@ -52,15 +52,18 @@ public class AnalysisCompensationScheduler {
     private final MediaFileMapper mediaFileMapper;
     private final AiService aiService;
     private final FailedAnalysisTaskService failedTaskService;
+    private final TaskEventService taskEventService;
     private final RedissonClient redissonClient;
 
     public AnalysisCompensationScheduler(MediaFileMapper mediaFileMapper,
                                          AiService aiService,
                                          FailedAnalysisTaskService failedTaskService,
+                                         TaskEventService taskEventService,
                                          RedissonClient redissonClient) {
         this.mediaFileMapper = mediaFileMapper;
         this.aiService = aiService;
         this.failedTaskService = failedTaskService;
+        this.taskEventService = taskEventService;
         this.redissonClient = redissonClient;
     }
 
@@ -155,6 +158,9 @@ public class AnalysisCompensationScheduler {
         }
         if (attempts >= maxAttempts) {
             failedTaskService.record(mediaId, new AiAnalysisException("重试耗尽，判定失败", false), attempts);
+
+            // SSE 推送：补偿重试耗尽 FAILED
+            taskEventService.publishAnalysis(mediaId, AiStatus.FAILED.name(), null, "重试耗尽，判定失败");
         }
     }
 }
