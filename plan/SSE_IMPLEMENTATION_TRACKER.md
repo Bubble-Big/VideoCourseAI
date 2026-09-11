@@ -152,7 +152,7 @@ grep -rn "setTranscriptStatus\|transcriptStatus.*=" server/src/main --include="*
   - [x] 文字提取: NONE → PROCESSING → SUCCESS（已通过，2026-09-11）
   - [x] 失败场景: PROCESSING → FAILED（已通过，2026-09-11，详见下方记录）
   - [x] 死信兜底: DLQ 消费 → FAILED（已通过，2026-09-11，详见下方记录）
-  - [ ] 结果复用: 复用他人结果 → SUCCESS (无 PROCESSING)
+  - [x] 结果复用: 复用他人结果 → SUCCESS (无 PROCESSING)（已通过，2026-09-11，手动验证）
 - [ ] 多实例场景 (启动两个后端实例)
   - [ ] 实例 A 提交任务
   - [ ] 实例 B 的 SSE 订阅者也收到事件 (验证 Redis Pub/Sub)
