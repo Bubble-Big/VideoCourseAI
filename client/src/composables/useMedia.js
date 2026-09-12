@@ -184,6 +184,7 @@ function startSSEStream(id, type) {
   taskStreams.stop(id, sseType)  // 关闭同 key 的旧连接
 
   taskStreams.start(id, sseType, {
+    userId: currentUser.value?.id,
     onEvent(event) {
       // 同步本地列表
       const item = list.value.find(i => i.id === event.mediaId)

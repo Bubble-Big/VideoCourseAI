@@ -101,6 +101,7 @@ export function chunkCancel(payload) {
 
 // ---- SSE 任务事件 ----
 // 返回端点 URL 字符串（供 EventSource 使用，不发起 fetch）
-export function getTaskEventsUrl(id, type) {
-  return `${BASE_URL}/debug/task-events?id=${id}&type=${type}`
+export function getTaskEventsUrl(id, type, userId) {
+  const userParam = userId != null ? `&userId=${userId}` : ''
+  return `${BASE_URL}/debug/task-events?id=${id}&type=${type}${userParam}`
 }

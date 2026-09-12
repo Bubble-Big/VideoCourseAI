@@ -21,7 +21,7 @@ export function createTaskStreams() {
    * @param {string} type      'ai' | 'transcribe'
    * @param {object} callbacks { onEvent(event), onError(err) }
    */
-  function start(id, type, { onEvent, onError } = {}) {
+  function start(id, type, { onEvent, onError, userId } = {}) {
     const key = `${id}:${type}`
     pool.get(key)?.cleanup()  // 清理同 key 的旧连接
 
@@ -31,7 +31,8 @@ export function createTaskStreams() {
     let visibilityHandler = null
     let active          = true
 
-    const url = getTaskEventsUrl(id, type)
+    const currentUserId = userId
+    const url = getTaskEventsUrl(id, type, currentUserId)
 
     function connect() {
       if (!active) return
