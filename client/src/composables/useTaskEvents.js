@@ -46,18 +46,11 @@ export function createTaskStreams() {
       }
 
       es.onerror = () => {
-        // readyState CLOSED(2) 表示服务端返回非 2xx（4xx/5xx 首次），不再重连
-        const isFinalError = es.readyState === EventSource.CLOSED
         es.close()
         es = null
         if (!active) return
 
-        if (isFinalError) {
-          onError?.(new Error('服务端拒绝连接（4xx），停止重连'))
-          cleanup()
-          return
-        }
-
+        // EventSource.CLOSED 同时涵盖 4xx 和 5xx，无法区分，统一走有上限的重试
         if (retryCount >= MAX_RETRIES) {
           onError?.(new Error(`SSE 已重连 ${MAX_RETRIES} 次，放弃`))
           cleanup()

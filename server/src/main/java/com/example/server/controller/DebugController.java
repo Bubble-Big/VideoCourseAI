@@ -173,7 +173,9 @@ public class DebugController {
      * @return SSE Emitter（text/event-stream）
      */
     @GetMapping(value = "/task-events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter subscribeTaskEvents(@RequestParam Long id, @RequestParam String type) {
+    public SseEmitter subscribeTaskEvents(@RequestParam Long id,
+                                          @RequestParam String type,
+                                          @RequestParam(required = false) Long userId) {
         // 验证参数
         if (!"ai".equals(type) && !"transcribe".equals(type)) {
             throw new BusinessException(ErrorCode.INVALID_ARGUMENT, "type 参数必须为 ai 或 transcribe");
@@ -183,6 +185,11 @@ public class DebugController {
         MediaFile mediaFile = mediaFileMapper.selectById(id);
         if (mediaFile == null) {
             throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在");
+        }
+
+        // P0：校验当前用户是否有权访问该文件
+        if (userId != null && mediaFile.getUserId() != null && !mediaFile.getUserId().equals(userId)) {
+            throw new BusinessException(ErrorCode.FORBIDDEN, "无权访问该文件的任务事件");
         }
 
         // 构建初始事件
