@@ -118,7 +118,7 @@ class AnalysisCompensationSchedulerTest {
         scheduler.compensate();
 
         verify(mediaFileMapper).updateById(stalledFile);
-        verify(aiService, never()).asyncAnalyze(anyLong());  // 版本冲突时不触发重试
+        verify(aiService, never()).asyncAnalyze(anyLong(), anyBoolean());  // 版本冲突时不触发重试
     }
 
     // ==================== 问题 2：重试计数绑定执行结果 ====================
@@ -131,13 +131,13 @@ class AnalysisCompensationSchedulerTest {
         when(schedulerLock.isHeldByCurrentThread()).thenReturn(true);
         when(mediaFileMapper.selectStalledAnalysis(any(), anyInt())).thenReturn(List.of(stalledFile));
         when(mediaFileMapper.updateById(any(MediaFile.class))).thenReturn(1);  // 刷新时间戳成功
-        when(aiService.asyncAnalyze(MEDIA_ID))
+        when(aiService.asyncAnalyze(MEDIA_ID, false))
                 .thenReturn(CompletableFuture.completedFuture(GateOutcome.DEFER));
 
         scheduler.compensate();
 
         // DEFER 情况下，whenComplete 回调会检测到 DEFER 并提前返回，不会调用 incrementAttemptsIfStillPending
-        verify(aiService).asyncAnalyze(MEDIA_ID);
+        verify(aiService).asyncAnalyze(MEDIA_ID, false);
         // 注意：由于 whenComplete 是异步回调，需要等待或使用其他方式验证
         // 这里验证的是主流程没有在 compensateOne 内同步递增计数
     }
@@ -150,12 +150,12 @@ class AnalysisCompensationSchedulerTest {
         when(schedulerLock.isHeldByCurrentThread()).thenReturn(true);
         when(mediaFileMapper.selectStalledAnalysis(any(), anyInt())).thenReturn(List.of(stalledFile));
         when(mediaFileMapper.updateById(any(MediaFile.class))).thenReturn(1);
-        when(aiService.asyncAnalyze(MEDIA_ID))
+        when(aiService.asyncAnalyze(MEDIA_ID, false))
                 .thenReturn(CompletableFuture.completedFuture(GateOutcome.REUSE));
 
         scheduler.compensate();
 
-        verify(aiService).asyncAnalyze(MEDIA_ID);
+        verify(aiService).asyncAnalyze(MEDIA_ID, false);
         // REUSE 也不应该消耗重试次数
     }
 
@@ -183,7 +183,7 @@ class AnalysisCompensationSchedulerTest {
         when(schedulerLock.isHeldByCurrentThread()).thenReturn(true);
         when(mediaFileMapper.selectStalledAnalysis(any(), anyInt())).thenReturn(List.of(stalledFile));
         when(mediaFileMapper.updateById(eq(stalledFile))).thenReturn(1);
-        when(aiService.asyncAnalyze(MEDIA_ID))
+        when(aiService.asyncAnalyze(MEDIA_ID, false))
                 .thenReturn(CompletableFuture.completedFuture(GateOutcome.PROCEED));
         when(mediaFileMapper.selectById(MEDIA_ID)).thenReturn(latestFile);
         when(mediaFileMapper.updateById(eq(latestFile))).thenReturn(1);
@@ -215,7 +215,7 @@ class AnalysisCompensationSchedulerTest {
         when(schedulerLock.isHeldByCurrentThread()).thenReturn(true);
         when(mediaFileMapper.selectStalledAnalysis(any(), anyInt())).thenReturn(List.of(stalledFile));
         when(mediaFileMapper.updateById(any(MediaFile.class))).thenReturn(1);
-        when(aiService.asyncAnalyze(MEDIA_ID))
+        when(aiService.asyncAnalyze(MEDIA_ID, false))
                 .thenReturn(CompletableFuture.completedFuture(GateOutcome.PROCEED));
         when(mediaFileMapper.selectById(MEDIA_ID)).thenReturn(latestFile);
 
@@ -254,7 +254,7 @@ class AnalysisCompensationSchedulerTest {
 
         // file1 正常
         when(mediaFileMapper.updateById(file1)).thenReturn(1);
-        when(aiService.asyncAnalyze(1L))
+        when(aiService.asyncAnalyze(1L, false))
                 .thenReturn(CompletableFuture.completedFuture(GateOutcome.PROCEED));
 
         // file2 抛异常
@@ -262,14 +262,14 @@ class AnalysisCompensationSchedulerTest {
 
         // file3 正常
         when(mediaFileMapper.updateById(file3)).thenReturn(1);
-        when(aiService.asyncAnalyze(3L))
+        when(aiService.asyncAnalyze(3L, false))
                 .thenReturn(CompletableFuture.completedFuture(GateOutcome.PROCEED));
 
         scheduler.compensate();
 
         // 验证即使 file2 异常，file1 和 file3 仍然被处理
-        verify(aiService).asyncAnalyze(1L);
-        verify(aiService).asyncAnalyze(3L);
+        verify(aiService).asyncAnalyze(1L, false);
+        verify(aiService).asyncAnalyze(3L, false);
         verify(schedulerLock).unlock();
     }
 
@@ -282,7 +282,7 @@ class AnalysisCompensationSchedulerTest {
 
         scheduler.compensate();
 
-        verify(aiService, never()).asyncAnalyze(anyLong());
+        verify(aiService, never()).asyncAnalyze(anyLong(), anyBoolean());
         verify(schedulerLock).unlock();
     }
 

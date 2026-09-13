@@ -69,7 +69,7 @@ class AiServiceTest {
         when(contentTaskGate.inAnalysisLock(eq(CONTENT_HASH), any()))
                 .thenReturn(GateOutcome.PROCEED);
 
-        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID);
+        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID, false);
 
         assertNotNull(future);
         assertInstanceOf(CompletableFuture.class, future);
@@ -92,7 +92,7 @@ class AiServiceTest {
                     return invocation.getArgument(1, java.util.function.Supplier.class).get();
                 });
 
-        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID);
+        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID, false);
 
         assertEquals(GateOutcome.PROCEED, future.get());
     }
@@ -108,7 +108,7 @@ class AiServiceTest {
                     return invocation.getArgument(1, java.util.function.Supplier.class).get();
                 });
 
-        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID);
+        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID, false);
 
         assertEquals(GateOutcome.REUSE, future.get());
     }
@@ -119,7 +119,7 @@ class AiServiceTest {
         when(contentTaskGate.inAnalysisLock(eq(CONTENT_HASH), any()))
                 .thenReturn(GateOutcome.DEFER);
 
-        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID);
+        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(MEDIA_ID, false);
 
         assertEquals(GateOutcome.DEFER, future.get());
     }
@@ -144,7 +144,7 @@ class AiServiceTest {
                     return invocation.getArgument(1, java.util.function.Supplier.class).get();
                 });
 
-        aiService.asyncAnalyze(MEDIA_ID);
+        aiService.asyncAnalyze(MEDIA_ID, false);
 
         ArgumentCaptor<MediaFile> captor = ArgumentCaptor.forClass(MediaFile.class);
         verify(mediaFileMapper, atLeastOnce()).updateById(captor.capture());
