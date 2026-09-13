@@ -168,6 +168,7 @@ VideoCourseAI-main/
 │  │                    /debug/ai                                  │   │
 │  │                    /debug/transcribe                           │   │
 │  │                    /debug/download                             │   │
+│  │                    /debug/task-events (SSE 实时推送)          │   │
 │  └────────┬──────────────────┬───────────────────┬──────────────┘   │
 │           │                  │                   │                  │
 │  ┌────────▼──────┐  ┌───────▼────────┐  ┌───────▼──────────────┐   │
@@ -313,41 +314,64 @@ VideoCourseAI-main/
                     │ 发送 AnalysisTaskMsg      │
                     │ (携带 contentHash)        │
                     │ → RocketMQ                │
+                    │ → SSE 推送 PENDING 事件   │
                     └────────┬──────────────────┘
                              │ 接口立即返回 ✅
-                             ▼
-          ┌─────────────────────────────────────┐
-          │     VideoAnalysisConsumer           │
-          │  触发派发（@Async 提交线程池后 ACK） │
-          │  队列满 → 吞异常，交补偿兜底         │
-          └────────────────┬────────────────────┘
-                           │ @Async
-                           ▼
-          ┌─────────────────────────────────────┐
-          │        AiService.asyncAnalyze()      │
-          │  contentTaskGate.inAnalysisLock()    │
-          │  抢不到 → DEFER（让位，交补偿兜底）  │
-          │  0. 结果复用(resolveAnalysis)         │
-          │  1. 转写(transcribeWithReuse)         │
-          │     内容级锁 + 归属复用               │
-          │  2. DeepSeek 总结(generateSummaryFromText)│
-          │  3. 写 aiStatus=SUCCESS / markFailed  │
-          │  4. 删 Redis 用户列表缓存             │
-          └────────────────┬────────────────────┘
-                           │ 异常内部消化
-                    ┌──────┴────────┐
-                    ▼               ▼
-              retryable=false   retryable=true
-              落 FAILED + 台账   保持 PROCESSING
-                               + 刷新 ai_process_at
-                                   │
-                                   ▼
-                    AnalysisCompensationScheduler（每 1min）
-                    扫卡死记录：ai_attempts<3 重新触发 / >=3 落 FAILED
-                           │
-                           ▼
-              前端 3秒轮询 aiStatus ──► 侧边栏展示 Markdown
+                             │
+          ┌──────────────────┴────────────────────┐
+          │                                        │
+          ▼ 前端建立 SSE 连接                      ▼
+   GET /debug/task-events?id={id}    VideoAnalysisConsumer
+     &type=ai&userId={userId}         触发派发（@Async 提交线程池后 ACK）
+          │                            队列满 → 吞异常，交补偿兜底
+          ▼                                   │
+   ┌─────────────────────┐                   │ @Async
+   │ TaskEventService    │                   ▼
+   │ .subscribe()        │     ┌─────────────────────────────────────┐
+   │ - 查询当前状态      │     │        AiService.asyncAnalyze()      │
+   │ - 推送初始事件      │     │  contentTaskGate.inAnalysisLock()    │
+   │ - 注册到连接池      │     │  抢不到 → DEFER（让位，交补偿兜底）  │
+   │ - 等待后续事件      │     │  0. 结果复用(resolveAnalysis)         │
+   └──────┬──────────────┘     │  1. 转写(transcribeWithReuse)         │
+          │ 收到事件             │     内容级锁 + 归属复用               │
+          │ (Redis Pub/Sub)     │  2. DeepSeek 总结(generateSummaryFromText)│
+          ▼                     │  3. 写 aiStatus=SUCCESS / markFailed  │
+   前端实时更新侧边栏          │  4. 删 Redis 用户列表缓存             │
+   (PENDING→PROCESSING→SUCCESS)│  5. SSE 推送状态变更事件              │
+                               └────────────────┬────────────────────┘
+                                                │ 异常内部消化
+                                         ┌──────┴────────┐
+                                         ▼               ▼
+                                   retryable=false   retryable=true
+                                   落 FAILED + 台账   保持 PROCESSING
+                                                    + 刷新 ai_process_at
+                                                        │
+                                                        ▼
+                                     AnalysisCompensationScheduler（每 1min）
+                                     扫卡死记录：ai_attempts<3 重新触发 / >=3 落 FAILED
 ```
+
+**SSE 实时推送机制**（2026-09-13 新增）:
+
+- **端点**: `GET /debug/task-events?id={mediaId}&type={ai|transcribe}&userId={userId}`
+- **协议**: Server-Sent Events (text/event-stream)
+- **连接管理**: `TaskEventService` 维护连接池 `Map<String, List<SseEmitter>>`
+- **跨实例广播**: Redis Pub/Sub 频道 `videocourse:task-events`
+- **初始状态**: 连接建立时立即推送当前状态（查询数据库）
+- **事件格式**: `data: {"mediaId":65,"state":"PROCESSING","aiSummary":null,"error":null,"timestamp":1789288152156,"terminal":false}`
+- **终态自动关闭**: `SUCCESS` / `FAILED` 事件后自动 `emitter.complete()`
+- **权限校验**: 验证 userId 参数与文件归属
+- **心跳机制**: 每 25 秒推送 keepalive 注释行，防止反向代理超时
+- **降级策略**: Redis 故障时自动降级到本地推送（单实例仍可用）
+- **自动恢复**: 定时探测 Redis，恢复后重置 `redisAvailable` 标志
+
+**前端 SSE 集成**:
+
+- **连接管理**: `useTaskEvents.js` - 自动重连（指数退避，最大 15s，最多 10 次）
+- **终态识别**: 收到 `terminal: true` 事件后自动关闭连接
+- **生命周期**: 侧边栏关闭时调用 `taskStreams.stop()` 释放连接
+- **本地状态更新**: 事件到达后直接更新本地列表，无需轮询 `fetchList()`
+- **多标签页**: 本地列表不含 mediaId 时优雅忽略事件
 
 **状态流转**（枚举 `AiStatus`，独立字段替代文案判断）：
 
@@ -671,8 +695,8 @@ contentHash = normalizeContentHash(mediaId, fileMd5)   // 合法 MD5 小写；�
 | 断点续传 | 场景一：内存 File + 续传横幅一键继续；场景二：文件指纹匹配 + 重新选择自动续传 |
 | 去重提示 | 内嵌横幅（红色警告）+ 坚持上传走 force 流程 |
 | URL 下载 | 输入框 + yt-dlp 后端下载 + 轮询结果 |
-| AI 分析 | 按钮触发 RocketMQ → 前端轮询按 `aiStatus` 字段判定完成（`code≠0` 提示限流/锁/冲突错误） |
-| 文字提取 | 异步提交 → 轮询按 `transcriptStatus` 字段判定完成 |
+| AI 分析 | 按钮触发 RocketMQ → SSE 实时推送状态（NONE → PENDING → PROCESSING → SUCCESS/FAILED），延迟 < 100ms |
+| 文字提取 | 异步提交 → SSE 实时推送状态（NONE → PROCESSING → SUCCESS/FAILED） |
 | 音频下载 | FFmpeg 转码 MP3 → Blob 下载 |
 | 视频删除 | DELETE 请求 + 前端列表移除 |
 | 工作台 | 单列横排列表，文件名左、按钮右 |
@@ -694,9 +718,9 @@ contentHash = normalizeContentHash(mediaId, fileMd5)   // 合法 MD5 小写；�
 **Composable 依赖关系（单向，无循环）**：
 
 ```
-useNotice / useAuth / useChunkedUpload   ← 无依赖
+useNotice / useAuth / useChunkedUpload / useTaskEvents   ← 无依赖
 useUpload  → useChunkedUpload + useNotice + useAuth + useMedia + api
-useMedia   → useNotice + useAuth + api + marked
+useMedia   → useNotice + useAuth + useTaskEvents + api + marked
 useBootstrap → useAuth + useUpload          （仅编排启动顺序）
 ```
 
@@ -825,7 +849,8 @@ rocketmq.producer.group=video-analysis-group
 | `styles/main.css` | 274 | 全局样式（原 App.vue `<style>` 迁移） |
 | `composables/useChunkedUpload.js` | 399 | 分片上传核心（单例） |
 | `composables/useUpload.js` | 297 | 上传编排（文件/URL/续传/去重/进度） |
-| `composables/useMedia.js` | 268 | 列表/侧边栏/轮询/删除/下载/转写/AI（按状态字段判断） |
+| `composables/useMedia.js` | 268 | 列表/侧边栏/SSE 实时推送/删除/下载/转写/AI |
+| `composables/useTaskEvents.js` | 150 | SSE 连接管理（自动重连/终态识别/生命周期） |
 | `composables/useAuth.js` | 103 | 登录态 + 认证弹窗 |
 | `composables/useBootstrap.js` | 20 | 启动/卸载编排 |
 | `composables/useNotice.js` | 14 | 全局通知条（message + showMsg） |
