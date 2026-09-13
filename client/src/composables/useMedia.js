@@ -9,7 +9,6 @@ import { createTaskStreams } from './useTaskEvents.js'
 // ---- 模块级状态（单例） ----
 const list = ref([])
 const sidebar = ref({ visible: false, type: 'ai', id: null, title: '', content: '', loading: false })
-const pollingTimers = ref({})
 const taskStreams = createTaskStreams()
 
 const { currentUser } = useAuth()
@@ -228,87 +227,6 @@ function startSSEStream(id, type) {
       showMsg('⚠️ 任务超时未完成', true)
     },
   })
-}
-
-function startPolling(id, type) {
-  // 清理旧定时器
-  if (pollingTimers.value[id]) clearInterval(pollingTimers.value[id].timer)
-  console.log(`[轮询] 开始监听任务 ID: ${id}, 类型: ${type}`)
-
-  // 未启动兜底计数：连续 NONE 的轮询次数（10 轮 × 3s ≈ 30s，对齐提交侧幂等键 TTL）
-  let stalledCount = 0
-
-  const timer = setInterval(async () => {
-    // 1. 强制刷新列表（带时间戳防缓存）
-    await fetchList()
-    const item = list.value.find(i => i.id === id)
-    if (!item) return
-
-    const st = type === 'ai' ? (item.aiStatus || 'NONE') : (item.transcriptStatus || 'NONE')
-
-    // 2. 终态结算
-    if (st === 'SUCCESS' || st === 'FAILED') {
-      if (sidebar.value.visible && sidebar.value.id === id) {
-        sidebar.value.content = st === 'FAILED'
-          ? (type === 'ai' ? '❌ 分析失败，请稍后重试' : '❌ 提取失败，请稍后重试')
-          : (type === 'ai' ? (item.aiSummary || '') : (item.transcriptText || ''))
-        sidebar.value.loading = false
-      }
-
-      if (st === 'FAILED') {
-        showMsg("⚠️ 任务结束，但存在错误", true)
-      } else {
-        showMsg("✅ 任务完成")
-      }
-
-      clearInterval(timer)
-      delete pollingTimers.value[id]
-      return
-    }
-
-    // 3. 未启动兜底：一直 NONE（未进入 PENDING/PROCESSING）→ 任务未真正启动（如并发提交失败被误报成功）
-    if (st === 'NONE') {
-      stalledCount++
-      if (stalledCount >= 10) {
-        clearInterval(timer)
-        delete pollingTimers.value[id]
-        if (sidebar.value.visible && sidebar.value.id === id) {
-          sidebar.value.content = '任务未能启动，请重试'
-          sidebar.value.loading = false
-        }
-        showMsg('⚠️ 任务未能启动，请重试', true)
-      }
-      // 未达阈值：保持「资源请求成功...」转圈，本轮不更新文案
-      return
-    }
-
-    // 4. 进行中（PENDING/PROCESSING）：清零未启动计数，按状态刷新转圈文案
-    stalledCount = 0
-    if (sidebar.value.visible && sidebar.value.id === id) {
-      if (type === 'ai') {
-        if (st === 'PENDING') sidebar.value.content = 'AI调用中...'
-        else if (st === 'PROCESSING') sidebar.value.content = 'AI分析中...'
-      } else {
-        if (st === 'PROCESSING') sidebar.value.content = '文字转写中...'
-      }
-      sidebar.value.loading = true
-    }
-  }, 3000) // 3 秒轮询一次
-
-  pollingTimers.value[id] = { timer, type }
-
-  // 10 分钟强制兜底停止：触发时若侧栏仍停留在此任务，给出超时提示避免卡死转圈
-  setTimeout(() => {
-    if (pollingTimers.value[id]) {
-      clearInterval(pollingTimers.value[id].timer)
-      delete pollingTimers.value[id]
-      if (sidebar.value.visible && sidebar.value.id === id) {
-        sidebar.value.content = '任务超时未完成，请稍后重试'
-        sidebar.value.loading = false
-      }
-      showMsg('⚠️ 任务超时未完成', true)
-    }
-  }, 600000)
 }
 
 function openSidebar(type, title, id) {
