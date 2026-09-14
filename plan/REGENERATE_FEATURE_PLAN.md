@@ -195,10 +195,7 @@ AI 分析侧边栏：
 
 ## 八、后续优化
 
-- 显示"本次结果是否复用"提示
 - 重新生成按钮添加冷却时间（30 秒）
-- 埋点统计重新生成次数、成功率、成本
-- 支持查看历史生成结果（需新表）
 
 ---
 
@@ -225,9 +222,7 @@ AI 分析侧边栏：
 
 ### 🔴 P0 严重问题（需立即修复）
 
----
-
-#### 问题 2：用户手动重试未使用乐观锁
+#### 用户手动重试未使用乐观锁
 
 **位置**：`DebugController.java:106-112`
 
@@ -315,102 +310,6 @@ private void incrementAttemptsIfStillPending(Long mediaId) {
 ```
 
 **更优方案**：在 `MediaFile` 表新增 `lastRetryType` 字段，区分"补偿重试"和"用户手动重试"。
-
----
-
-#### 问题 4：前端防重复点击不够强
-
-**位置**：`ResultSidebar.vue:71`
-
-**问题描述**：
-`regenerating` 标志只在函数开始检查，但 `aiAnalyze/transcribe` 是异步的，用户在确认对话框期间快速双击仍可能发出多个请求。
-
-**影响**：
-- 短时间内发出多个重新生成请求
-- 浪费 AI 配额
-- 可能触发后端并发冲突
-
-**修复方案**：
-```javascript
-// ResultSidebar.vue 改进
-const regenerating = ref(false)
-const requestInFlight = ref(false)  // 新增：请求飞行中标记
-
-async function handleRegenerate() {
-  if (regenerating.value || requestInFlight.value) return
-  
-  const confirmMessage = sidebar.value.type === 'ai'
-    ? '重新生成将消耗 AI 配额，确定继续吗？'
-    : '确定要重新提取文字吗？'
-  
-  const confirmed = await showConfirm(confirmMessage, '确认操作')
-  if (!confirmed) return
-  
-  if (requestInFlight.value) return  // 确认对话框期间可能有其他请求
-  
-  regenerating.value = true
-  requestInFlight.value = true
-  
-  try {
-    if (sidebar.value.type === 'ai') {
-      await aiAnalyze(sidebar.value.id, true)
-    } else {
-      await transcribe(sidebar.value.id, true)
-    }
-  } catch (error) {
-    console.error('重新生成失败:', error)
-    sidebar.value.content = '❌ 重新生成失败，请稍后重试'
-    sidebar.value.loading = false
-  } finally {
-    regenerating.value = false
-    setTimeout(() => { requestInFlight.value = false }, 1000)  // 防抖 1 秒
-  }
-}
-```
-
----
-
-### ℹ️ P2 轻微问题（优化）
-
-#### 问题 5：跨用户内容复用时缓存未失效
-
-**位置**：`AiService.java:332-335`
-
-**问题描述**：
-用户 A 重新生成时，会失效用户 A 的 Redis 缓存。但如果用户 B 上传了相同内容的文件并通过内容复用获得结果，用户 B 的缓存**不会**失效。
-
-**影响**：
-- 用户 B 可能看到过期的状态（如仍显示旧结果）
-- 需要手动刷新页面
-
-**修复方案**：
-```java
-// ContentTaskGate.java 改进
-public boolean resolveAnalysis(MediaFile target, String contentHash) {
-    // ... 原有复用逻辑 ...
-    
-    if (复用成功) {
-        // 失效目标用户的缓存，确保前端能看到最新状态
-        evictCache(target);
-        return true;
-    }
-    return false;
-}
-```
-
----
-
-### 修复优先级汇总
-
-| 优先级 | 问题编号 | 问题描述 | 预计工作量 |
-|--------|---------|---------|-----------|
-| 🔴 P0 | 1 | force=true 跳过提交幂等键 | 1 小时 |
-| 🔴 P0 | 2 | 用户重试加乐观锁 | 0.5 小时 |
-| ⚠️ P1 | 3 | 补偿调度器计数冲突 | 1 小时 |
-| ⚠️ P1 | 4 | 前端防重复点击加强 | 0.5 小时 |
-| ℹ️ P2 | 5 | 跨用户缓存失效 | 0.5 小时 |
-
-**总修复工作量**：3.5 小时
 
 ---
 
