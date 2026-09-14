@@ -59,10 +59,11 @@ public class AiService {
      * <p>成功写 SUCCESS；永久失败落 FAILED + 台账；瞬时失败保持 PROCESSING + 刷新时间戳，
      * 由 {@code AnalysisCompensationScheduler} 定时补偿重试（不再上抛给 MQ 重投）。</p>
      *
+     * @param force 是否强制重新生成（跳过复用逻辑）
      * @return CompletableFuture 包装的 GateOutcome，用于补偿调度器判断是否真正执行
      */
     @Async("aiTaskExecutor")
-    public CompletableFuture<GateOutcome> asyncAnalyze(Long mediaId) {
+    public CompletableFuture<GateOutcome> asyncAnalyze(Long mediaId, Boolean force) {
         String contentHash = mediaService.contentHash(mediaId);
         GateOutcome outcome = contentTaskGate.inAnalysisLock(contentHash, () -> {
             MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
@@ -70,8 +71,8 @@ public class AiService {
                 throw new AiAnalysisException("文件不存在: " + mediaId, false, AiFailStage.FILE);
             }
 
-            // 结果复用：查询并回填已有结果
-            if (contentTaskGate.resolveAnalysis(mediaFile, contentHash)) {
+            // 结果复用：查询并回填已有结果（force=true 时跳过复用）
+            if (!Boolean.TRUE.equals(force) && contentTaskGate.resolveAnalysis(mediaFile, contentHash)) {
                 evictCache(mediaFile);
                 log.info("AI 分析结果复用, mediaId={} contentHash={}", mediaId, contentHash);
                 return GateOutcome.REUSE;
@@ -90,7 +91,7 @@ public class AiService {
 
             try {
                 // 1. 语音转文字：内容级锁 + 归属复用
-                String text = transcribeWithReuse(mediaFile, contentHash);
+                String text = transcribeWithReuse(mediaFile, contentHash, force);
                 if (text == null) {
                     throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
                 }
@@ -105,7 +106,10 @@ public class AiService {
                         .eq(MediaFile::getId, mediaFile.getId())
                         .set(MediaFile::getAiSummary, NO_SPEECH_SUMMARY)
                         .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
-                    contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
+                    // force=true 时不登记归属，避免污染复用链
+                    if (!Boolean.TRUE.equals(force)) {
+                        contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
+                    }
                     evictCache(mediaFile);
 
                     // SSE 推送：SUCCESS（无语音内容）
@@ -123,7 +127,10 @@ public class AiService {
                     .eq(MediaFile::getId, mediaFile.getId())
                     .set(MediaFile::getAiSummary, summary)
                     .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
-                contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
+                // force=true 时不登记归属，避免污染复用链
+                if (!Boolean.TRUE.equals(force)) {
+                    contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
+                }
                 evictCache(mediaFile);
 
                 // SSE 推送：SUCCESS
@@ -187,9 +194,11 @@ public class AiService {
 
     /**
      * 异步提取全文（@Async 一次性任务，无 MQ 消费层接收重试，失败只落库不上抛）。
+     *
+     * @param force 是否强制重新生成（跳过复用逻辑）
      */
     @Async("aiTaskExecutor")
-    public void asyncTranscribe(Long mediaId) {
+    public void asyncTranscribe(Long mediaId, Boolean force) {
         MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
         if (mediaFile == null) {
             log.warn("全文提取任务找不到文件记录, mediaId={}", mediaId);
@@ -200,7 +209,7 @@ public class AiService {
         try {
             // 内容级锁 + 归属复用：同一内容只转写一次；抢不到锁则等待他人转写完成后复用（对齐 AI 分析）
             String contentHash = mediaService.contentHash(mediaId);
-            String text = transcribeWithReuse(mediaFile, contentHash);
+            String text = transcribeWithReuse(mediaFile, contentHash, force);
             if (text == null) {
                 // 等待转写锁超时仍未复用：回滚到 NONE 允许重试，避免永久卡 PROCESSING
                 mediaFile.setTranscriptStatus(AiStatus.NONE.name());
@@ -240,16 +249,19 @@ public class AiService {
      *
      * @param mediaFile   目标记录
      * @param contentHash 内容指纹
+     * @param force       是否强制重新生成（跳过复用逻辑）
      * @return 转写文本；null 表示等待转写锁超时且无归属可复用
      */
-    private String transcribeWithReuse(MediaFile mediaFile, String contentHash) {
+    private String transcribeWithReuse(MediaFile mediaFile, String contentHash, Boolean force) {
         String[] resultHolder = new String[1];
         GateOutcome outcome = contentTaskGate.inTranscribeLock(contentHash, () -> {
-            // 锁内先查复用
-            String reusable = contentTaskGate.resolveTranscript(mediaFile, contentHash);
-            if (reusable != null) {
-                resultHolder[0] = reusable;
-                return GateOutcome.REUSE;
+            // 锁内先查复用（force=true 时跳过复用）
+            if (!Boolean.TRUE.equals(force)) {
+                String reusable = contentTaskGate.resolveTranscript(mediaFile, contentHash);
+                if (reusable != null) {
+                    resultHolder[0] = reusable;
+                    return GateOutcome.REUSE;
+                }
             }
 
             // 抢到锁且无归属：真正转写一次
@@ -263,7 +275,10 @@ public class AiService {
                 .eq(MediaFile::getId, mediaFile.getId())
                 .set(MediaFile::getTranscriptText, text)
                 .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
-            contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
+            // force=true 时不登记归属，避免污染复用链
+            if (!Boolean.TRUE.equals(force)) {
+                contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
+            }
 
             // SSE 推送：transcription SUCCESS
             taskEventService.publishTranscription(mediaFile.getId(), AiStatus.SUCCESS.name(), text, null);

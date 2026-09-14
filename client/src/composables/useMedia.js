@@ -8,7 +8,16 @@ import { createTaskStreams } from './useTaskEvents.js'
 
 // ---- 模块级状态（单例） ----
 const list = ref([])
-const sidebar = ref({ visible: false, type: 'ai', id: null, title: '', content: '', loading: false })
+const sidebar = ref({
+  visible: false,
+  type: 'ai',
+  id: null,
+  title: '',
+  content: '',
+  loading: false,
+  state: null,      // 任务状态：NONE/PENDING/PROCESSING/SUCCESS/FAILED
+  mediaId: null     // 媒体文件 ID
+})
 const taskStreams = createTaskStreams()
 
 const { currentUser } = useAuth()
@@ -88,33 +97,39 @@ async function downloadAudio(item) {
   }
 }
 
-async function transcribe(id) {
+async function transcribe(id, force = false) {
   const item = list.value.find(i => i.id === id)
   const st = item?.transcriptStatus || 'NONE'
 
-  // 1. 已完成（成功/失败）→ 直接显示结果
-  if (st === 'SUCCESS' || st === 'FAILED') {
-    openSidebar('text', '全量文字提取', id)
-    sidebar.value.content = st === 'FAILED' ? '❌ 提取失败，请稍后重试' : (item.transcriptText || '')
-    sidebar.value.loading = false
-    return
+  // force=true 时跳过状态检查，直接重新生成
+  if (!force) {
+    // 1. 已完成（成功/失败）→ 直接显示结果
+    if (st === 'SUCCESS' || st === 'FAILED') {
+      openSidebar('text', '全量文字提取', id)
+      sidebar.value.content = st === 'FAILED' ? '❌ 提取失败，请稍后重试' : (item.transcriptText || '')
+      sidebar.value.loading = false
+      sidebar.value.state = st
+      return
+    }
+
+    // 2. 正在处理 → 打开转圈，订阅 SSE
+    if (st === 'PROCESSING') {
+      openSidebar('text', '全量文字提取', id)
+      sidebar.value.loading = true
+      sidebar.value.content = "文字转写中..."
+      sidebar.value.state = st
+      startSSEStream(id, 'transcribe')
+      return
+    }
   }
 
-  // 2. 正在处理 → 打开转圈，订阅 SSE
-  if (st === 'PROCESSING') {
-    openSidebar('text', '全量文字提取', id)
-    sidebar.value.loading = true
-    sidebar.value.content = "文字转写中..."
-    startSSEStream(id, 'transcribe')
-    return
-  }
-
-  // 3. NONE → 提交请求
+  // 3. NONE 或 force=true → 提交请求
   openSidebar('text', '全量文字提取', id)
   sidebar.value.loading = true
   sidebar.value.content = "资源请求中..."
+  sidebar.value.state = 'PENDING'
   try {
-    const res = await api.transcribe(id)
+    const res = await api.transcribe(id, force)
     const data = await res.json()
     if (data.code !== 0) {
       showMsg(data.message || '提交失败', true)
@@ -131,34 +146,40 @@ async function transcribe(id) {
 }
 
 // AI 分析：含限流/锁错误的处理
-async function aiAnalyze(id) {
+async function aiAnalyze(id, force = false) {
   const item = list.value.find(i => i.id === id)
   const st = item?.aiStatus || 'NONE'
 
-  // 1. 已完成（成功/失败）→ 直接显示结果
-  if (st === 'SUCCESS' || st === 'FAILED') {
-    openSidebar('ai', 'AI 智能总结', id)
-    sidebar.value.content = st === 'FAILED' ? '❌ 分析失败，请稍后重试' : (item.aiSummary || '')
-    sidebar.value.loading = false
-    return
-  }
+  // force=true 时跳过状态检查，直接重新生成
+  if (!force) {
+    // 1. 已完成（成功/失败）→ 直接显示结果
+    if (st === 'SUCCESS' || st === 'FAILED') {
+      openSidebar('ai', 'AI 智能总结', id)
+      sidebar.value.content = st === 'FAILED' ? '❌ 分析失败，请稍后重试' : (item.aiSummary || '')
+      sidebar.value.loading = false
+      sidebar.value.state = st
+      return
+    }
 
-  // 2. 正在处理 → 打开转圈，订阅 SSE
-  if (st === 'PENDING' || st === 'PROCESSING') {
-    openSidebar('ai', 'AI 智能总结', id)
-    sidebar.value.loading = true
-    sidebar.value.content = st === 'PENDING' ? 'AI调用中...' : 'AI分析中...'
-    startSSEStream(id, 'ai')
-    return
+    // 2. 正在处理 → 打开转圈，订阅 SSE
+    if (st === 'PENDING' || st === 'PROCESSING') {
+      openSidebar('ai', 'AI 智能总结', id)
+      sidebar.value.loading = true
+      sidebar.value.content = st === 'PENDING' ? 'AI调用中...' : 'AI分析中...'
+      sidebar.value.state = st
+      startSSEStream(id, 'ai')
+      return
+    }
   }
 
   // 3. 准备提交请求，打开侧边栏 loading
   openSidebar('ai', 'AI 智能总结', id)
   sidebar.value.loading = true
   sidebar.value.content = "资源请求中..."
+  sidebar.value.state = 'PENDING'
 
   try {
-    const res = await api.aiAnalyze(id)
+    const res = await api.aiAnalyze(id, force)
     const data = await res.json()
 
     // 4. 检查后端返回：code 非 0 → 限流/锁/报错，任务被拒绝
@@ -199,6 +220,9 @@ function startSSEStream(id, type) {
 
       // 侧边栏不属于此任务时忽略 UI 更新
       if (!sidebar.value.visible || sidebar.value.id !== event.mediaId) return
+
+      // 更新侧边栏状态
+      sidebar.value.state = event.state
 
       if (event.state === 'SUCCESS') {
         sidebar.value.content = sseType === 'ai'
@@ -255,6 +279,7 @@ export function useMedia() {
     sidebar,
     renderedMarkdown,
     fetchList,
+    refreshMediaList: fetchList,  // 导出为 refreshMediaList 供 ResultSidebar 使用
     deleteItem,
     downloadAudio,
     transcribe,

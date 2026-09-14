@@ -219,10 +219,258 @@ AI 分析侧边栏：
 
 ---
 
+## 十、已知问题与漏洞修复计划
+
+> 基于代码全面审查（2026-09-15），识别出的安全与一致性问题
+
+### 🔴 P0 严重问题（需立即修复）
+
+#### 问题 1：force=true 仍参与提交幂等键竞争
+
+**位置**：`DebugController.java:84-89`
+
+**问题描述**：
+用户点击"重新生成"时（force=true），仍需要抢占 30 秒 TTL 的 `active:{contentHash}` 幂等键。如果另一个相同内容的任务正在提交，用户的手动重试会被拒绝返回"任务提交中，请稍候"。
+
+**影响**：
+- 同一用户在两个标签页同时重新生成 → 一个被拒绝
+- 不同用户上传相同文件后同时重新生成 → 一个被拒绝
+- 用户体验不佳：明确的手动重试被拒绝
+
+**修复方案**：
+```java
+// DebugController.java 改进
+String contentHash = AnalysisTaskKeys.normalizeContentHash(id, file.getFileMd5());
+
+if (!force) {
+    // 非 force 模式：需要抢占幂等键，避免重复提交
+    boolean accepted = contentTaskGate.tryMarkSubmitting(contentHash, id);
+    if (!accepted) {
+        return Result.ok("任务提交中，请稍候");
+    }
+} else {
+    // force 模式：强制标记，覆盖旧的提交标记
+    contentTaskGate.forceMarkSubmitting(contentHash, id);
+}
+```
+
+**需要新增方法**：
+```java
+// ContentTaskGate.java
+public void forceMarkSubmitting(String contentHash, Long mediaId) {
+    String activeKey = AnalysisTaskKeys.active(contentHash);
+    redisTemplate.opsForValue().set(activeKey, String.valueOf(mediaId), SUBMIT_ACTIVE_TTL);
+}
+```
+
+---
+
+#### 问题 2：用户手动重试未使用乐观锁
+
+**位置**：`DebugController.java:106-112`
+
+**问题描述**：
+状态重置时没有检查 `version` 字段（乐观锁），可能覆盖补偿调度器或其他并发操作刚写入的结果。
+
+**场景**：
+1. 用户 A 点击重新生成，查询到 `version=10`
+2. 补偿调度器同时完成了一次成功分析，写入 `SUCCESS, version=11`
+3. 用户 A 的请求继续执行，无条件覆盖写入 `PENDING, version=12`
+4. **结果**：成功的分析结果被用户的重新生成请求覆盖
+
+**影响**：
+- 数据一致性破坏：丢失其他操作的成功结果
+- 补偿调度器的努力被覆盖
+
+**修复方案**：
+```java
+// DebugController.java 改进
+MediaFile file = mediaFileMapper.selectById(id);
+if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在，请检查后重试");
+
+// 记录当前版本号
+Integer currentVersion = file.getVersion();
+
+// ... 幂等检查、限流等逻辑 ...
+
+// 状态重置时使用乐观锁
+int updated = mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+    .eq(MediaFile::getId, file.getId())
+    .eq(MediaFile::getVersion, currentVersion)  // 乐观锁
+    .set(MediaFile::getAiStatus, AiStatus.PENDING.name())
+    .set(MediaFile::getAiSummary, null)
+    .set(MediaFile::getAiProcessAt, LocalDateTime.now())
+    .set(MediaFile::getAiAttempts, 0)
+    .set(MediaFile::getCompensationAttempts, 0));
+
+if (updated == 0) {
+    // 版本冲突：说明记录已被其他操作修改
+    contentTaskGate.rollbackSubmitting(contentHash);
+    return Result.error(ErrorCode.CONFLICT, "文件状态已变更，请刷新后重试");
+}
+```
+
+---
+
+### ⚠️ P1 中等问题（重要）
+
+#### 问题 3：补偿调度器与用户手动重试的计数冲突
+
+**位置**：`AnalysisCompensationScheduler.java:137-159`
+
+**问题描述**：
+用户手动重试时会清零 `compensationAttempts`，但补偿调度器可能基于旧快照在清零后递增计数。
+
+**场景**：
+1. 文件处于 `PROCESSING`，`compensationAttempts=2`
+2. 补偿调度器扫描到该文件，刷新时间戳成功（版本冲突检查通过）
+3. **同时**用户点击"重新生成"，清零 `compensationAttempts=0`
+4. 调度器触发 `aiService.asyncAnalyze` 完成后，读取最新记录 `compensationAttempts=0`
+5. 递增为 1，写入数据库
+
+**影响**：
+- 用户期望从 0 重新开始，但调度器将其递增到 1
+- 计数语义不清晰，可能导致误判重试次数
+
+**修复方案**：
+```java
+// AnalysisCompensationScheduler.java 改进
+private void incrementAttemptsIfStillPending(Long mediaId) {
+    MediaFile latest = mediaFileMapper.selectById(mediaId);
+    if (latest == null || !AiStatus.PROCESSING.name().equals(latest.getAiStatus())) {
+        return;
+    }
+    
+    // 新增：检查 aiProcessAt 是否在最近被刷新（说明可能是用户手动重试）
+    if (latest.getAiProcessAt() != null && 
+        Duration.between(latest.getAiProcessAt(), LocalDateTime.now()).getSeconds() < 5) {
+        log.info("检测到最近的时间戳刷新，可能是用户手动重试，跳过计数 mediaId={}", mediaId);
+        return;
+    }
+    
+    // ... 原有递增逻辑 ...
+}
+```
+
+**更优方案**：在 `MediaFile` 表新增 `lastRetryType` 字段，区分"补偿重试"和"用户手动重试"。
+
+---
+
+#### 问题 4：前端防重复点击不够强
+
+**位置**：`ResultSidebar.vue:71`
+
+**问题描述**：
+`regenerating` 标志只在函数开始检查，但 `aiAnalyze/transcribe` 是异步的，用户在确认对话框期间快速双击仍可能发出多个请求。
+
+**影响**：
+- 短时间内发出多个重新生成请求
+- 浪费 AI 配额
+- 可能触发后端并发冲突
+
+**修复方案**：
+```javascript
+// ResultSidebar.vue 改进
+const regenerating = ref(false)
+const requestInFlight = ref(false)  // 新增：请求飞行中标记
+
+async function handleRegenerate() {
+  if (regenerating.value || requestInFlight.value) return
+  
+  const confirmMessage = sidebar.value.type === 'ai'
+    ? '重新生成将消耗 AI 配额，确定继续吗？'
+    : '确定要重新提取文字吗？'
+  
+  const confirmed = await showConfirm(confirmMessage, '确认操作')
+  if (!confirmed) return
+  
+  if (requestInFlight.value) return  // 确认对话框期间可能有其他请求
+  
+  regenerating.value = true
+  requestInFlight.value = true
+  
+  try {
+    if (sidebar.value.type === 'ai') {
+      await aiAnalyze(sidebar.value.id, true)
+    } else {
+      await transcribe(sidebar.value.id, true)
+    }
+  } catch (error) {
+    console.error('重新生成失败:', error)
+    sidebar.value.content = '❌ 重新生成失败，请稍后重试'
+    sidebar.value.loading = false
+  } finally {
+    regenerating.value = false
+    setTimeout(() => { requestInFlight.value = false }, 1000)  // 防抖 1 秒
+  }
+}
+```
+
+---
+
+### ℹ️ P2 轻微问题（优化）
+
+#### 问题 5：跨用户内容复用时缓存未失效
+
+**位置**：`AiService.java:332-335`
+
+**问题描述**：
+用户 A 重新生成时，会失效用户 A 的 Redis 缓存。但如果用户 B 上传了相同内容的文件并通过内容复用获得结果，用户 B 的缓存**不会**失效。
+
+**影响**：
+- 用户 B 可能看到过期的状态（如仍显示旧结果）
+- 需要手动刷新页面
+
+**修复方案**：
+```java
+// ContentTaskGate.java 改进
+public boolean resolveAnalysis(MediaFile target, String contentHash) {
+    // ... 原有复用逻辑 ...
+    
+    if (复用成功) {
+        // 失效目标用户的缓存，确保前端能看到最新状态
+        evictCache(target);
+        return true;
+    }
+    return false;
+}
+```
+
+---
+
+### 修复优先级汇总
+
+| 优先级 | 问题编号 | 问题描述 | 预计工作量 |
+|--------|---------|---------|-----------|
+| 🔴 P0 | 1 | force=true 跳过提交幂等键 | 1 小时 |
+| 🔴 P0 | 2 | 用户重试加乐观锁 | 0.5 小时 |
+| ⚠️ P1 | 3 | 补偿调度器计数冲突 | 1 小时 |
+| ⚠️ P1 | 4 | 前端防重复点击加强 | 0.5 小时 |
+| ℹ️ P2 | 5 | 跨用户缓存失效 | 0.5 小时 |
+
+**总修复工作量**：3.5 小时
+
+---
+
+### 测试建议
+
+**P0 修复后必须测试**：
+1. **并发测试**：同一用户两个标签页同时重新生成 → 验证乐观锁
+2. **竞态测试**：补偿调度器扫描期间用户点击重新生成 → 验证版本冲突检测
+3. **幂等键测试**：force=true 时提交幂等键是否正确覆盖
+
+**P1 修复后建议测试**：
+4. **快速双击测试**：确认对话框期间快速双击 → 验证防重复逻辑
+5. **调度器冲突测试**：模拟补偿调度器与用户重试的时间窗口冲突
+
+---
+
 ## 总结
 
 通过添加 `force` 参数实现重新生成功能，工作量 6 小时，成本 ¥150/月，不影响现有架构和其他用户。
 
-**状态**：待实现  
-**优先级**：高  
-**预计上线**：2026-09-16
+**代码审查识别出 5 个问题，其中 2 个 P0 严重问题需立即修复，修复工作量 3.5 小时。**
+
+**当前状态**：功能已实现，存在已知漏洞待修复  
+**优先级**：高（P0 问题需优先处理）  
+**预计完全上线**：2026-09-16（修复 P0 后）

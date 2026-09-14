@@ -67,14 +67,17 @@ public class DebugController {
 
     // AI总结接口(幂等键 + 限流 + MQ)
     @GetMapping("/ai")
-    public Result<String> aiAnalyze(@RequestParam Long id) {
+    public Result<String> aiAnalyze(@RequestParam Long id,
+                                    @RequestParam(value = "force", defaultValue = "false") boolean force) {
         MediaFile file = mediaFileMapper.selectById(id);
         if (file == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在，请检查后重试");
 
-        // 幂等：任务已在后台运行 → 不重复投递，返回成功让前端轮询等待结果
-        String aiSt = file.getAiStatus();
-        if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
-            return Result.ok("任务已在后台运行");
+        // 幂等：任务已在后台运行 → 不重复投递，返回成功让前端轮询等待结果（force=true 时跳过幂等检查）
+        if (!force) {
+            String aiSt = file.getAiStatus();
+            if (AiStatus.PENDING.name().equals(aiSt) || AiStatus.PROCESSING.name().equals(aiSt)) {
+                return Result.ok("任务已在后台运行");
+            }
         }
 
         // 提交侧幂等键：内容级（contentHash），原子抢占；抢不到说明并发提交中，吞掉重复投递
@@ -109,8 +112,8 @@ public class DebugController {
                 .set(MediaFile::getCompensationAttempts, 0));
             redisTemplate.delete("media:list:user:" + userIdKey);
 
-            //发送消息（携带内容指纹，消费侧用 contentHash 做内容级锁 / 幂等）
-            AnalysisTaskMsg msg = new AnalysisTaskMsg(id, "START_ANALYSIS", contentHash);
+            //发送消息（携带内容指纹 + force 标记，消费侧用 contentHash 做内容级锁 / 幂等）
+            AnalysisTaskMsg msg = new AnalysisTaskMsg(id, "START_ANALYSIS", contentHash, force);
             rocketMQTemplate.convertAndSend("video-analysis-topic", msg);
 
             // SSE 推送：PENDING
@@ -136,12 +139,13 @@ public class DebugController {
 
     //纯文字提取接口
     @GetMapping("/transcribe")
-    public Result<String> transcribe(@RequestParam Long id) {
+    public Result<String> transcribe(@RequestParam Long id,
+                                     @RequestParam(value = "force", defaultValue = "false") boolean force) {
         MediaFile mediaFile = mediaFileMapper.selectById(id);
         if (mediaFile == null) throw new BusinessException(ErrorCode.NOT_FOUND, "文件不存在，请检查后重试");
 
-        // 幂等：正在提取时不重复提交，返回成功让前端轮询等待结果
-        if (AiStatus.PROCESSING.name().equals(mediaFile.getTranscriptStatus())) {
+        // 幂等：正在提取时不重复提交，返回成功让前端轮询等待结果（force=true 时跳过幂等检查）
+        if (!force && AiStatus.PROCESSING.name().equals(mediaFile.getTranscriptStatus())) {
             return Result.ok("任务已在后台运行");
         }
 
@@ -152,15 +156,16 @@ public class DebugController {
         // 使用 LambdaUpdateWrapper 只更新需要的字段，避免乐观锁冲突
         mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
             .eq(MediaFile::getId, mediaFile.getId())
-            .set(MediaFile::getTranscriptStatus, AiStatus.PROCESSING.name()));
+            .set(MediaFile::getTranscriptStatus, AiStatus.PROCESSING.name())
+            .set(MediaFile::getTranscriptText, null));
         String userIdKey = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
         redisTemplate.delete("media:list:user:" + userIdKey);
 
         // SSE 推送：transcription PROCESSING
         taskEventService.publishTranscription(id, AiStatus.PROCESSING.name(), null, null);
 
-        // 调用异步服务
-        aiService.asyncTranscribe(id);
+        // 调用异步服务（传递 force 参数）
+        aiService.asyncTranscribe(id, force);
 
         return Result.ok("提取任务已后台运行");
     }

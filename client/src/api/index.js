@@ -30,13 +30,15 @@ export function downloadAudio(id) {
 }
 
 // ---- 提取文字 ----
-export function transcribe(id) {
-  return fetch(`${BASE_URL}/debug/transcribe?id=${id}`)
+export function transcribe(id, force = false) {
+  const forceParam = force ? '&force=true' : ''
+  return fetch(`${BASE_URL}/debug/transcribe?id=${id}${forceParam}`)
 }
 
 // ---- AI 智能总结 ----
-export function aiAnalyze(id) {
-  return fetch(`${BASE_URL}/debug/ai?id=${id}`)
+export function aiAnalyze(id, force = false) {
+  const forceParam = force ? '&force=true' : ''
+  return fetch(`${BASE_URL}/debug/ai?id=${id}${forceParam}`)
 }
 
 // ---- 用户登录 / 注册 ----

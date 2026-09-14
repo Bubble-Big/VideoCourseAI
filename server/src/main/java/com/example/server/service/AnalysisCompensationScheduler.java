@@ -117,7 +117,7 @@ public class AnalysisCompensationScheduler {
             return;
         }
 
-        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(mediaId);
+        CompletableFuture<GateOutcome> future = aiService.asyncAnalyze(mediaId, false);
         future.whenComplete((outcome, ex) -> {
             if (ex != null || outcome == GateOutcome.DEFER) {
                 // 异常或让位：这次触发没有产生任何真实进展，不消耗 attempts，交下一轮重新判断

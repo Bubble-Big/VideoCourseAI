@@ -17,13 +17,136 @@
       <div v-else>
         <div v-if="sidebar.type === 'ai'" class="markdown-content" v-html="renderedMarkdown"></div>
         <div v-else class="text-content"><pre>{{ sidebar.content }}</pre></div>
+
+        <!-- 重新生成按钮 -->
+        <div v-if="showRegenerateButton" class="regenerate-section">
+          <button
+            class="regenerate-btn"
+            @click="handleRegenerate"
+            :disabled="regenerating"
+          >
+            <span v-if="regenerating" class="btn-loading">
+              <div class="quantum-loader tiny"></div>
+              重新生成中...
+            </span>
+            <span v-else>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+              </svg>
+              重新生成
+            </span>
+          </button>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
+import { computed, ref } from 'vue'
 import { useMedia } from '../composables/useMedia.js'
+import { useConfirm } from '../composables/useConfirm.js'
 
-const { sidebar, renderedMarkdown, closeSidebar } = useMedia()
+const { sidebar, renderedMarkdown, closeSidebar, refreshMediaList, aiAnalyze, transcribe } = useMedia()
+const { confirm: showConfirm } = useConfirm()
+
+const regenerating = ref(false)
+
+// 显示重新生成按钮的条件
+// AI 分析：SUCCESS 或 FAILED 状态时显示
+// 文字提取：仅 FAILED 状态时显示
+const showRegenerateButton = computed(() => {
+  if (!sidebar.value.state || sidebar.value.loading) return false
+
+  if (sidebar.value.type === 'ai') {
+    return sidebar.value.state === 'SUCCESS' || sidebar.value.state === 'FAILED'
+  } else if (sidebar.value.type === 'text') {
+    return sidebar.value.state === 'FAILED'
+  }
+  return false
+})
+
+// 处理重新生成
+async function handleRegenerate() {
+  if (regenerating.value) return
+
+  // 确认对话框
+  const confirmMessage = sidebar.value.type === 'ai'
+    ? '重新生成将消耗 AI 配额，确定继续吗？'
+    : '确定要重新提取文字吗？'
+
+  const confirmed = await showConfirm(confirmMessage, '确认操作')
+  if (!confirmed) return
+
+  regenerating.value = true
+
+  try {
+    // 调用 API（传递 force=true）
+    // aiAnalyze/transcribe 内部会自动：
+    // 1. 打开侧边栏并设置 loading 状态
+    // 2. 调用后端 API
+    // 3. 启动 SSE 订阅
+    // 4. SSE 推送会自动更新侧边栏
+    if (sidebar.value.type === 'ai') {
+      await aiAnalyze(sidebar.value.id, true)
+    } else {
+      await transcribe(sidebar.value.id, true)
+    }
+  } catch (error) {
+    console.error('重新生成失败:', error)
+  } finally {
+    regenerating.value = false
+  }
+}
 </script>
+
+<style scoped>
+.regenerate-section {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.regenerate-btn {
+  width: 100%;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.regenerate-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+}
+
+.regenerate-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.regenerate-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quantum-loader.tiny {
+  width: 16px;
+  height: 16px;
+  border-width: 2px;
+}
+</style>

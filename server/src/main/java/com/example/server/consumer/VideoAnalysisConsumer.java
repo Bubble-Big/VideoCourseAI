@@ -27,10 +27,11 @@ public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> 
     @Override
     public void onMessage(AnalysisTaskMsg msg) {
         Long mediaId = msg.getMediaId();
-        log.info("收到分析任务, mediaId={}", mediaId);
+        Boolean force = msg.getForce();
+        log.info("收到分析任务, mediaId={}, force={}", mediaId, force);
         try {
             // 只做触发派发：@Async 立即返回，监听线程快进快出，不执行重活
-            aiService.asyncAnalyze(mediaId);
+            aiService.asyncAnalyze(mediaId, force);
         } catch (RejectedExecutionException e) {
             // 线程池队列满：吞掉并正常 ACK，状态仍是 PENDING，交给定时补偿兜底
             log.warn("分析任务派发被拒绝（线程池过载），等待补偿重试, mediaId={}", mediaId);
