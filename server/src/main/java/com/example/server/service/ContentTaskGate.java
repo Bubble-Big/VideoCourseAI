@@ -15,6 +15,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -205,12 +206,14 @@ public class ContentTaskGate {
             LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
                 .eq(MediaFile::getId, mediaFile.getId())
                 .set(MediaFile::getAiSummary, owner.getAiSummary())
-                .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name());
+                .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name())
+                .set(MediaFile::getAiProcessAt, LocalDateTime.now());
             if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
                 mediaFile.setTranscriptText(owner.getTranscriptText());
                 mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
                 wrapper.set(MediaFile::getTranscriptText, owner.getTranscriptText())
-                       .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name());
+                       .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name())
+                       .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now());
             }
             mediaFileMapper.update(null, wrapper);
             rememberAnalysis(contentHash, owner.getId()); // 回填归属缓存
@@ -301,7 +304,8 @@ public class ContentTaskGate {
             mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                 .eq(MediaFile::getId, mediaFile.getId())
                 .set(MediaFile::getTranscriptText, owner.getTranscriptText())
-                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
+                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name())
+                .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now()));
             rememberTranscript(contentHash, owner.getId()); // 回填归属缓存
 
             // SSE 推送：复用转写结果 SUCCESS

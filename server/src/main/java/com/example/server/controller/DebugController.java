@@ -194,6 +194,7 @@ public class DebugController {
             .eq(MediaFile::getVersion, currentVersion)
             .set(MediaFile::getTranscriptStatus, AiStatus.PROCESSING.name())
             .set(MediaFile::getTranscriptText, null)
+            .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now())
             .set(MediaFile::getTranscriptCompensationAttempts, 0)
             .set(MediaFile::getTranscriptRetryCount, currentTranscriptRetryCount + 1));
 

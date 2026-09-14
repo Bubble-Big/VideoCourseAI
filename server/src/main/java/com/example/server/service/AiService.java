@@ -105,7 +105,8 @@ public class AiService {
                     mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                         .eq(MediaFile::getId, mediaFile.getId())
                         .set(MediaFile::getAiSummary, NO_SPEECH_SUMMARY)
-                        .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
+                        .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name())
+                        .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
                     // force=true 时不登记归属，避免污染复用链
                     if (!Boolean.TRUE.equals(force)) {
                         contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
@@ -126,7 +127,8 @@ public class AiService {
                 mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                     .eq(MediaFile::getId, mediaFile.getId())
                     .set(MediaFile::getAiSummary, summary)
-                    .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name()));
+                    .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name())
+                    .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
                 // force=true 时不登记归属，避免污染复用链
                 if (!Boolean.TRUE.equals(force)) {
                     contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
@@ -215,7 +217,8 @@ public class AiService {
                 mediaFile.setTranscriptStatus(AiStatus.NONE.name());
                 mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                     .eq(MediaFile::getId, mediaFile.getId())
-                    .set(MediaFile::getTranscriptStatus, AiStatus.NONE.name()));
+                    .set(MediaFile::getTranscriptStatus, AiStatus.NONE.name())
+                    .set(MediaFile::getTranscriptProcessAt, null));
                 evictCache(mediaFile);
                 log.info("等待转写锁超时，回滚待重试, mediaId={} contentHash={}", mediaId, contentHash);
                 return;
@@ -232,7 +235,8 @@ public class AiService {
             mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                 .eq(MediaFile::getId, mediaFile.getId())
                 .set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name())
-                .set(MediaFile::getTranscriptText, null));
+                .set(MediaFile::getTranscriptText, null)
+                .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now()));
             evictCache(mediaFile);
 
             // SSE 推送：transcription FAILED
@@ -274,7 +278,8 @@ public class AiService {
             mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                 .eq(MediaFile::getId, mediaFile.getId())
                 .set(MediaFile::getTranscriptText, text)
-                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name()));
+                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name())
+                .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now()));
             // force=true 时不登记归属，避免污染复用链
             if (!Boolean.TRUE.equals(force)) {
                 contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
@@ -305,7 +310,8 @@ public class AiService {
         LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
             .eq(MediaFile::getId, mediaFile.getId())
             .set(MediaFile::getAiStatus, AiStatus.FAILED.name())
-            .set(MediaFile::getAiSummary, null);
+            .set(MediaFile::getAiSummary, null)
+            .set(MediaFile::getAiProcessAt, LocalDateTime.now());
         if (!AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())) {
             mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
             wrapper.set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name());
