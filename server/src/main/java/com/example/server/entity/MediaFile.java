@@ -44,4 +44,16 @@ public class MediaFile {
 
     // 补偿调度器专属重试计数（问题 5：与用户手动重试 aiAttempts 语义分离）
     private Integer compensationAttempts;
+
+    // AI 分析用户手动重试计数器（P1 修复：解决补偿调度器与用户重试的计数冲突）
+    private Integer analysisRetryCount;
+
+    // 文字提取补偿调度器专属重试计数
+    private Integer transcriptCompensationAttempts;
+
+    // 文字提取用户手动重试计数器（用于检测补偿调度器计数冲突）
+    private Integer transcriptRetryCount;
+
+    // 文字提取补偿调度器最近一次处理时间戳（与 aiProcessAt 分离，防时间戳干扰）
+    private LocalDateTime transcriptProcessAt;
 }

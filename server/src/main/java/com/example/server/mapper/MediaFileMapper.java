@@ -36,4 +36,12 @@ public interface MediaFileMapper extends BaseMapper<MediaFile> {
     List<MediaFile> selectStalledAnalysis(@Param("threshold") LocalDateTime threshold,
                                           @Param("limit") int limit);
 
+    /**
+     * 查「卡死」的文字提取记录（PROCESSING 且超过阈值未更新），供文字提取补偿调度器重新触发或落失败。
+     */
+    @Select("SELECT * FROM media_files WHERE transcript_status = 'PROCESSING' " +
+            "AND ai_process_at < #{threshold} ORDER BY ai_process_at ASC LIMIT #{limit}")
+    List<MediaFile> selectStalledTranscription(@Param("threshold") LocalDateTime threshold,
+                                               @Param("limit") int limit);
+
 }

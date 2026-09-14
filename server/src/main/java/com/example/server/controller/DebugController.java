@@ -92,6 +92,8 @@ public class DebugController {
         // 记录变更前的状态与旧结果，用于 MQ 投递失败时回滚，避免任务卡死在 PENDING
         String prevAiStatus = file.getAiStatus();
         String prevAiSummary = file.getAiSummary();
+        // 记录当前版本号，用于乐观锁检查
+        Integer currentVersion = file.getVersion();
         try {
             // 双层限流：用户级 + 全局级（真超限 429，Redis 异常 503）
             rateLimitService.requireAiQuota(file.getUserId());
@@ -103,13 +105,40 @@ public class DebugController {
             // 问题 5：用户手动重试视为全新一轮，aiAttempts 与 compensationAttempts 均清零
             file.setAiAttempts(0);
             file.setCompensationAttempts(0);
-            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+            // P1 修复：递增 analysisRetryCount，用于补偿调度器检测冲突
+            Integer currentAnalysisRetryCount = (file.getAnalysisRetryCount() == null ? 0 : file.getAnalysisRetryCount());
+            file.setAnalysisRetryCount(currentAnalysisRetryCount + 1);
+            // P0 修复：使用乐观锁，防止覆盖补偿调度器或其他并发操作的结果
+            int updated = mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                 .eq(MediaFile::getId, file.getId())
+                .eq(MediaFile::getVersion, currentVersion)
                 .set(MediaFile::getAiStatus, AiStatus.PENDING.name())
                 .set(MediaFile::getAiSummary, null)
                 .set(MediaFile::getAiProcessAt, LocalDateTime.now())
                 .set(MediaFile::getAiAttempts, 0)
-                .set(MediaFile::getCompensationAttempts, 0));
+                .set(MediaFile::getCompensationAttempts, 0)
+                .set(MediaFile::getAnalysisRetryCount, currentAnalysisRetryCount + 1));
+
+            if (updated == 0) {
+                // 版本冲突：记录已被其他操作修改，重新查询最新状态
+                MediaFile latest = mediaFileMapper.selectById(file.getId());
+                contentTaskGate.rollbackSubmitting(contentHash);
+
+                if (latest != null && AiStatus.SUCCESS.name().equals(latest.getAiStatus())) {
+                    // 补偿调度器或其他操作已完成分析 → 用户尚未看到结果
+                    // 直接返回成功，让前端 SSE 推送结果，用户体验流畅
+                    redisTemplate.delete("media:list:user:" + userIdKey);
+                    taskEventService.publishAnalysis(id, latest.getAiStatus(), latest.getAiSummary(), null);
+                    return Result.ok("分析已完成");
+                } else if (latest != null && AiStatus.PROCESSING.name().equals(latest.getAiStatus())) {
+                    // 任务还在处理中，无需重复提交
+                    return Result.ok("任务已在后台运行");
+                } else {
+                    // 其他状态（FAILED/PENDING）或记录不存在 → 提示冲突
+                    throw new BusinessException(ErrorCode.CONFLICT, "文件状态已变更，请刷新后重试");
+                }
+            }
+
             redisTemplate.delete("media:list:user:" + userIdKey);
 
             //发送消息（携带内容指纹 + force 标记，消费侧用 contentHash 做内容级锁 / 幂等）
@@ -152,13 +181,40 @@ public class DebugController {
         // 文字提取配额：用户级 + 全局级双层限流
         rateLimitService.requireTranscribeQuota(mediaFile.getUserId());
 
-        // 更新状态为 PROCESSING，并失效缓存让前端立即感知
-        // 使用 LambdaUpdateWrapper 只更新需要的字段，避免乐观锁冲突
-        mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-            .eq(MediaFile::getId, mediaFile.getId())
-            .set(MediaFile::getTranscriptStatus, AiStatus.PROCESSING.name())
-            .set(MediaFile::getTranscriptText, null));
+        // 记录当前版本号，用于乐观锁检查
+        Integer currentVersion = mediaFile.getVersion();
+        Integer currentTranscriptRetryCount = (mediaFile.getTranscriptRetryCount() == null ? 0 : mediaFile.getTranscriptRetryCount());
         String userIdKey = (mediaFile.getUserId() == null) ? "anon" : String.valueOf(mediaFile.getUserId());
+
+        // 更新状态为 PROCESSING，并失效缓存让前端立即感知
+        // P0 修复：使用乐观锁，防止覆盖补偿调度器或其他并发操作的结果
+        // 同时递增 transcriptRetryCount 用于补偿调度器检测冲突，重置补偿计数
+        int updated = mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
+            .eq(MediaFile::getId, mediaFile.getId())
+            .eq(MediaFile::getVersion, currentVersion)
+            .set(MediaFile::getTranscriptStatus, AiStatus.PROCESSING.name())
+            .set(MediaFile::getTranscriptText, null)
+            .set(MediaFile::getTranscriptCompensationAttempts, 0)
+            .set(MediaFile::getTranscriptRetryCount, currentTranscriptRetryCount + 1));
+
+        if (updated == 0) {
+            // 版本冲突：记录已被其他操作修改，重新查询最新状态
+            MediaFile latest = mediaFileMapper.selectById(mediaFile.getId());
+
+            if (latest != null && AiStatus.SUCCESS.name().equals(latest.getTranscriptStatus())) {
+                // 补偿调度器或其他操作已完成文字提取 → 直接返回成功
+                redisTemplate.delete("media:list:user:" + userIdKey);
+                taskEventService.publishTranscription(id, latest.getTranscriptStatus(), latest.getTranscriptText(), null);
+                return Result.ok("提取已完成");
+            } else if (latest != null && AiStatus.PROCESSING.name().equals(latest.getTranscriptStatus())) {
+                // 任务还在处理中，无需重复提交
+                return Result.ok("任务已在后台运行");
+            } else {
+                // 其他状态（FAILED/PENDING）或记录不存在 → 提示冲突
+                throw new BusinessException(ErrorCode.CONFLICT, "文件状态已变更，请刷新后重试");
+            }
+        }
+
         redisTemplate.delete("media:list:user:" + userIdKey);
 
         // SSE 推送：transcription PROCESSING

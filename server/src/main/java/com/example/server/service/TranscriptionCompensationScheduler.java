@@ -17,35 +17,32 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * AI 分析补偿调度器：继承抽象基类，定制化实现 AI 分析的补偿逻辑。
+ * 文字提取补偿调度器：继承抽象基类，定制化实现文字提取的补偿逻辑。
  */
 @Component
-public class AnalysisCompensationScheduler extends AbstractCompensationScheduler {
+public class TranscriptionCompensationScheduler extends AbstractCompensationScheduler {
 
-    private static final Logger log = LoggerFactory.getLogger(AnalysisCompensationScheduler.class);
+    private static final Logger log = LoggerFactory.getLogger(TranscriptionCompensationScheduler.class);
 
-    @Value("${ai.compensation.threshold-minutes:20}")
+    @Value("${transcription.compensation.threshold-minutes:15}")
     private long thresholdMinutes;
 
-    @Value("${ai.compensation.max-attempts:3}")
+    @Value("${transcription.compensation.max-attempts:3}")
     private int maxAttempts;
 
     private final AiService aiService;
-    private final FailedAnalysisTaskService failedTaskService;
 
-    public AnalysisCompensationScheduler(MediaFileMapper mediaFileMapper,
-                                        AiService aiService,
-                                        FailedAnalysisTaskService failedTaskService,
-                                        TaskEventService taskEventService,
-                                        RedissonClient redissonClient) {
+    public TranscriptionCompensationScheduler(MediaFileMapper mediaFileMapper,
+                                             AiService aiService,
+                                             TaskEventService taskEventService,
+                                             RedissonClient redissonClient) {
         super(mediaFileMapper, redissonClient, taskEventService);
         this.aiService = aiService;
-        this.failedTaskService = failedTaskService;
     }
 
     @Override
     protected String getLockKey() {
-        return "lock:scheduler:analysis-compensation";
+        return "lock:scheduler:transcription-compensation";
     }
 
     @Override
@@ -60,68 +57,70 @@ public class AnalysisCompensationScheduler extends AbstractCompensationScheduler
 
     @Override
     protected String getSchedulerName() {
-        return "AI分析补偿调度器";
+        return "文字提取补偿调度器";
     }
 
     @Override
     protected List<MediaFile> scanStalledTasks(LocalDateTime threshold, int limit) {
-        return mediaFileMapper.selectStalledAnalysis(threshold, limit);
+        return mediaFileMapper.selectStalledTranscription(threshold, limit);
     }
 
     @Override
     protected CompletableFuture<?> triggerRetry(Long mediaId) {
-        return aiService.asyncAnalyze(mediaId, false);
+        aiService.asyncTranscribe(mediaId, false);
+        return CompletableFuture.completedFuture(null);
     }
 
     @Override
     protected String getStatus(MediaFile file) {
-        return file.getAiStatus();
+        return file.getTranscriptStatus();
     }
 
     @Override
     protected Integer getCompensationAttempts(MediaFile file) {
-        return file.getCompensationAttempts();
+        return file.getTranscriptCompensationAttempts();
     }
 
     @Override
     protected Integer getRetryCount(MediaFile file) {
-        return file.getAnalysisRetryCount();
+        return file.getTranscriptRetryCount();
     }
 
     @Override
     protected LocalDateTime getProcessAt(MediaFile file) {
-        return file.getAiProcessAt();
+        return file.getTranscriptProcessAt();
     }
 
     @Override
     protected void setStatus(LambdaUpdateWrapper<MediaFile> wrapper, String status) {
-        wrapper.set(MediaFile::getAiStatus, status)
-               .set(MediaFile::getAiSummary, null);
+        wrapper.set(MediaFile::getTranscriptStatus, status)
+               .set(MediaFile::getTranscriptText, null);
     }
 
     @Override
     protected void setCompensationAttempts(LambdaUpdateWrapper<MediaFile> wrapper, int attempts) {
-        wrapper.set(MediaFile::getCompensationAttempts, attempts);
+        wrapper.set(MediaFile::getTranscriptCompensationAttempts, attempts);
     }
 
     @Override
     protected void setProcessAt(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time) {
-        wrapper.set(MediaFile::getAiProcessAt, time);
+        wrapper.set(MediaFile::getTranscriptProcessAt, time);
     }
 
     @Override
     protected void refreshProcessAtField(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time) {
-        wrapper.set(MediaFile::getAiProcessAt, time);
+        wrapper.set(MediaFile::getTranscriptProcessAt, time);
     }
 
     @Override
     protected void recordFailure(Long mediaId, Exception ex, int attempts) {
-        failedTaskService.record(mediaId, (AiAnalysisException) ex, attempts);
+        log.error("文字提取重试耗尽, mediaId={}, attempts={}, err={}",
+            mediaId, attempts, ex.getMessage());
     }
 
     @Override
     protected void publishFailure(Long mediaId, String errorMsg) {
-        taskEventService.publishAnalysis(mediaId, AiStatus.FAILED.name(), null, errorMsg);
+        taskEventService.publishTranscription(mediaId, AiStatus.FAILED.name(), null, errorMsg);
     }
 
     @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
