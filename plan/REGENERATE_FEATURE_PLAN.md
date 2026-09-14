@@ -225,44 +225,6 @@ AI 分析侧边栏：
 
 ### 🔴 P0 严重问题（需立即修复）
 
-#### 问题 1：force=true 仍参与提交幂等键竞争
-
-**位置**：`DebugController.java:84-89`
-
-**问题描述**：
-用户点击"重新生成"时（force=true），仍需要抢占 30 秒 TTL 的 `active:{contentHash}` 幂等键。如果另一个相同内容的任务正在提交，用户的手动重试会被拒绝返回"任务提交中，请稍候"。
-
-**影响**：
-- 同一用户在两个标签页同时重新生成 → 一个被拒绝
-- 不同用户上传相同文件后同时重新生成 → 一个被拒绝
-- 用户体验不佳：明确的手动重试被拒绝
-
-**修复方案**：
-```java
-// DebugController.java 改进
-String contentHash = AnalysisTaskKeys.normalizeContentHash(id, file.getFileMd5());
-
-if (!force) {
-    // 非 force 模式：需要抢占幂等键，避免重复提交
-    boolean accepted = contentTaskGate.tryMarkSubmitting(contentHash, id);
-    if (!accepted) {
-        return Result.ok("任务提交中，请稍候");
-    }
-} else {
-    // force 模式：强制标记，覆盖旧的提交标记
-    contentTaskGate.forceMarkSubmitting(contentHash, id);
-}
-```
-
-**需要新增方法**：
-```java
-// ContentTaskGate.java
-public void forceMarkSubmitting(String contentHash, Long mediaId) {
-    String activeKey = AnalysisTaskKeys.active(contentHash);
-    redisTemplate.opsForValue().set(activeKey, String.valueOf(mediaId), SUBMIT_ACTIVE_TTL);
-}
-```
-
 ---
 
 #### 问题 2：用户手动重试未使用乐观锁
