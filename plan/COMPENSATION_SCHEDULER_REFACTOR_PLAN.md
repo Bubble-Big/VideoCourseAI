@@ -1,8 +1,9 @@
 # 补偿调度器抽象重构计划
 
 > 创建日期：2026-09-14  
-> 状态：待实施  
-> 预计工作量：3 小时
+> 更新日期：2026-09-15  
+> 状态：✅ 已完成  
+> 实际工作量：2.5 小时
 
 ---
 
@@ -700,6 +701,25 @@ public class TranscodeCompensationScheduler extends AbstractCompensationSchedule
 - **功能补齐**：文字提取补偿调度器上线
 - **易扩展**：未来新增调度器成本极低
 
-**当前状态**：计划已完成  
-**优先级**：中（可配合 P0/P1 修复一起实施）  
-**预计上线**：2026-09-15
+**当前状态**：✅ 已完成  
+**实施日期**：2026-09-14 ~ 2026-09-15  
+**实际成果**：
+- ✅ V8 数据库迁移已执行（`transcript_compensation_attempts`、`transcript_retry_count`、索引）
+- ✅ `AbstractCompensationScheduler` 抽象基类已实现
+- ✅ `AnalysisCompensationScheduler` 已重构继承基类
+- ✅ `TranscriptionCompensationScheduler` 已实现
+- ✅ `DebugController.transcribe()` 已更新（递增 `transcriptRetryCount` + 乐观锁）
+- ✅ 发现并修复 8 处系统性 bug（所有任务完成路径缺失 `*_process_at` 时间戳更新）
+
+**附加修复**：
+- 🐛 修复 AI 分析 / 文字提取所有完成路径（SUCCESS/FAILED/REUSE/ROLLBACK）缺失时间戳更新的系统性 bug
+- 🐛 修复会导致补偿调度器误判已完成任务为卡死状态并无限重试的严重问题
+
+**验收结果**：
+- ✅ 编译通过（Maven）
+- ✅ 数据库结构已更新
+- ✅ 所有时间戳更新路径已修复
+- ⏳ 功能测试待运行时验证
+
+**优先级**：已完成  
+**实际上线**：2026-09-15

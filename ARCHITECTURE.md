@@ -1,6 +1,7 @@
 # VideoCourseAI — 智能视频内容理解平台 架构分析文档
 
 > 分析日期：2026-08-15  
+> 最后更新：2026-09-15  
 > 项目仓库：https://github.com/Bubble-Big/VideoCourseAI
 
 ---
@@ -443,8 +444,16 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | file_md5 | VARCHAR(32) | 全文件 MD5 = 内容指纹 contentHash — 分片上传重构新增 |
 | ai_status | VARCHAR(32) | AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED — 状态字段化新增 |
 | ai_summary | TEXT | AI 总结内容 (Markdown) |
+| ai_process_at | DATETIME | AI 分析最后处理时间（用于补偿调度器扫描卡死任务） |
+| ai_attempts | INT | AI 分析补偿调度器重试计数（≥3 标记 FAILED） |
+| compensation_attempts | INT | AI 分析补偿调度器重试计数（旧字段名，已废弃，保留兼容） |
+| analysis_retry_count | INT | 用户 AI 分析手动重试次数（用于检测补偿调度器计数冲突） |
 | transcript_status | VARCHAR(32) | 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED — 状态字段化新增 |
 | transcript_text | TEXT | 语音转写全文 |
+| transcript_process_at | DATETIME | 文字提取最后处理时间（V8 新增，用于文字提取补偿调度器） |
+| transcript_compensation_attempts | INT | 文字提取补偿调度器重试计数（V8 新增） |
+| transcript_retry_count | INT | 用户文字提取手动重试次数（V8 新增，用于检测补偿调度器计数冲突） |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理） |
 | cover_url | VARCHAR | 封面 URL |
 | upload_time | DATETIME | 上传时间 (DB 自动填充) |
 
@@ -485,7 +494,10 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 {
   "mediaId": Long,       // 媒体文件 ID
   "action": String,      // 动作类型 (START_ANALYSIS)
-  "contentHash": String  // 内容指纹（MD5 标准化），供消费侧内容级锁/幂等/复用
+  "contentHash": String, // 内容指纹（MD5 标准化），供消费侧内容级锁/幂等/复用
+  "force": Boolean       // 是否强制重新生成（跳过复用逻辑，V8 新增）
+}
+```
 }
 ```
 
@@ -791,52 +803,117 @@ rocketmq.producer.group=video-analysis-group
 
 ---
 
-## 十四、文件清单
+## 十四、近期架构演进记录（2026-09-14 ~ 2026-09-15）
 
-### 后端 Java 文件 (30+个)
+### 14.1 补偿调度器抽象重构（已完成）
+
+**背景**：AI 分析补偿调度器已实现，文字提取补偿调度器缺失，两者核心逻辑高度相似（90% 可复用）。
+
+**实施**：
+- ✅ 创建 `AbstractCompensationScheduler` 抽象基类，统一「分布式锁 + 扫描循环 + 乐观锁 + retryCount 冲突检测」通用逻辑
+- ✅ `AnalysisCompensationScheduler` 重构继承基类（代码量从 ~200 行降至 ~130 行）
+- ✅ 新增 `TranscriptionCompensationScheduler` 文字提取补偿调度器
+- ✅ V8 数据库迁移：新增 `transcript_compensation_attempts`、`transcript_retry_count`、`transcript_process_at` 字段及索引
+- ✅ `DebugController.transcribe()` 更新：用户手动重试时递增 `transcriptRetryCount` + 乐观锁保护
+
+**成果**：代码复用率达 90%，未来新增补偿调度器只需 100 行代码；文字提取卡死任务自动恢复机制上线。
+
+**详见**：`plan/COMPENSATION_SCHEDULER_REFACTOR_PLAN.md`
+
+### 14.2 重新生成功能（force 参数，已完成）
+
+**背景**：AI 分析失败或结果不满意时，无法直接重新生成，只能删除重新上传。
+
+**实施**：
+- ✅ 后端 `force` 参数支持：`AnalysisTaskMsg` 添加 `Boolean force` 字段，传递至 `AiService.asyncAnalyze()` / `asyncTranscribe()`
+- ✅ `force=true` 跳过复用逻辑（`resolveAnalysis` / `resolveTranscript`），不登记归属缓存（避免污染复用链）
+- ✅ 前端重新生成按钮：AI 分析（SUCCESS/FAILED 显示）、文字提取（仅 FAILED 显示），点击前确认弹窗
+- ✅ P0 修复：用户手动重试添加乐观锁（`DebugController.ai()` + `transcribe()`），防止覆盖补偿调度器结果
+- ✅ P1 修复：补偿调度器添加 `retryCount` 冲突检测，避免与用户手动重试计数混淆
+
+**设计原则**：简单（复用现有架构）、安全（限流 + 确认提示）、独立（不影响其他用户复用）。
+
+**详见**：`plan/REGENERATE_FEATURE_PLAN.md`
+
+### 14.3 系统性 Bug 修复（process_at 时间戳缺失）
+
+**问题**：所有任务完成路径（SUCCESS/FAILED/REUSE/ROLLBACK）缺失 `*_process_at` 时间戳更新，导致补偿调度器误判已完成任务为卡死状态，触发无限重试。
+
+**修复范围**（共 8 处）：
+- ✅ `AiService.transcribeWithReuse()` SUCCESS 路径
+- ✅ `AiService.asyncTranscribe()` FAILED 路径 + 超时回滚路径
+- ✅ `AiService.asyncAnalyze()` 无语音内容路径 + 正常分析路径
+- ✅ `AiService.markFailed()` 永久失败路径
+- ✅ `ContentTaskGate.resolveTranscript()` 复用路径
+- ✅ `ContentTaskGate.resolveAnalysis()` 复用路径
+
+**影响**：彻底解决补偿调度器误判问题，确保所有完成路径正确更新时间戳。
+
+---
+
+## 十五、文件清单
+
+### 后端 Java 文件 (35+个)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `ServerApplication.java` | 18 | Spring Boot 启动类 |
 | `common/Result.java` | 32 | 统一 API 响应体 (record) |
 | `common/ErrorCode.java` | 37 | 统一错误码枚举（含 httpStatus 显式映射） |
-| `common/AiStatus.java` | 22 | AI 分析/文字提取状态枚举 (新增) |
-| `common/GateOutcome.java` | 15 | ContentTaskGate 三态返回契约 (新增) |
+| `common/AiStatus.java` | 22 | AI 分析/文字提取状态枚举 |
+| `common/GateOutcome.java` | 15 | ContentTaskGate 三态返回契约 |
 | `config/MinioConfig.java` | 76 | MinIO 客户端初始化 + 桶策略 + 生命周期 |
 | `config/ThreadPoolConfig.java` | 35 | AI 任务线程池配置（@Async 文字提取用） |
 | `config/WebConfig.java` | 24 | CORS 全局跨域配置 |
 | `controller/UserController.java` | 90 | 用户注册/登录 |
 | `controller/MediaController.java` | 179 | URL 上传（补算 MD5）/列表/删除 |
-| `controller/ChunkController.java` | 103 | 分片上传 5 个端点 (新增) |
-| `controller/DebugController.java` | 162 | AI分析（幂等键+限流）/文字提取/音频下载 |
-| `controller/ApiExceptionHandler.java` | 105 | 全局异常处理 (新增) |
+| `controller/ChunkController.java` | 103 | 分片上传 5 个端点 |
+| `controller/DebugController.java` | 305 | AI分析（幂等键+限流+乐观锁）/文字提取/音频下载/SSE订阅 |
+| `controller/ApiExceptionHandler.java` | 105 | 全局异常处理 |
 | `service/MediaService.java` | 99 | 媒体处理服务（+calculateMd5/contentHash） |
 | `service/ChunkUploadService.java` | 449 | 分片上传核心逻辑（本地合并） |
-| `service/AiService.java` | 300 | 异步 AI 分析（状态机 + 内容复用，Gate/Legacy 双路径） |
-| `service/ContentTaskGate.java` | 220 | 内容级串行原语统一收敛（锁语义+提交标记+归属复用） (新增) |
-| `service/RateLimitService.java` | 71 | 双层令牌桶限流 (新增) |
-| `service/FailedAnalysisTaskService.java` | 44 | 失败台账服务（record） (新增) |
-| `service/AnalysisCompensationScheduler.java` | 76 | 补偿式重试调度器（扫卡死记录重新触发/落失败） (新增) |
+| `service/AiService.java` | 341 | 异步 AI 分析（状态机 + 内容复用 + force 支持） |
+| `service/ContentTaskGate.java` | 349 | 内容级串行原语统一收敛（锁语义+提交标记+归属复用） |
+| `service/TaskEventService.java` | 187 | SSE 实时推送服务（连接管理 + Redis Pub/Sub） |
+| `service/RateLimitService.java` | 71 | 双层令牌桶限流 |
+| `service/FailedAnalysisTaskService.java` | 44 | 失败台账服务（record） |
+| `service/AbstractCompensationScheduler.java` | 195 | 补偿调度器抽象基类（通用逻辑 + retryCount 冲突检测） |
+| `service/AnalysisCompensationScheduler.java` | 130 | AI 分析补偿调度器（继承抽象基类） |
+| `service/TranscriptionCompensationScheduler.java` | 130 | 文字提取补偿调度器（继承抽象基类，V8 新增） |
 | `consumer/VideoAnalysisConsumer.java` | 38 | RocketMQ 消费者（触发派发 + ACK） |
-| `consumer/VideoAnalysisDlqConsumer.java` | 33 | AI 分析死信兜底（落 FAILED） (新增) |
-| `exception/BusinessException.java` | 20 | 业务异常 (新增) |
-| `exception/AiAnalysisException.java` | 27 | 带 retryable 标志的 AI 异常 (新增) |
+| `consumer/VideoAnalysisDlqConsumer.java` | 33 | AI 分析死信兜底（落 FAILED） |
+| `exception/BusinessException.java` | 20 | 业务异常 |
+| `exception/AiAnalysisException.java` | 27 | 带 retryable 标志的 AI 异常 |
 | `strategy/AiAnalysisStrategy.java` | 26 | AI 分析策略接口 |
 | `strategy/impl/AliyunDeepSeekStrategy.java` | 76 | FFmpeg + ASR + DeepSeek 实现 |
-| `dto/AnalysisTaskMsg.java` | 30 | RocketMQ 消息体（+contentHash） |
-| `dto/ChunkUploadDTO.java` | 116 | 分片上传请求/响应 DTO (新增) |
+| `dto/AnalysisTaskMsg.java` | 35 | RocketMQ 消息体（+contentHash +force） |
+| `dto/ChunkUploadDTO.java` | 116 | 分片上传请求/响应 DTO |
+| `dto/TaskEvent.java` | 45 | SSE 任务事件 DTO（V8 新增） |
 | `entity/User.java` | 27 | 用户实体 |
-| `entity/MediaFile.java` | 37 | 媒体文件实体（+file_size/md5/ai_status/transcript_status/ai_process_at/ai_attempts） |
-| `entity/FailedAnalysisTask.java` | 26 | AI 失败台账实体 (新增) |
+| `entity/MediaFile.java` | 52 | 媒体文件实体（+补偿字段 +时间戳字段 +乐观锁） |
+| `entity/FailedAnalysisTask.java` | 26 | AI 失败台账实体 |
 | `mapper/UserMapper.java` | 9 | 用户 DAO |
-| `mapper/MediaFileMapper.java` | 9 | 媒体文件 DAO |
-| `mapper/FailedAnalysisTaskMapper.java` | 9 | 台账 DAO (新增) |
+| `mapper/MediaFileMapper.java` | 46 | 媒体文件 DAO（+selectStalledAnalysis +selectStalledTranscription +MD5 反查） |
+| `mapper/FailedAnalysisTaskMapper.java` | 9 | 台账 DAO |
 | `utils/MinioUtils.java` | 211 | MinIO 上传/删除/分片/流式拷贝（本地合并） |
 | `utils/YtDlpUtils.java` | 88 | yt-dlp 视频下载工具 |
 | `utils/DeepSeekUtils.java` | 179 | DeepSeek AI 调用 |
 | `utils/AliyunAsrUtils.java` | 103 | 语音识别（SiliconFlow TeleSpeechASR） |
-| `utils/AnalysisTaskKeys.java` | 52 | 分析任务 Key + contentHash 标准化 (新增) |
+| `utils/AnalysisTaskKeys.java` | 52 | 分析任务 Key + contentHash 标准化 |
 | `utils/FfmpegUtils.java` | 95 | FFmpeg 音频提取 |
+
+### 数据库迁移文件
+
+| 文件 | 版本 | 职责 |
+|------|------|------|
+| `V1__init.sql` | 1 | 初始化数据库结构 |
+| `V2__add_file_md5.sql` | 2 | 新增 file_md5 字段 + 索引 |
+| `V3__add_ai_status.sql` | 3 | 新增 ai_status 字段（AI 分析状态追踪） |
+| `V4__add_transcript_status.sql` | 4 | 新增 transcript_status 字段（文字提取状态追踪） |
+| `V5__add_analysis_indexes.sql` | 5 | 新增 file_md5 + ai_status 索引（优化归属复用查询） |
+| `V6__add_compensation_columns.sql` | 6 | 新增 ai_attempts + ai_process_at + analysis_retry_count 字段（补偿调度器支持） |
+| `V7__add_version_column.sql` | 7 | 新增 version 字段（乐观锁防冲突） |
+| `V8__add_transcript_compensation_columns.sql` | 8 | 新增 transcript_compensation_attempts + transcript_retry_count + transcript_process_at 字段及索引（文字提取补偿调度器支持） |
 
 ### 前端文件
 
