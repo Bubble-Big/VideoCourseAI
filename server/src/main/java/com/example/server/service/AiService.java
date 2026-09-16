@@ -1,20 +1,25 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.common.AiFailStage;
 import com.example.server.common.AiStatus;
 import com.example.server.common.GateOutcome;
+import com.example.server.entity.MediaAiAnalysis;
 import com.example.server.entity.MediaFile;
+import com.example.server.entity.MediaTranscription;
 import com.example.server.exception.AiAnalysisException;
+import com.example.server.mapper.MediaAiAnalysisMapper;
 import com.example.server.mapper.MediaFileMapper;
+import com.example.server.mapper.MediaTranscriptionMapper;
 import com.example.server.strategy.AiAnalysisStrategy;
-import com.example.server.utils.AnalysisTaskKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.concurrent.CompletableFuture;
@@ -30,8 +35,9 @@ public class AiService {
     private static final String NO_SPEECH_SUMMARY = "视频未提取到有效信息，无法分析";
 
     private final MediaFileMapper mediaFileMapper;
+    private final MediaAiAnalysisMapper aiAnalysisMapper;
+    private final MediaTranscriptionMapper transcriptionMapper;
     private final AiAnalysisStrategy aiAnalysisStrategy;
-    // 【关键】必须注入 Redis 工具！
     private final StringRedisTemplate redisTemplate;
     private final MediaService mediaService;
     private final FailedAnalysisTaskService failedTaskService;
@@ -39,6 +45,8 @@ public class AiService {
     private final TaskEventService taskEventService;
 
     public AiService(MediaFileMapper mediaFileMapper,
+                     MediaAiAnalysisMapper aiAnalysisMapper,
+                     MediaTranscriptionMapper transcriptionMapper,
                      @Qualifier("defaultAiStrategy") AiAnalysisStrategy aiAnalysisStrategy,
                      StringRedisTemplate redisTemplate,
                      MediaService mediaService,
@@ -46,6 +54,8 @@ public class AiService {
                      ContentTaskGate contentTaskGate,
                      TaskEventService taskEventService) {
         this.mediaFileMapper = mediaFileMapper;
+        this.aiAnalysisMapper = aiAnalysisMapper;
+        this.transcriptionMapper = transcriptionMapper;
         this.aiAnalysisStrategy = aiAnalysisStrategy;
         this.redisTemplate = redisTemplate;
         this.mediaService = mediaService;
@@ -71,6 +81,20 @@ public class AiService {
                 throw new AiAnalysisException("文件不存在: " + mediaId, false, AiFailStage.FILE);
             }
 
+            // 查询或初始化 AI 分析记录
+            MediaAiAnalysis aiAnalysis = aiAnalysisMapper.selectOne(
+                new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, mediaId)
+            );
+            if (aiAnalysis == null) {
+                aiAnalysis = new MediaAiAnalysis();
+                aiAnalysis.setMediaId(mediaId);
+                aiAnalysis.setStatus(AiStatus.NONE.name());
+                aiAnalysis.setAttempts(0);
+                aiAnalysis.setCompensationAttempts(0);
+                aiAnalysis.setRetryCount(0);
+                aiAnalysisMapper.insert(aiAnalysis);
+            }
+
             // 结果复用：查询并回填已有结果（force=true 时跳过复用）
             if (!Boolean.TRUE.equals(force) && contentTaskGate.resolveAnalysis(mediaFile, contentHash)) {
                 evictCache(mediaFile);
@@ -79,12 +103,9 @@ public class AiService {
             }
 
             // 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳
-            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
-            mediaFile.setAiProcessAt(LocalDateTime.now());
-            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                .eq(MediaFile::getId, mediaFile.getId())
-                .set(MediaFile::getAiStatus, AiStatus.PROCESSING.name())
-                .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
+            aiAnalysis.setStatus(AiStatus.PROCESSING.name());
+            aiAnalysis.setProcessAt(LocalDateTime.now());
+            aiAnalysisMapper.updateById(aiAnalysis);
 
             // SSE 推送：PROCESSING
             taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
@@ -95,18 +116,14 @@ public class AiService {
                 if (text == null) {
                     throw new AiAnalysisException("等待转写锁超时，稍后重试", true, AiFailStage.LOCK);
                 }
-                mediaFile.setTranscriptText(text);
-                mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
 
                 if (NO_SPEECH_TRANSCRIPT.equals(text)) {
                     // 无语音内容：跳过 LLM，直接落受控总结文案
-                    mediaFile.setAiSummary(NO_SPEECH_SUMMARY);
-                    mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-                    mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                        .eq(MediaFile::getId, mediaFile.getId())
-                        .set(MediaFile::getAiSummary, NO_SPEECH_SUMMARY)
-                        .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name())
-                        .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
+                    aiAnalysis.setSummary(NO_SPEECH_SUMMARY);
+                    aiAnalysis.setStatus(AiStatus.SUCCESS.name());
+                    aiAnalysis.setProcessAt(LocalDateTime.now());
+                    aiAnalysisMapper.updateById(aiAnalysis);
+
                     // force=true 时不登记归属，避免污染复用链
                     if (!Boolean.TRUE.equals(force)) {
                         contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
@@ -122,13 +139,11 @@ public class AiService {
 
                 // 2. 智能总结
                 String summary = aiAnalysisStrategy.generateSummaryFromText(text);
-                mediaFile.setAiSummary(summary);
-                mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-                mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                    .eq(MediaFile::getId, mediaFile.getId())
-                    .set(MediaFile::getAiSummary, summary)
-                    .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name())
-                    .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
+                aiAnalysis.setSummary(summary);
+                aiAnalysis.setStatus(AiStatus.SUCCESS.name());
+                aiAnalysis.setProcessAt(LocalDateTime.now());
+                aiAnalysisMapper.updateById(aiAnalysis);
+
                 // force=true 时不登记归属，避免污染复用链
                 if (!Boolean.TRUE.equals(force)) {
                     contentTaskGate.rememberAnalysis(contentHash, mediaFile.getId());
@@ -142,8 +157,8 @@ public class AiService {
                 return GateOutcome.PROCEED;
 
             } catch (Exception e) {
-                handleAnalysisException(mediaFile, mediaId, e);
-                return GateOutcome.PROCEED;  // 异常已处理，视为完成
+                handleAnalysisException(aiAnalysis, mediaId, e);
+                return GateOutcome.PROCEED;
             }
         });
 
@@ -157,28 +172,22 @@ public class AiService {
     /**
      * 统一异常处理：永久失败落 FAILED，瞬时失败保持 PROCESSING 交补偿
      */
-    private void handleAnalysisException(MediaFile mediaFile, Long mediaId, Exception e) {
+    private void handleAnalysisException(MediaAiAnalysis aiAnalysis, Long mediaId, Exception e) {
         if (e instanceof AiAnalysisException ae && !ae.isRetryable()) {
-            if (mediaFile != null) {
-                markFailed(mediaFile, e);
-            }
-            failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
+            markFailed(aiAnalysis, mediaId, e);
+            failedTaskService.record(mediaId, ae, aiAnalysis.getAttempts());
             return;
         }
-        if (mediaFile != null) {
-            // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
-            mediaFile.setAiStatus(AiStatus.PROCESSING.name());
-            mediaFile.setAiProcessAt(LocalDateTime.now());
-            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                .eq(MediaFile::getId, mediaFile.getId())
-                .set(MediaFile::getAiStatus, AiStatus.PROCESSING.name())
-                .set(MediaFile::getAiProcessAt, LocalDateTime.now()));
+        // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
+        aiAnalysis.setStatus(AiStatus.PROCESSING.name());
+        aiAnalysis.setProcessAt(LocalDateTime.now());
+        aiAnalysisMapper.updateById(aiAnalysis);
 
-            // SSE 推送：PROCESSING（瞬时失败，等待重试）
-            taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
-        }
+        // SSE 推送：PROCESSING（瞬时失败，等待重试）
+        taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
+
         if (e instanceof AiAnalysisException ae) {
-            failedTaskService.record(mediaId, ae, attemptsOf(mediaFile));
+            failedTaskService.record(mediaId, ae, aiAnalysis.getAttempts());
         }
         log.warn("AI 分析瞬时失败，保持 PROCESSING 等待补偿重试, mediaId={}, err={}", mediaId, e.getMessage());
     }
@@ -187,11 +196,13 @@ public class AiService {
      * 落失败（供补偿调度器 / DLQ 兜底调用）：绕过可重试判断，直接写 FAILED + 受控文案。
      */
     public void markFailedFinal(Long mediaId) {
-        MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
-        if (mediaFile == null) {
+        MediaAiAnalysis aiAnalysis = aiAnalysisMapper.selectOne(
+            new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, mediaId)
+        );
+        if (aiAnalysis == null) {
             return;
         }
-        markFailed(mediaFile, new AiAnalysisException("重试耗尽，判定失败", false));
+        markFailed(aiAnalysis, mediaId, new AiAnalysisException("重试耗尽，判定失败", false));
     }
 
     /**
@@ -203,7 +214,7 @@ public class AiService {
     public void asyncTranscribe(Long mediaId, Boolean force) {
         MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
         if (mediaFile == null) {
-            log.warn("全文提取任务找不到文件记录, mediaId={}", mediaId);
+            log.warn("全文提取任务找不到文件记录, mediaId=", mediaId);
             return;
         }
         log.info("开始全文提取任务, mediaId={}", mediaId);
@@ -214,29 +225,33 @@ public class AiService {
             String text = transcribeWithReuse(mediaFile, contentHash, force);
             if (text == null) {
                 // 等待转写锁超时仍未复用：回滚到 NONE 允许重试，避免永久卡 PROCESSING
-                mediaFile.setTranscriptStatus(AiStatus.NONE.name());
-                mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                    .eq(MediaFile::getId, mediaFile.getId())
-                    .set(MediaFile::getTranscriptStatus, AiStatus.NONE.name())
-                    .set(MediaFile::getTranscriptProcessAt, null));
+                MediaTranscription transcription = transcriptionMapper.selectOne(
+                    new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+                );
+                if (transcription != null) {
+                    transcription.setStatus(AiStatus.NONE.name());
+                    transcription.setProcessAt(null);
+                    transcriptionMapper.updateById(transcription);
+                }
                 evictCache(mediaFile);
                 log.info("等待转写锁超时，回滚待重试, mediaId={} contentHash={}", mediaId, contentHash);
                 return;
             }
-            // transcribeWithReuse 内部已落库 transcriptText / transcriptStatus 并登记归属
             evictCache(mediaFile);
             log.info("全文提取完成, mediaId={}", mediaId);
 
         } catch (Exception e) {
             log.error("全文提取失败, mediaId={}, err={}", mediaId, e.getMessage(), e);
             // 失败只置状态字段，不塞失败文案进内容字段（由前端按状态渲染）
-            mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
-            mediaFile.setTranscriptText(null);
-            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                .eq(MediaFile::getId, mediaFile.getId())
-                .set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name())
-                .set(MediaFile::getTranscriptText, null)
-                .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now()));
+            MediaTranscription transcription = transcriptionMapper.selectOne(
+                new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+            );
+            if (transcription != null) {
+                transcription.setStatus(AiStatus.FAILED.name());
+                transcription.setTranscriptText(null);
+                transcription.setProcessAt(LocalDateTime.now());
+                transcriptionMapper.updateById(transcription);
+            }
             evictCache(mediaFile);
 
             // SSE 推送：transcription FAILED
@@ -259,6 +274,22 @@ public class AiService {
     private String transcribeWithReuse(MediaFile mediaFile, String contentHash, Boolean force) {
         String[] resultHolder = new String[1];
         GateOutcome outcome = contentTaskGate.inTranscribeLock(contentHash, () -> {
+            Long mediaId = mediaFile.getId();
+
+            // 查询或初始化转写记录
+            MediaTranscription transcription = transcriptionMapper.selectOne(
+                new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+            );
+            if (transcription == null) {
+                transcription = new MediaTranscription();
+                transcription.setMediaId(mediaId);
+                transcription.setStatus(AiStatus.PROCESSING.name());
+                transcription.setAttempts(0);
+                transcription.setCompensationAttempts(0);
+                transcription.setRetryCount(0);
+                transcriptionMapper.insert(transcription);
+            }
+
             // 锁内先查复用（force=true 时跳过复用）
             if (!Boolean.TRUE.equals(force)) {
                 String reusable = contentTaskGate.resolveTranscript(mediaFile, contentHash);
@@ -273,13 +304,11 @@ public class AiService {
             if (text == null || text.isBlank()) {
                 text = NO_SPEECH_TRANSCRIPT;
             }
-            mediaFile.setTranscriptText(text);
-            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                .eq(MediaFile::getId, mediaFile.getId())
-                .set(MediaFile::getTranscriptText, text)
-                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name())
-                .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now()));
+            transcription.setTranscriptText(text);
+            transcription.setStatus(AiStatus.SUCCESS.name());
+            transcription.setProcessAt(LocalDateTime.now());
+            transcriptionMapper.updateById(transcription);
+
             // force=true 时不登记归属，避免污染复用链
             if (!Boolean.TRUE.equals(force)) {
                 contentTaskGate.rememberTranscript(contentHash, mediaFile.getId());
@@ -303,33 +332,30 @@ public class AiService {
      * 失败落库：写 FAILED + 受控文案 + 同步 transcriptStatus + 删缓存。
      * <p>受控文案不拼接异常 message，避免底层 errBody 泄漏到前端。</p>
      */
-    private void markFailed(MediaFile mediaFile, Exception e) {
-        mediaFile.setAiStatus(AiStatus.FAILED.name());
-        mediaFile.setAiSummary(null); // 失败不塞文案，由前端按状态渲染
+    private void markFailed(MediaAiAnalysis aiAnalysis, Long mediaId, Exception e) {
+        aiAnalysis.setStatus(AiStatus.FAILED.name());
+        aiAnalysis.setSummary(null);
+        aiAnalysis.setProcessAt(LocalDateTime.now());
+        aiAnalysisMapper.updateById(aiAnalysis);
+
         // 若转写阶段尚未成功（即失败发生在 transcribe），同步置 FAILED，避免与 aiStatus 不一致
-        LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
-            .eq(MediaFile::getId, mediaFile.getId())
-            .set(MediaFile::getAiStatus, AiStatus.FAILED.name())
-            .set(MediaFile::getAiSummary, null)
-            .set(MediaFile::getAiProcessAt, LocalDateTime.now());
-        if (!AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())) {
-            mediaFile.setTranscriptStatus(AiStatus.FAILED.name());
-            wrapper.set(MediaFile::getTranscriptStatus, AiStatus.FAILED.name());
+        MediaTranscription transcription = transcriptionMapper.selectOne(
+            new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+        );
+        if (transcription != null && !AiStatus.SUCCESS.name().equals(transcription.getStatus())) {
+            transcription.setStatus(AiStatus.FAILED.name());
+            transcriptionMapper.updateById(transcription);
         }
-        mediaFileMapper.update(null, wrapper);
-        evictCache(mediaFile);
+
+        MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
+        if (mediaFile != null) {
+            evictCache(mediaFile);
+        }
 
         // SSE 推送：FAILED
-        taskEventService.publishAnalysis(mediaFile.getId(), AiStatus.FAILED.name(), null, e.getMessage());
+        taskEventService.publishAnalysis(mediaId, AiStatus.FAILED.name(), null, e.getMessage());
 
-        log.error("AI 分析失败, mediaId={}, err={}", mediaFile.getId(), e.getMessage(), e);
-    }
-
-    /**
-     * 台账 attempts 取值：直传补偿重试次数（首次失败未重试为 0），文件不存在时兜底 0。
-     */
-    private int attemptsOf(MediaFile mediaFile) {
-        return mediaFile == null || mediaFile.getAiAttempts() == null ? 0 : mediaFile.getAiAttempts();
+        log.error("AI 分析失败, mediaId={}, err=", mediaId, e.getMessage(), e);
     }
 
     /**

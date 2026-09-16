@@ -281,37 +281,46 @@ public class ChunkUploadService {
                 Files.deleteIfExists(mergedFile);
             }
 
-            // 4.5 坚持上传的去重逻辑：MD5 比对同名文件
+            // 4.5 MD5 内容级去重（与 URL 上传接口一致）
             String finalFileName = fileName;
             boolean isForce = "1".equals(meta.get("forceUpload"));
-            if (isForce && userId != null) {
-                // 查找同名同大小的已完成文件
-                QueryWrapper<MediaFile> dupQuery = new QueryWrapper<>();
-                dupQuery.eq("user_id", userId)
-                        .eq("filename", fileName)
-                        .eq("file_size", parseLong(meta.get("fileSize")))
+
+            // 优先检查：同用户 + 相同 MD5 的已完成记录 → 复用旧记录，保留 AI 分析结果
+            if (userId != null) {
+                QueryWrapper<MediaFile> md5Query = new QueryWrapper<>();
+                md5Query.eq("user_id", userId)
+                        .eq("file_md5", fileMd5)
                         .eq("status", "COMPLETED");
-                MediaFile existing = mediaFileMapper.selectOne(dupQuery);
-                if (existing != null && existing.getFileMd5() != null && existing.getFileMd5().equals(fileMd5)) {
-                    // MD5 相同 → 同一文件，删除新文件，更新旧文件时间
+                MediaFile existing = mediaFileMapper.selectOne(md5Query);
+                if (existing != null) {
+                    // MD5 相同 → 复用旧记录，删除新上传文件，刷新时间并失效缓存
                     minioUtils.removeFile(fileUrl);
-                    existing.setUploadTime(LocalDateTime.now());
                     mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
                         .eq(MediaFile::getId, existing.getId())
                         .set(MediaFile::getUploadTime, LocalDateTime.now()));
-                    // 返回已有记录
                     redis.opsForHash().put(metaKey, "status", "COMPLETED");
                     redis.opsForHash().put(metaKey, "mediaId", String.valueOf(existing.getId()));
                     redis.opsForHash().put(metaKey, "filePath", existing.getFilePath());
                     cleanUpChunks(uploadId);
-                    if (userId != null) { redis.delete("media:list:user:" + userId); }
+                    redis.delete("media:list:user:" + userId);
+                    System.out.println("分片上传 MD5 去重命中，复用已有记录 mediaId=" + existing.getId());
                     ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
                     resp.setMediaId(existing.getId());
                     resp.setFilePath(existing.getFilePath());
                     resp.setStatus("COMPLETED");
                     return resp;
-                } else if (existing != null && existing.getFileMd5() != null) {
-                    // MD5 不同 → 同名不同文件，添加防重名后缀
+                }
+            }
+
+            // 次要检查：坚持上传模式下，同名不同内容文件需添加后缀避免覆盖
+            if (isForce && userId != null) {
+                QueryWrapper<MediaFile> nameQuery = new QueryWrapper<>();
+                nameQuery.eq("user_id", userId)
+                        .eq("filename", fileName)
+                        .eq("status", "COMPLETED");
+                MediaFile sameNameFile = mediaFileMapper.selectOne(nameQuery);
+                if (sameNameFile != null && sameNameFile.getFileMd5() != null && !sameNameFile.getFileMd5().equals(fileMd5)) {
+                    // 同名不同文件 → 添加 (1)、(2) 后缀
                     finalFileName = findAvailableFileName(fileName, userId);
                 }
             }

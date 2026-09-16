@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户表';
 
 -- ============================================================
--- 媒体文件表（含分片上传重构新增字段）
+-- 媒体文件表（V10 表拆分后：仅保留基础信息）
 -- ============================================================
 CREATE TABLE IF NOT EXISTS media_files (
     id              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '媒体文件ID',
@@ -33,21 +33,54 @@ CREATE TABLE IF NOT EXISTS media_files (
     filename        VARCHAR(512) NOT NULL COMMENT '原始文件名',
     status          VARCHAR(32)  DEFAULT 'UPLOADED' COMMENT '状态: UPLOADED / COMPLETED',
     file_path       VARCHAR(1024) DEFAULT NULL COMMENT 'MinIO 公开访问URL',
-    file_size       BIGINT       DEFAULT NULL COMMENT '文件大小(字节) — 分片上传重构新增',
-    file_md5        VARCHAR(32)  DEFAULT NULL COMMENT '全文件MD5哈希(后端合并后计算) — 分片上传重构新增',
-    ai_status       VARCHAR(32)  DEFAULT 'NONE' COMMENT 'AI分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED',
-    ai_summary      TEXT         DEFAULT NULL COMMENT 'AI 智能总结(Markdown)',
-    transcript_status VARCHAR(32) DEFAULT 'NONE' COMMENT '文字提取状态: NONE/PROCESSING/SUCCESS/FAILED',
-    transcript_text TEXT         DEFAULT NULL COMMENT '语音转写全文',
+    file_size       BIGINT       DEFAULT NULL COMMENT '文件大小(字节)',
+    file_md5        VARCHAR(32)  DEFAULT NULL COMMENT '全文件MD5哈希(内容级去重)',
     cover_url       VARCHAR(1024) DEFAULT NULL COMMENT '封面URL',
-    upload_time     DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间(数据库自动填充)',
-    ai_process_at   DATETIME     DEFAULT NULL COMMENT '最近一次 AI 分析尝试时间',
-    ai_attempts     INT          NOT NULL DEFAULT 0 COMMENT 'AI 分析已尝试次数',
+    upload_time     DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+    version         INT          NOT NULL DEFAULT 0 COMMENT '乐观锁版本号',
     PRIMARY KEY (id),
     KEY idx_user_id (user_id),
     KEY idx_user_md5 (user_id, file_md5),
     KEY idx_file_md5 (file_md5)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='媒体文件表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='媒体文件表（基础信息）';
+
+-- ============================================================
+-- AI 分析子表（V10 新增）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS media_ai_analysis (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT COMMENT '分析记录ID',
+    media_id                BIGINT       NOT NULL COMMENT '关联 media_files.id',
+    status                  VARCHAR(32)  DEFAULT 'NONE' COMMENT '分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED',
+    summary                 TEXT         DEFAULT NULL COMMENT 'AI 智能总结(Markdown)',
+    process_at              DATETIME     DEFAULT NULL COMMENT '最近一次分析尝试时间',
+    attempts                INT          NOT NULL DEFAULT 0 COMMENT '实时任务尝试次数',
+    compensation_attempts   INT          NOT NULL DEFAULT 0 COMMENT '补偿调度器尝试次数',
+    retry_count             INT          NOT NULL DEFAULT 0 COMMENT '用户手动重试计数（冲突检测）',
+    created_at              DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at              DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_media_id (media_id),
+    KEY idx_stalled (status, process_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 分析子表';
+
+-- ============================================================
+-- 文字转写子表（V10 新增）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS media_transcription (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT COMMENT '转写记录ID',
+    media_id                BIGINT       NOT NULL COMMENT '关联 media_files.id',
+    status                  VARCHAR(32)  DEFAULT 'NONE' COMMENT '转写状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED',
+    transcript_text         TEXT         DEFAULT NULL COMMENT '语音转写全文',
+    process_at              DATETIME     DEFAULT NULL COMMENT '最近一次转写尝试时间',
+    attempts                INT          NOT NULL DEFAULT 0 COMMENT '实时任务尝试次数',
+    compensation_attempts   INT          NOT NULL DEFAULT 0 COMMENT '补偿调度器尝试次数',
+    retry_count             INT          NOT NULL DEFAULT 0 COMMENT '用户手动重试计数（冲突检测）',
+    created_at              DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at              DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_media_id (media_id),
+    KEY idx_stalled (status, process_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='文字转写子表';
 
 -- ============================================================
 -- AI 分析失败台账表

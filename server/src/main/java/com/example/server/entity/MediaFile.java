@@ -14,46 +14,15 @@ public class MediaFile {
     @TableId(type = IdType.AUTO)
     private Long id;
 
-    private Long userId;          // 核心：记录是谁传的
-
+    private Long userId;
     private String filename;
-    private String status;        //UPLOADED, COMPLETED
+    private String status;        // UPLOADED, COMPLETED
     private String filePath;
-
-    //下面这几个是新加的
-    private String aiStatus;         // AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED
-    private String aiSummary;
-    private String transcriptStatus; // 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED
-    private String transcriptText;
-    private String coverUrl;
-
-    // 分片上传重构：新增文件大小和 MD5 字段
     private Long fileSize;
     private String fileMd5;
-
-    //上传时间由数据库自动记录，Java 不插手，防止报错
+    private String coverUrl;
     private LocalDateTime uploadTime;
 
-    // AI 分析补偿式重试：最近一次尝试时间 + 已尝试次数（见 plan/AI_ANALYSIS_COMPENSATION_PLAN.md）
-    private LocalDateTime aiProcessAt;
-    private Integer aiAttempts;
-
-    // 乐观锁版本号（问题 1：防补偿调度器与原任务写入竞态覆盖）
     @Version
-    private Integer version;
-
-    // 补偿调度器专属重试计数（问题 5：与用户手动重试 aiAttempts 语义分离）
-    private Integer compensationAttempts;
-
-    // AI 分析用户手动重试计数器（P1 修复：解决补偿调度器与用户重试的计数冲突）
-    private Integer analysisRetryCount;
-
-    // 文字提取补偿调度器专属重试计数
-    private Integer transcriptCompensationAttempts;
-
-    // 文字提取用户手动重试计数器（用于检测补偿调度器计数冲突）
-    private Integer transcriptRetryCount;
-
-    // 文字提取补偿调度器最近一次处理时间戳（与 aiProcessAt 分离，防时间戳干扰）
-    private LocalDateTime transcriptProcessAt;
+    private Integer version;      // 乐观锁版本号
 }

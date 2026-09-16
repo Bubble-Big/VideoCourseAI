@@ -1,10 +1,15 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.common.AiStatus;
 import com.example.server.common.GateOutcome;
+import com.example.server.entity.MediaAiAnalysis;
 import com.example.server.entity.MediaFile;
+import com.example.server.entity.MediaTranscription;
+import com.example.server.mapper.MediaAiAnalysisMapper;
 import com.example.server.mapper.MediaFileMapper;
+import com.example.server.mapper.MediaTranscriptionMapper;
 import com.example.server.utils.AnalysisTaskKeys;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -46,6 +51,8 @@ public class ContentTaskGate {
     private final RedissonClient redissonClient;
     private final StringRedisTemplate redisTemplate;
     private final MediaFileMapper mediaFileMapper;
+    private final MediaAiAnalysisMapper aiAnalysisMapper;
+    private final MediaTranscriptionMapper transcriptionMapper;
     private final TaskEventService taskEventService;
 
     @Value("${ai.analysis-lock-wait-seconds:600}")
@@ -181,48 +188,90 @@ public class ContentTaskGate {
      * @return true=已复用，false=无可复用结果
      */
     public boolean resolveAnalysis(MediaFile mediaFile, String contentHash) {
+        Long mediaId = mediaFile.getId();
+
+        // 查询当前的分析记录
+        MediaAiAnalysis currentAnalysis = aiAnalysisMapper.selectOne(
+            new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, mediaId)
+        );
+
         // 本 mediaId 已有成功结果 → 幂等直接返回
-        if (isSuccessAnalysis(mediaFile)) {
+        if (isSuccessAnalysis(currentAnalysis)) {
             return true;
         }
+
         // 内容级归属可复用：换 mediaId 重复上传的场景
         Long ownerMediaId = analysisResultOwner(contentHash);
-        MediaFile owner = null;
-        if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
-            owner = mediaFileMapper.selectById(ownerMediaId);
+        MediaAiAnalysis owner = null;
+        if (ownerMediaId != null && !ownerMediaId.equals(mediaId)) {
+            owner = aiAnalysisMapper.selectOne(
+                new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, ownerMediaId)
+            );
             if (!isSuccessAnalysis(owner)) {
-                redisTemplate.delete(AnalysisTaskKeys.completedOwner(contentHash)); // 归属失效，清掉
+                redisTemplate.delete(AnalysisTaskKeys.completedOwner(contentHash));
                 owner = null;
             }
         }
+
         // Redis 归属未命中/失效 → 回退 DB 按 file_md5 反查（V5 索引优化）
         if (owner == null && AnalysisTaskKeys.isRealMd5(contentHash)) {
-            owner = mediaFileMapper.selectCompletedAnalysisByMd5(contentHash, mediaFile.getId());
+            owner = aiAnalysisMapper.selectCompletedAnalysisByMd5(contentHash, mediaId);
         }
+
         if (owner != null) {
-            mediaFile.setAiSummary(owner.getAiSummary());
-            mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-            // 转写文本一并复用（owner 分析成功必有转写）
-            LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
-                .eq(MediaFile::getId, mediaFile.getId())
-                .set(MediaFile::getAiSummary, owner.getAiSummary())
-                .set(MediaFile::getAiStatus, AiStatus.SUCCESS.name())
-                .set(MediaFile::getAiProcessAt, LocalDateTime.now());
-            if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
-                mediaFile.setTranscriptText(owner.getTranscriptText());
-                mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-                wrapper.set(MediaFile::getTranscriptText, owner.getTranscriptText())
-                       .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name())
-                       .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now());
+            // 初始化或更新当前分析记录
+            if (currentAnalysis == null) {
+                currentAnalysis = new MediaAiAnalysis();
+                currentAnalysis.setMediaId(mediaId);
+                currentAnalysis.setSummary(owner.getSummary());
+                currentAnalysis.setStatus(AiStatus.SUCCESS.name());
+                currentAnalysis.setProcessAt(LocalDateTime.now());
+                currentAnalysis.setAttempts(0);
+                currentAnalysis.setCompensationAttempts(0);
+                currentAnalysis.setRetryCount(0);
+                aiAnalysisMapper.insert(currentAnalysis);
+            } else {
+                currentAnalysis.setSummary(owner.getSummary());
+                currentAnalysis.setStatus(AiStatus.SUCCESS.name());
+                currentAnalysis.setProcessAt(LocalDateTime.now());
+                aiAnalysisMapper.updateById(currentAnalysis);
             }
-            mediaFileMapper.update(null, wrapper);
-            rememberAnalysis(contentHash, owner.getId()); // 回填归属缓存
+
+            // 转写文本一并复用（owner 分析成功必有转写）
+            MediaTranscription ownerTranscription = transcriptionMapper.selectOne(
+                new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, owner.getMediaId())
+            );
+            if (ownerTranscription != null && ownerTranscription.getTranscriptText() != null
+                    && !ownerTranscription.getTranscriptText().isBlank()) {
+                MediaTranscription currentTranscription = transcriptionMapper.selectOne(
+                    new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+                );
+                if (currentTranscription == null) {
+                    currentTranscription = new MediaTranscription();
+                    currentTranscription.setMediaId(mediaId);
+                    currentTranscription.setTranscriptText(ownerTranscription.getTranscriptText());
+                    currentTranscription.setStatus(AiStatus.SUCCESS.name());
+                    currentTranscription.setProcessAt(LocalDateTime.now());
+                    currentTranscription.setAttempts(0);
+                    currentTranscription.setCompensationAttempts(0);
+                    currentTranscription.setRetryCount(0);
+                    transcriptionMapper.insert(currentTranscription);
+                } else {
+                    currentTranscription.setTranscriptText(ownerTranscription.getTranscriptText());
+                    currentTranscription.setStatus(AiStatus.SUCCESS.name());
+                    currentTranscription.setProcessAt(LocalDateTime.now());
+                    transcriptionMapper.updateById(currentTranscription);
+                }
+
+                // SSE 推送：复用转写结果
+                taskEventService.publishTranscription(mediaId, AiStatus.SUCCESS.name(),
+                    ownerTranscription.getTranscriptText(), null);
+            }
+
+            rememberAnalysis(contentHash, owner.getMediaId());
 
             // SSE 推送：复用结果 SUCCESS
-            taskEventService.publishAnalysis(mediaFile.getId(), AiStatus.SUCCESS.name(), owner.getAiSummary(), null);
-            if (owner.getTranscriptText() != null && !owner.getTranscriptText().isBlank()) {
-                taskEventService.publishTranscription(mediaFile.getId(), AiStatus.SUCCESS.name(), owner.getTranscriptText(), null);
-            }
+            taskEventService.publishAnalysis(mediaId, AiStatus.SUCCESS.name(), owner.getSummary(), null);
 
             return true;
         }
@@ -256,11 +305,11 @@ public class ContentTaskGate {
     /**
      * 分析是否真正可用：状态为 SUCCESS 且 summary 非空。
      */
-    private boolean isSuccessAnalysis(MediaFile mediaFile) {
-        return mediaFile != null
-                && AiStatus.SUCCESS.name().equals(mediaFile.getAiStatus())
-                && mediaFile.getAiSummary() != null
-                && !mediaFile.getAiSummary().isBlank();
+    private boolean isSuccessAnalysis(MediaAiAnalysis aiAnalysis) {
+        return aiAnalysis != null
+                && AiStatus.SUCCESS.name().equals(aiAnalysis.getStatus())
+                && aiAnalysis.getSummary() != null
+                && !aiAnalysis.getSummary().isBlank();
     }
 
     // ==================== 转写结果复用 ====================
@@ -277,39 +326,60 @@ public class ContentTaskGate {
      * @return 转写文本；null 表示无可复用结果
      */
     public String resolveTranscript(MediaFile mediaFile, String contentHash) {
+        Long mediaId = mediaFile.getId();
+
+        // 查询当前的转写记录
+        MediaTranscription currentTranscription = transcriptionMapper.selectOne(
+            new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+        );
+
         // 本 mediaId 已有转写
-        if (isSuccessTranscript(mediaFile)) {
-            return mediaFile.getTranscriptText();
+        if (isSuccessTranscript(currentTranscription)) {
+            return currentTranscription.getTranscriptText();
         }
+
         Long ownerMediaId = transcriptOwner(contentHash);
-        MediaFile owner = null;
-        if (ownerMediaId != null && !ownerMediaId.equals(mediaFile.getId())) {
-            owner = mediaFileMapper.selectById(ownerMediaId);
+        MediaTranscription owner = null;
+        if (ownerMediaId != null && !ownerMediaId.equals(mediaId)) {
+            owner = transcriptionMapper.selectOne(
+                new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, ownerMediaId)
+            );
             // 仅当归属真正失效才清除：记录被删 / 转写 FAILED / 文本为空
-            if (owner == null
-                    || AiStatus.FAILED.name().equals(owner.getTranscriptStatus())
-                    || owner.getTranscriptText() == null
-                    || owner.getTranscriptText().isBlank()) {
+            if (!isSuccessTranscript(owner)) {
                 redisTemplate.delete(AnalysisTaskKeys.contextOwner(contentHash));
                 owner = null;
             }
         }
+
         // Redis 归属未命中/失效 → 回退 DB 按 file_md5 反查（V5 索引优化）
         if (owner == null && AnalysisTaskKeys.isRealMd5(contentHash)) {
-            owner = mediaFileMapper.selectCompletedTranscriptByMd5(contentHash, mediaFile.getId());
+            owner = transcriptionMapper.selectCompletedTranscriptByMd5(contentHash, mediaId);
         }
+
         if (owner != null) {
-            mediaFile.setTranscriptText(owner.getTranscriptText());
-            mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-            mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
-                .eq(MediaFile::getId, mediaFile.getId())
-                .set(MediaFile::getTranscriptText, owner.getTranscriptText())
-                .set(MediaFile::getTranscriptStatus, AiStatus.SUCCESS.name())
-                .set(MediaFile::getTranscriptProcessAt, LocalDateTime.now()));
-            rememberTranscript(contentHash, owner.getId()); // 回填归属缓存
+            // 初始化或更新当前转写记录
+            if (currentTranscription == null) {
+                currentTranscription = new MediaTranscription();
+                currentTranscription.setMediaId(mediaId);
+                currentTranscription.setTranscriptText(owner.getTranscriptText());
+                currentTranscription.setStatus(AiStatus.SUCCESS.name());
+                currentTranscription.setProcessAt(LocalDateTime.now());
+                currentTranscription.setAttempts(0);
+                currentTranscription.setCompensationAttempts(0);
+                currentTranscription.setRetryCount(0);
+                transcriptionMapper.insert(currentTranscription);
+            } else {
+                currentTranscription.setTranscriptText(owner.getTranscriptText());
+                currentTranscription.setStatus(AiStatus.SUCCESS.name());
+                currentTranscription.setProcessAt(LocalDateTime.now());
+                transcriptionMapper.updateById(currentTranscription);
+            }
+
+            rememberTranscript(contentHash, owner.getMediaId());
 
             // SSE 推送：复用转写结果 SUCCESS
-            taskEventService.publishTranscription(mediaFile.getId(), AiStatus.SUCCESS.name(), owner.getTranscriptText(), null);
+            taskEventService.publishTranscription(mediaId, AiStatus.SUCCESS.name(),
+                owner.getTranscriptText(), null);
 
             return owner.getTranscriptText();
         }
@@ -343,11 +413,11 @@ public class ContentTaskGate {
     /**
      * 转写是否真正可用：状态为 SUCCESS 且文本非空。
      */
-    private boolean isSuccessTranscript(MediaFile mediaFile) {
-        return mediaFile != null
-                && AiStatus.SUCCESS.name().equals(mediaFile.getTranscriptStatus())
-                && mediaFile.getTranscriptText() != null
-                && !mediaFile.getTranscriptText().isBlank();
+    private boolean isSuccessTranscript(MediaTranscription transcription) {
+        return transcription != null
+                && AiStatus.SUCCESS.name().equals(transcription.getStatus())
+                && transcription.getTranscriptText() != null
+                && !transcription.getTranscriptText().isBlank();
     }
 }
 

@@ -1,9 +1,12 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.common.AiStatus;
+import com.example.server.entity.MediaAiAnalysis;
 import com.example.server.entity.MediaFile;
 import com.example.server.exception.AiAnalysisException;
+import com.example.server.mapper.MediaAiAnalysisMapper;
 import com.example.server.mapper.MediaFileMapper;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
@@ -13,8 +16,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 /**
  * AI 分析补偿调度器：继承抽象基类，定制化实现 AI 分析的补偿逻辑。
@@ -32,15 +37,18 @@ public class AnalysisCompensationScheduler extends AbstractCompensationScheduler
 
     private final AiService aiService;
     private final FailedAnalysisTaskService failedTaskService;
+    private final MediaAiAnalysisMapper aiAnalysisMapper;
 
     public AnalysisCompensationScheduler(MediaFileMapper mediaFileMapper,
                                         AiService aiService,
                                         FailedAnalysisTaskService failedTaskService,
                                         TaskEventService taskEventService,
-                                        RedissonClient redissonClient) {
+                                        RedissonClient redissonClient,
+                                        MediaAiAnalysisMapper aiAnalysisMapper) {
         super(mediaFileMapper, redissonClient, taskEventService);
         this.aiService = aiService;
         this.failedTaskService = failedTaskService;
+        this.aiAnalysisMapper = aiAnalysisMapper;
     }
 
     @Override
@@ -65,7 +73,18 @@ public class AnalysisCompensationScheduler extends AbstractCompensationScheduler
 
     @Override
     protected List<MediaFile> scanStalledTasks(LocalDateTime threshold, int limit) {
-        return mediaFileMapper.selectStalledAnalysis(threshold, limit);
+        // 先查子表，再关联主表
+        List<MediaAiAnalysis> stalledList = aiAnalysisMapper.selectStalledAnalysis(threshold, limit);
+
+        if (stalledList.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 批量查询关联的 MediaFile（避免 N+1）
+        List<Long> mediaIds = stalledList.stream()
+            .map(MediaAiAnalysis::getMediaId)
+            .collect(Collectors.toList());
+        return mediaFileMapper.selectBatchIds(mediaIds);
     }
 
     @Override
@@ -75,43 +94,58 @@ public class AnalysisCompensationScheduler extends AbstractCompensationScheduler
 
     @Override
     protected String getStatus(MediaFile file) {
-        return file.getAiStatus();
+        MediaAiAnalysis analysis = aiAnalysisMapper.selectOne(
+            new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, file.getId())
+        );
+        return analysis != null ? analysis.getStatus() : AiStatus.NONE.name();
     }
 
     @Override
     protected Integer getCompensationAttempts(MediaFile file) {
-        return file.getCompensationAttempts();
+        MediaAiAnalysis analysis = aiAnalysisMapper.selectOne(
+            new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, file.getId())
+        );
+        return analysis != null ? analysis.getCompensationAttempts() : 0;
     }
 
     @Override
     protected Integer getRetryCount(MediaFile file) {
-        return file.getAnalysisRetryCount();
+        MediaAiAnalysis analysis = aiAnalysisMapper.selectOne(
+            new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, file.getId())
+        );
+        return analysis != null ? analysis.getRetryCount() : 0;
     }
 
     @Override
     protected LocalDateTime getProcessAt(MediaFile file) {
-        return file.getAiProcessAt();
+        MediaAiAnalysis analysis = aiAnalysisMapper.selectOne(
+            new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, file.getId())
+        );
+        return analysis != null ? analysis.getProcessAt() : null;
     }
 
     @Override
     protected void setStatus(LambdaUpdateWrapper<MediaFile> wrapper, String status) {
-        wrapper.set(MediaFile::getAiStatus, status)
-               .set(MediaFile::getAiSummary, null);
+        // 这个方法已废弃，改为直接操作子表
+        // 保留空实现以兼容抽象基类
     }
 
     @Override
     protected void setCompensationAttempts(LambdaUpdateWrapper<MediaFile> wrapper, int attempts) {
-        wrapper.set(MediaFile::getCompensationAttempts, attempts);
+        // 这个方法已废弃，改为直接操作子表
+        // 保留空实现以兼容抽象基类
     }
 
     @Override
     protected void setProcessAt(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time) {
-        wrapper.set(MediaFile::getAiProcessAt, time);
+        // 这个方法已废弃，改为直接操作子表
+        // 保留空实现以兼容抽象基类
     }
 
     @Override
     protected void refreshProcessAtField(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time) {
-        wrapper.set(MediaFile::getAiProcessAt, time);
+        // 这个方法已废弃，改为直接操作子表
+        // 保留空实现以兼容抽象基类
     }
 
     @Override
