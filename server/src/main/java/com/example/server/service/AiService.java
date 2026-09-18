@@ -103,9 +103,20 @@ public class AiService {
             }
 
             // 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳（无论首次还是重试）
+            // 重新查询确保 version 字段最新，避免乐观锁冲突
+            aiAnalysis = aiAnalysisMapper.selectOne(
+                new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, mediaId)
+            );
+            if (aiAnalysis == null) {
+                throw new AiAnalysisException("分析记录丢失: " + mediaId, false, AiFailStage.FILE);
+            }
             aiAnalysis.setStatus(AiStatus.PROCESSING.name());
             aiAnalysis.setProcessAt(LocalDateTime.now());
-            aiAnalysisMapper.updateById(aiAnalysis);
+            int updated = aiAnalysisMapper.updateById(aiAnalysis);
+            if (updated == 0) {
+                log.warn("更新 PROCESSING 状态失败（乐观锁冲突），mediaId={}", mediaId);
+                throw new AiAnalysisException("状态更新冲突，稍后重试", true, AiFailStage.LOCK);
+            }
 
             // SSE 推送：PROCESSING
             taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
@@ -122,7 +133,11 @@ public class AiService {
                     aiAnalysis.setSummary(NO_SPEECH_SUMMARY);
                     aiAnalysis.setStatus(AiStatus.SUCCESS.name());
                     aiAnalysis.setProcessAt(LocalDateTime.now());
-                    aiAnalysisMapper.updateById(aiAnalysis);
+                    int updatedRows = aiAnalysisMapper.updateById(aiAnalysis);
+                    if (updatedRows == 0) {
+                        log.warn("更新 SUCCESS 状态失败（乐观锁冲突），mediaId={}", mediaId);
+                        throw new AiAnalysisException("状态更新冲突，稍后重试", true, AiFailStage.LOCK);
+                    }
 
                     // force=true 时不登记归属，避免污染复用链
                     if (!Boolean.TRUE.equals(force)) {
@@ -142,7 +157,11 @@ public class AiService {
                 aiAnalysis.setSummary(summary);
                 aiAnalysis.setStatus(AiStatus.SUCCESS.name());
                 aiAnalysis.setProcessAt(LocalDateTime.now());
-                aiAnalysisMapper.updateById(aiAnalysis);
+                int updatedRows = aiAnalysisMapper.updateById(aiAnalysis);
+                if (updatedRows == 0) {
+                    log.warn("更新 SUCCESS 状态失败（乐观锁冲突），mediaId={}", mediaId);
+                    throw new AiAnalysisException("状态更新冲突，稍后重试", true, AiFailStage.LOCK);
+                }
 
                 // force=true 时不登记归属，避免污染复用链
                 if (!Boolean.TRUE.equals(force)) {
