@@ -751,17 +751,44 @@ WHERE media_id = 999;
 | 重构 `TranscriptionCompensationScheduler` | 15 分钟 | 开发 | ✅ 已完成 |
 | 更新 `AiService` 刷新 process_at | 10 分钟 | 开发 | ✅ 已完成 |
 | 修复 `MediaController.list()` | 10 分钟 | 开发 | ✅ 已完成 |
+| 修复泛型编译错误（LambdaUpdateWrapper） | 10 分钟 | 开发 | ✅ 已完成 |
+| 手动执行数据库字段添加（生产环境） | 5 分钟 | 开发 | ✅ 已完成 |
+| 推送代码到远程仓库 | 2 分钟 | 开发 | ✅ 已完成 |
 | 编写单元测试 | 20 分钟 | 开发 | ⏳ 待开始 |
 | 集成测试 | 15 分钟 | QA | ⏳ 待开始 |
 | 前端验证 | 10 分钟 | QA | ⏳ 待开始 |
 | 代码审查 | 15 分钟 | Tech Lead | ⏳ 待开始 |
 | 部署上线 | 5 分钟 | DevOps | ⏳ 待开始 |
 
-**总计**：约 2.5 小时
+**总计**：约 2.5 小时（核心开发已完成）
 
 ---
 
-**文档版本**：v1.0  
+**文档版本**：v1.1  
 **创建时间**：2026-09-17  
-**最后更新**：2026-09-17  
+**最后更新**：2026-09-18  
 **相关 Issue**：前端无法正确调取已完成任务的历史文本（mediaId=69 卡死案例）
+
+## 实施记录
+
+### 2026-09-18 完成情况
+
+**代码修改**：
+1. ✅ 创建 V11 迁移脚本添加 `version` 字段到两个子表
+2. ✅ 实体类 `MediaAiAnalysis` 和 `MediaTranscription` 添加 `@Version` 注解
+3. ✅ 泛型重构 `AbstractCompensationScheduler<T>` 直接操作子表
+4. ✅ 两个调度器子类完整实现所有抽象方法
+5. ✅ `AiService` 补充 `process_at` 时间戳刷新逻辑
+6. ✅ `MediaController.list()` 批量查询改用外键 `media_id`
+7. ✅ 修复泛型 `LambdaUpdateWrapper<T>` 类型推断问题（改用 `.setSql()`）
+
+**数据库操作**：
+- ✅ `media_ai_analysis` 表添加 `version INT NOT NULL DEFAULT 0`
+- ✅ `media_transcription` 表添加 `version INT NOT NULL DEFAULT 0`
+
+**Git 提交**：
+- Commit 1: 补偿调度器子表适配修复（含 V11 迁移、泛型重构、MediaController 修复）
+- Commit 2: 泛型编译错误修复（LambdaUpdateWrapper 类型推断）
+- 已推送到远程 `test` 分支
+
+**下一步**：编写单元测试验证补偿逻辑、集成测试、前端验证
