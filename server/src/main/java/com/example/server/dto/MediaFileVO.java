@@ -4,7 +4,7 @@ import lombok.Data;
 import java.time.LocalDateTime;
 
 /**
- * 媒体文件列表VO（包含文本内容）
+ * 媒体文件列表VO（不含TEXT字段，仅状态信息）
  */
 @Data
 public class MediaFileVO {
@@ -18,11 +18,7 @@ public class MediaFileVO {
     private String coverUrl;
     private LocalDateTime uploadTime;
 
-    // AI 分析
+    // 关联状态（仅状态枚举，不含内容）
     private String aiStatus;
-    private String aiSummary;
-
-    // 文字转写
     private String transcriptStatus;
-    private String transcriptText;
 }

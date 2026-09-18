@@ -103,26 +103,17 @@ async function transcribe(id, force = false) {
 
   // force=true 时跳过状态检查，直接重新生成
   if (!force) {
-    // 1. 已完成但本地没有文本 → 通过 SSE 获取
-    if (st === 'SUCCESS' && !item.transcriptText) {
-      openSidebar('text', '全量文字提取', id)
-      sidebar.value.loading = true
-      sidebar.value.content = "加载文本中..."
-      sidebar.value.state = st
-      startSSEStream(id, 'transcribe')
-      return
-    }
-
-    // 2. 已完成且有文本 → 直接显示
+    // 1. 已完成 → 通过 SSE 获取数据库中已有结果（列表接口不返回大文本内容）
     if (st === 'SUCCESS' || st === 'FAILED') {
       openSidebar('text', '全量文字提取', id)
-      sidebar.value.content = st === 'FAILED' ? '❌ 提取失败，请稍后重试' : (item.transcriptText || '')
-      sidebar.value.loading = false
+      sidebar.value.loading = true
+      sidebar.value.content = st === 'FAILED' ? '❌ 提取失败，请稍后重试' : '加载文本中...'
       sidebar.value.state = st
+      startSSEStream(id, 'transcribe')  // SSE 会推送数据库中已有的内容
       return
     }
 
-    // 3. 正在处理 → 打开转圈，订阅 SSE
+    // 2. 正在处理 → 打开转圈，订阅 SSE
     if (st === 'PROCESSING') {
       openSidebar('text', '全量文字提取', id)
       sidebar.value.loading = true
@@ -162,26 +153,17 @@ async function aiAnalyze(id, force = false) {
 
   // force=true 时跳过状态检查，直接重新生成
   if (!force) {
-    // 1. 已完成但本地没有文本 → 通过 SSE 获取
-    if (st === 'SUCCESS' && !item.aiSummary) {
-      openSidebar('ai', 'AI 智能总结', id)
-      sidebar.value.loading = true
-      sidebar.value.content = "加载分析结果中..."
-      sidebar.value.state = st
-      startSSEStream(id, 'ai')
-      return
-    }
-
-    // 2. 已完成且有文本 → 直接显示
+    // 1. 已完成 → 通过 SSE 获取数据库中已有结果（列表接口不返回大文本内容）
     if (st === 'SUCCESS' || st === 'FAILED') {
       openSidebar('ai', 'AI 智能总结', id)
-      sidebar.value.content = st === 'FAILED' ? '❌ 分析失败，请稍后重试' : (item.aiSummary || '')
-      sidebar.value.loading = false
+      sidebar.value.loading = true
+      sidebar.value.content = st === 'FAILED' ? '❌ 分析失败，请稍后重试' : '加载分析结果中...'
       sidebar.value.state = st
+      startSSEStream(id, 'ai')  // SSE 会推送数据库中已有的内容
       return
     }
 
-    // 3. 正在处理 → 打开转圈，订阅 SSE
+    // 2. 正在处理 → 打开转圈，订阅 SSE
     if (st === 'PENDING' || st === 'PROCESSING') {
       openSidebar('ai', 'AI 智能总结', id)
       sidebar.value.loading = true

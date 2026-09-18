@@ -4,7 +4,11 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.server.dto.ChunkUploadDTO;
 import com.example.server.entity.MediaFile;
+import com.example.server.entity.MediaAiAnalysis;
+import com.example.server.entity.MediaTranscription;
 import com.example.server.mapper.MediaFileMapper;
+import com.example.server.mapper.MediaAiAnalysisMapper;
+import com.example.server.mapper.MediaTranscriptionMapper;
 import com.example.server.utils.MinioUtils;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -47,15 +51,24 @@ public class ChunkUploadService {
     private final RedissonClient redissonClient;
     private final MinioUtils minioUtils;
     private final MediaFileMapper mediaFileMapper;
+    private final MediaAiAnalysisMapper mediaAiAnalysisMapper;
+    private final MediaTranscriptionMapper mediaTranscriptionMapper;
+    private final AiService aiService;
 
     public ChunkUploadService(StringRedisTemplate redis,
                               RedissonClient redissonClient,
                               MinioUtils minioUtils,
-                              MediaFileMapper mediaFileMapper) {
+                              MediaFileMapper mediaFileMapper,
+                              MediaAiAnalysisMapper mediaAiAnalysisMapper,
+                              MediaTranscriptionMapper mediaTranscriptionMapper,
+                              AiService aiService) {
         this.redis = redis;
         this.redissonClient = redissonClient;
         this.minioUtils = minioUtils;
         this.mediaFileMapper = mediaFileMapper;
+        this.mediaAiAnalysisMapper = mediaAiAnalysisMapper;
+        this.mediaTranscriptionMapper = mediaTranscriptionMapper;
+        this.aiService = aiService;
     }
 
     // ==================== 1. 初始化上传 ====================
@@ -293,6 +306,19 @@ public class ChunkUploadService {
                         .eq("status", "COMPLETED");
                 MediaFile existing = mediaFileMapper.selectOne(md5Query);
                 if (existing != null) {
+                    // 检查子表数据完整性：AI 分析和转写是否都已完成
+                    boolean hasCompleteAi = mediaAiAnalysisMapper.selectOne(
+                        new QueryWrapper<MediaAiAnalysis>()
+                            .eq("media_id", existing.getId())
+                            .eq("status", "COMPLETED")
+                    ) != null;
+
+                    boolean hasCompleteTranscript = mediaTranscriptionMapper.selectOne(
+                        new QueryWrapper<MediaTranscription>()
+                            .eq("media_id", existing.getId())
+                            .eq("status", "COMPLETED")
+                    ) != null;
+
                     // MD5 相同 → 复用旧记录，删除新上传文件，刷新时间并失效缓存
                     minioUtils.removeFile(fileUrl);
                     mediaFileMapper.update(null, new LambdaUpdateWrapper<MediaFile>()
@@ -303,7 +329,15 @@ public class ChunkUploadService {
                     redis.opsForHash().put(metaKey, "filePath", existing.getFilePath());
                     cleanUpChunks(uploadId);
                     redis.delete("media:list:user:" + userId);
-                    System.out.println("分片上传 MD5 去重命中，复用已有记录 mediaId=" + existing.getId());
+
+                    // 如果子表数据不完整，重新触发 AI 分析任务（补全缺失数据）
+                    if (!hasCompleteAi || !hasCompleteTranscript) {
+                        System.out.println("分片上传 MD5 去重命中但子表数据不完整，重新触发 AI 分析 mediaId=" + existing.getId());
+                        aiService.asyncAnalyze(existing.getId(), false);
+                    } else {
+                        System.out.println("分片上传 MD5 去重命中，复用已有完整记录 mediaId=" + existing.getId());
+                    }
+
                     ChunkUploadDTO.MergeResponse resp = new ChunkUploadDTO.MergeResponse();
                     resp.setMediaId(existing.getId());
                     resp.setFilePath(existing.getFilePath());

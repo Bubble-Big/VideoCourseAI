@@ -11,3 +11,6 @@ stop-all.bat
 # --- Docker runtime data ---
 mysql/data/
 minio/data/
+
+# --- 构建日志 ---
+*.log
