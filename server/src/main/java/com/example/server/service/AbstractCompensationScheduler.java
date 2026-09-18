@@ -139,12 +139,11 @@ public abstract class AbstractCompensationScheduler<T> {
 
         // 刷新 process_at（使用乐观锁）
         LocalDateTime newProcessAt = LocalDateTime.now();
-        LambdaUpdateWrapper<T> wrapper = new LambdaUpdateWrapper<T>()
-            .eq("media_id", mediaId)
-            .eq("version", snapshotVersion)
-            .set("process_at", newProcessAt);
-
-        int updated = getChildTableMapper().update(null, wrapper);
+        int updated = getChildTableMapper().update(null,
+            new LambdaUpdateWrapper<T>()
+                .apply("media_id = {0} AND version = {1}", mediaId, snapshotVersion)
+                .setSql("process_at = '" + newProcessAt + "'")
+        );
 
         if (updated == 0) {
             log.info("{}刷新时间戳被跳过（版本冲突）, mediaId={}", getSchedulerName(), mediaId);
@@ -179,9 +178,9 @@ public abstract class AbstractCompensationScheduler<T> {
      */
     private void incrementAttemptsIfStillPending(Long mediaId, Integer snapshotRetryCount) {
         // 重新查询子表最新记录
-        T latest = getChildTableMapper().selectOne(
-            new LambdaQueryWrapper<T>().eq("media_id", mediaId)
-        );
+        LambdaQueryWrapper<T> query = new LambdaQueryWrapper<>();
+        query.apply("media_id = {0}", mediaId);
+        T latest = getChildTableMapper().selectOne(query);
 
         if (latest == null || !AiStatus.PROCESSING.name().equals(getStatus(latest))) {
             return;
@@ -201,16 +200,15 @@ public abstract class AbstractCompensationScheduler<T> {
         // 递增子表的 compensation_attempts（乐观锁）
         int attempts = (getCompensationAttempts(latest) == null ? 0 : getCompensationAttempts(latest)) + 1;
 
-        LambdaUpdateWrapper<T> wrapper = new LambdaUpdateWrapper<T>()
-            .eq("media_id", mediaId)
-            .eq("version", getVersion(latest))
-            .set("compensation_attempts", attempts);
+        LambdaUpdateWrapper<T> updateWrapper = new LambdaUpdateWrapper<>();
+        updateWrapper.apply("media_id = {0} AND version = {1}", mediaId, getVersion(latest))
+                     .setSql("compensation_attempts = " + attempts);
 
         if (attempts >= getMaxAttempts()) {
-            wrapper.set("status", AiStatus.FAILED.name());
+            updateWrapper.setSql("status = '" + AiStatus.FAILED.name() + "'");
         }
 
-        int updated = getChildTableMapper().update(null, wrapper);
+        int updated = getChildTableMapper().update(null, updateWrapper);
         if (updated == 0) {
             return;
         }
