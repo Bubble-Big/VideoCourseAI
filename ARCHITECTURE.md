@@ -1,7 +1,7 @@
 # VideoCourseAI — 智能视频内容理解平台 架构分析文档
 
 > 分析日期：2026-08-15  
-> 最后更新：2026-09-15  
+> 最后更新：2026-09-18  
 > 项目仓库：https://github.com/Bubble-Big/VideoCourseAI
 
 ---
@@ -78,10 +78,19 @@ VideoCourseAI-main/
 │       ├── resources/
 │       │   ├── application.properties   # 应用配置
 │       │   └── db/                      # 数据库脚本
-│       │       ├── schema.sql           # 完整建表语句
+│       │       ├── schema.sql           # 完整建表语句（5张表）
 │       │       ├── V1__add_file_size_and_md5.sql     # 分片上传字段迁移
 │       │       ├── V2__add_ai_status.sql             # AI/转写状态字段迁移
-│       │       └── V3__add_failed_analysis_task.sql  # 失败台账建表
+│       │       ├── V3__add_failed_analysis_task.sql  # 失败台账建表
+│       │       ├── V4__add_ai_compensation.sql       # AI 补偿计数字段
+│       │       ├── V5__add_content_reuse_indexes.sql # 内容复用索引
+│       │       ├── V6__add_media_file_version.sql    # 父表乐观锁版本号
+│       │       ├── V7__add_retry_count.sql           # 重试计数字段
+│       │       ├── V8__add_transcript_compensation_fields.sql # 转写补偿字段
+│       │       ├── V9__add_transcript_process_at.sql # 转写时间戳字段
+│       │       ├── V10__split_media_files_table.sql  # 表拆分迁移（父子表分离）
+│       │       ├── V11__add_child_table_version.sql  # 子表乐观锁版本号
+│       │       └── rollback_v10.sql                  # V10 回滚脚本
 │       └── java/com/example/server/
 │           ├── ServerApplication.java   # 启动类
 │           ├── common/                  # 公共组件 (新增)
@@ -105,7 +114,11 @@ VideoCourseAI-main/
 │           │   ├── AiService.java       # AI 分析服务 (状态机 + 内容复用)
 │           │   ├── ContentTaskGate.java # 内容级串行原语统一收敛 (新增)
 │           │   ├── RateLimitService.java   # 双层令牌桶限流 (新增)
-│           │   └── FailedAnalysisTaskService.java # 失败台账服务 (新增)
+│           │   ├── TaskEventService.java   # SSE 实时推送服务 (新增)
+│           │   ├── FailedAnalysisTaskService.java # 失败台账服务 (新增)
+│           │   ├── AbstractCompensationScheduler.java # 补偿调度器泛型基类 (新增)
+│           │   ├── AnalysisCompensationScheduler.java # AI 分析补偿调度器 (新增)
+│           │   └── TranscriptionCompensationScheduler.java # 文字转写补偿调度器 (新增)
 │           ├── consumer/                # MQ 消费者
 │           │   └── VideoAnalysisConsumer.java
 │           ├── strategy/                # 策略模式
@@ -116,7 +129,9 @@ VideoCourseAI-main/
 │           │   └── ChunkUploadDTO.java  # 分片上传请求/响应 DTO (新增)
 │           ├── entity/                  # 实体层
 │           │   ├── User.java
-│           │   ├── MediaFile.java       # (+file_size/file_md5 +ai_status/transcript_status)
+│           │   ├── MediaFile.java       # 父表 (+file_size/file_md5 +ai_status/transcript_status)
+│           │   ├── MediaAiAnalysis.java # AI 分析子表 (新增，V10 拆分)
+│           │   ├── MediaTranscription.java # 文字转写子表 (新增，V10 拆分)
 │           │   └── FailedAnalysisTask.java # AI 失败台账实体 (新增)
 │           ├── exception/               # 异常定义 (新增)
 │           │   ├── BusinessException.java
@@ -124,6 +139,8 @@ VideoCourseAI-main/
 │           ├── mapper/                  # 数据访问层
 │           │   ├── UserMapper.java
 │           │   ├── MediaFileMapper.java
+│           │   ├── MediaAiAnalysisMapper.java # AI 分析子表 DAO (新增，V10 拆分)
+│           │   ├── MediaTranscriptionMapper.java # 文字转写子表 DAO (新增，V10 拆分)
 │           │   └── FailedAnalysisTaskMapper.java # 台账 DAO (新增)
 │           └── utils/                   # 工具类
 │               ├── FfmpegUtils.java     # FFmpeg 音频提取（统一入口）
@@ -432,7 +449,7 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | avatar | VARCHAR | 头像 URL |
 | role | VARCHAR | 角色 (USER) |
 
-**media_files 表** (`MediaFile.java`)
+**media_files 表** (`MediaFile.java`) — 父表（V10 拆分后保留基础文件信息）
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | BIGINT (自增) | 主键 |
@@ -443,19 +460,40 @@ AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
 | file_size | BIGINT | 文件大小(字节) — 分片上传重构新增 |
 | file_md5 | VARCHAR(32) | 全文件 MD5 = 内容指纹 contentHash — 分片上传重构新增 |
 | ai_status | VARCHAR(32) | AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED — 状态字段化新增 |
-| ai_summary | TEXT | AI 总结内容 (Markdown) |
-| ai_process_at | DATETIME | AI 分析最后处理时间（用于补偿调度器扫描卡死任务） |
-| ai_attempts | INT | AI 分析补偿调度器重试计数（≥3 标记 FAILED） |
-| compensation_attempts | INT | AI 分析补偿调度器重试计数（旧字段名，已废弃，保留兼容） |
-| analysis_retry_count | INT | 用户 AI 分析手动重试次数（用于检测补偿调度器计数冲突） |
 | transcript_status | VARCHAR(32) | 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED — 状态字段化新增 |
-| transcript_text | TEXT | 语音转写全文 |
-| transcript_process_at | DATETIME | 文字提取最后处理时间（V8 新增，用于文字提取补偿调度器） |
-| transcript_compensation_attempts | INT | 文字提取补偿调度器重试计数（V8 新增） |
-| transcript_retry_count | INT | 用户文字提取手动重试次数（V8 新增，用于检测补偿调度器计数冲突） |
-| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理） |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理，V6 新增） |
 | cover_url | VARCHAR | 封面 URL |
 | upload_time | DATETIME | 上传时间 (DB 自动填充) |
+
+**media_ai_analysis 表** (`MediaAiAnalysis.java`) — AI 分析子表（V10 拆分新增）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT (自增) | 主键 |
+| media_id | BIGINT | 外键关联 media_files.id |
+| status | VARCHAR(32) | AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED |
+| summary | TEXT | AI 总结内容 (Markdown) |
+| process_at | DATETIME | AI 分析最后处理时间（用于补偿调度器扫描卡死任务） |
+| attempts | INT | 当前补偿批次重试计数（V10 重命名，原 ai_attempts） |
+| compensation_attempts | INT | 补偿调度器累计重试计数（≥3 标记 FAILED） |
+| retry_count | INT | 用户 AI 分析手动重试次数（用于检测补偿调度器计数冲突） |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理，V11 新增） |
+| created_at | DATETIME | 记录创建时间 |
+| updated_at | DATETIME | 记录更新时间 |
+
+**media_transcription 表** (`MediaTranscription.java`) — 文字转写子表（V10 拆分新增）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT (自增) | 主键 |
+| media_id | BIGINT | 外键关联 media_files.id |
+| status | VARCHAR(32) | 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED |
+| transcript_text | TEXT | 语音转写全文 |
+| process_at | DATETIME | 文字提取最后处理时间（用于文字提取补偿调度器） |
+| attempts | INT | 当前补偿批次重试计数（V10 重命名，原 transcript_attempts） |
+| compensation_attempts | INT | 文字提取补偿调度器累计重试计数（≥3 标记 FAILED） |
+| retry_count | INT | 用户文字提取手动重试次数（用于检测补偿调度器计数冲突） |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理，V11 新增） |
+| created_at | DATETIME | 记录创建时间 |
+| updated_at | DATETIME | 记录更新时间 |
 
 **failed_analysis_task 表** (`FailedAnalysisTask.java`) — AI 分析失败台账
 | 字段 | 类型 | 说明 |
@@ -803,7 +841,7 @@ rocketmq.producer.group=video-analysis-group
 
 ---
 
-## 十四、近期架构演进记录（2026-09-14 ~ 2026-09-15）
+## 十四、近期架构演进记录（2026-09-14 ~ 2026-09-18）
 
 ### 14.1 补偿调度器抽象重构（已完成）
 
@@ -848,6 +886,52 @@ rocketmq.producer.group=video-analysis-group
 - ✅ `ContentTaskGate.resolveAnalysis()` 复用路径
 
 **影响**：彻底解决补偿调度器误判问题，确保所有完成路径正确更新时间戳。
+
+### 14.4 数据库表拆分与补偿调度器子表适配（V10 + V11，已完成）
+
+**背景**：父表 `media_files` 承载 AI 分析 + 文字提取两套字段（共 12 个），职责不清晰，字段冗余。V10 拆分后补偿调度器仍依赖父表已移除字段，导致编译失败。
+
+**V10 数据库表拆分**：
+- ✅ 创建子表 `media_ai_analysis`（AI 分析字段：`status`, `summary`, `process_at`, `attempts`, `compensation_attempts`, `retry_count`）
+- ✅ 创建子表 `media_transcription`（文字提取字段：`status`, `transcript_text`, `process_at`, `attempts`, `compensation_attempts`, `retry_count`）
+- ✅ 父表 `media_files` 保留状态汇总字段（`ai_status`, `transcript_status`）+ 基础文件信息
+- ✅ 数据迁移：将现有数据从父表迁移至两张子表，保留原 `media_id` 关联
+- ✅ 创建对应 Mapper（`MediaAiAnalysisMapper`, `MediaTranscriptionMapper`）与 XML 自定义查询
+
+**V11 子表乐观锁支持**：
+- ✅ 子表添加 `version` 字段（`ALTER TABLE` + 实体类 `@Version` 注解）
+- ✅ 确保 MyBatis-Plus 乐观锁插件正确识别子表 `version` 字段
+
+**补偿调度器泛型重构**：
+- ✅ `AbstractCompensationScheduler` 改为 `AbstractCompensationScheduler<T>` 泛型基类
+- ✅ 移除对 `MediaFileMapper` / 父表字段的依赖
+- ✅ 新增抽象方法：`getChildTableMapper()`, `scanStalledTasks()`, `getMediaId()`, `getVersion()`, `getRetryCount()`, `getStatus()`, `getProcessAt()` 等
+- ✅ 递增计数与时间戳刷新改为直接操作子表（使用 `LambdaUpdateWrapper<T>` + 乐观锁）
+- ✅ `AnalysisCompensationScheduler` 重写为 `extends AbstractCompensationScheduler<MediaAiAnalysis>`
+- ✅ `TranscriptionCompensationScheduler` 重写为 `extends AbstractCompensationScheduler<MediaTranscription>`
+
+**MediaController 批量查询修复**：
+- ✅ `MediaController.list()` 批量查询改用外键 `media_id`（`LambdaQueryWrapper.in(MediaAiAnalysis::getMediaId, mediaIds)`），而非主键 `id`
+
+**AiService 适配**：
+- ✅ 查询/更新子表记录时使用 `media_id` 外键条件
+- ✅ 转写任务创建/重试时确保刷新子表 `process_at` 字段
+
+**编译验证**：
+- ✅ Maven 静默编译通过（`mvn -q -DskipTests compile`）
+- ✅ 泛型类型推断问题已修复（`LambdaUpdateWrapper` 编译错误）
+
+**Git 提交记录**（test 分支）：
+- ✅ 提交 1：补偿调度器子表适配修复（含 V11 迁移脚本、泛型重构、MediaController 修复）
+- ✅ 提交 2：泛型编译错误修复
+- ✅ 推送到远程仓库
+
+**成果**：
+- 数据库职责单一化：父表管状态汇总，子表管具体字段
+- 补偿调度器完全解耦父表依赖，直接操作子表
+- 编译通过且逻辑完整，可进行集成测试
+
+**详见**：`plan/COMPENSATION_SCHEDULER_CHILD_TABLE_FIX_PLAN.md`
 
 ---
 
