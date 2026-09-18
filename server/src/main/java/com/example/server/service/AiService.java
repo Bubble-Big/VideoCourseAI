@@ -102,7 +102,7 @@ public class AiService {
                 return GateOutcome.REUSE;
             }
 
-            // 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳
+            // 进入处理态：复用未命中才置 PROCESSING + 刷新时间戳（无论首次还是重试）
             aiAnalysis.setStatus(AiStatus.PROCESSING.name());
             aiAnalysis.setProcessAt(LocalDateTime.now());
             aiAnalysisMapper.updateById(aiAnalysis);
@@ -284,10 +284,16 @@ public class AiService {
                 transcription = new MediaTranscription();
                 transcription.setMediaId(mediaId);
                 transcription.setStatus(AiStatus.PROCESSING.name());
+                transcription.setProcessAt(LocalDateTime.now());
                 transcription.setAttempts(0);
                 transcription.setCompensationAttempts(0);
                 transcription.setRetryCount(0);
                 transcriptionMapper.insert(transcription);
+            } else if (AiStatus.NONE.name().equals(transcription.getStatus())) {
+                // 重试时刷新 process_at
+                transcription.setStatus(AiStatus.PROCESSING.name());
+                transcription.setProcessAt(LocalDateTime.now());
+                transcriptionMapper.updateById(transcription);
             }
 
             // 锁内先查复用（force=true 时跳过复用）

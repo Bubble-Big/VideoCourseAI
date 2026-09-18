@@ -197,8 +197,12 @@ public class MediaController {
         // 2. 批量查询状态（避免 N+1）
         List<Long> mediaIds = files.stream().map(MediaFile::getId).collect(Collectors.toList());
 
-        List<MediaAiAnalysis> analysisList = aiAnalysisMapper.selectBatchIds(mediaIds);
-        List<MediaTranscription> transcriptionList = transcriptionMapper.selectBatchIds(mediaIds);
+        List<MediaAiAnalysis> analysisList = aiAnalysisMapper.selectList(
+            new LambdaQueryWrapper<MediaAiAnalysis>().in(MediaAiAnalysis::getMediaId, mediaIds)
+        );
+        List<MediaTranscription> transcriptionList = transcriptionMapper.selectList(
+            new LambdaQueryWrapper<MediaTranscription>().in(MediaTranscription::getMediaId, mediaIds)
+        );
 
         // 3. 构建状态映射（只映射状态，不映射 TEXT）
         Map<Long, String> aiStatusMap = analysisList.stream()

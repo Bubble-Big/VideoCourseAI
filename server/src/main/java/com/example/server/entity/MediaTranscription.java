@@ -18,6 +18,10 @@ public class MediaTranscription {
     private Integer attempts;
     private Integer compensationAttempts;
     private Integer retryCount;
+
+    @Version
+    private Integer version;  // 乐观锁版本号
+
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

@@ -1,6 +1,8 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.example.server.common.AiStatus;
 import com.example.server.common.GateOutcome;
 import com.example.server.entity.MediaFile;
@@ -10,7 +12,6 @@ import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -21,8 +22,10 @@ import java.util.concurrent.TimeUnit;
 /**
  * 补偿调度器抽象基类：封装通用逻辑（分布式锁、扫描循环、乐观锁、retryCount 冲突检测）。
  * 子类通过实现抽象方法定制化查询条件、触发重试、字段访问等。
+ *
+ * @param <T> 子表实体类型（MediaAiAnalysis 或 MediaTranscription）
  */
-public abstract class AbstractCompensationScheduler {
+public abstract class AbstractCompensationScheduler<T> {
 
     protected static final Logger log = LoggerFactory.getLogger(AbstractCompensationScheduler.class);
     protected static final int SCAN_LIMIT = 100;
@@ -53,31 +56,34 @@ public abstract class AbstractCompensationScheduler {
     /** 调度器名称（用于日志） */
     protected abstract String getSchedulerName();
 
-    // ========== 子类查询方法 ==========
+    // ========== 子表访问方法（泛型化） ==========
 
-    /** 扫描卡死任务 */
-    protected abstract List<MediaFile> scanStalledTasks(LocalDateTime threshold, int limit);
+    /** 获取子表 Mapper */
+    protected abstract BaseMapper<T> getChildTableMapper();
+
+    /** 扫描卡死任务（由子类 Mapper 实现 SQL 查询） */
+    protected abstract List<T> scanStalledTasks(LocalDateTime threshold, int limit);
+
+    /** 从子表实体中提取 mediaId */
+    protected abstract Long getMediaId(T entity);
+
+    /** 从子表实体中提取 version */
+    protected abstract Integer getVersion(T entity);
+
+    /** 从子表实体中提取 retryCount */
+    protected abstract Integer getRetryCount(T entity);
+
+    /** 从子表实体中提取 compensationAttempts */
+    protected abstract Integer getCompensationAttempts(T entity);
+
+    /** 从子表实体中提取 status */
+    protected abstract String getStatus(T entity);
+
+    /** 从子表实体中提取 processAt */
+    protected abstract LocalDateTime getProcessAt(T entity);
 
     /** 触发重试（返回 CompletableFuture 用于异步回调） */
     protected abstract CompletableFuture<?> triggerRetry(Long mediaId);
-
-    // ========== 子类字段访问器 ==========
-
-    protected abstract String getStatus(MediaFile file);
-    protected abstract Integer getCompensationAttempts(MediaFile file);
-    protected abstract Integer getRetryCount(MediaFile file);
-    protected abstract LocalDateTime getProcessAt(MediaFile file);
-
-    // ========== 子类字段设置器 ==========
-
-    protected abstract void setStatus(LambdaUpdateWrapper<MediaFile> wrapper, String status);
-    protected abstract void setCompensationAttempts(LambdaUpdateWrapper<MediaFile> wrapper, int attempts);
-    protected abstract void setProcessAt(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time);
-
-    /**
-     * 刷新时间戳字段：AI 分析用 ai_process_at，文字提取用 transcript_process_at
-     */
-    protected abstract void refreshProcessAtField(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time);
 
     // ========== 子类失败处理 ==========
 
@@ -104,16 +110,16 @@ public abstract class AbstractCompensationScheduler {
 
         try {
             LocalDateTime threshold = LocalDateTime.now().minus(Duration.ofMinutes(getThresholdMinutes()));
-            List<MediaFile> stalled = scanStalledTasks(threshold, SCAN_LIMIT);
+            List<T> stalled = scanStalledTasks(threshold, SCAN_LIMIT);
             if (stalled.isEmpty()) {
                 return;
             }
             log.info("{}扫到 {} 条卡死记录", getSchedulerName(), stalled.size());
-            for (MediaFile f : stalled) {
+            for (T entity : stalled) {
                 try {
-                    compensateOne(f);
+                    compensateOne(entity);
                 } catch (Exception e) {
-                    log.warn("单条补偿处理异常, mediaId={}, err={}", f.getId(), e.getMessage(), e);
+                    log.warn("单条补偿处理异常, mediaId={}, err={}", getMediaId(entity), e.getMessage(), e);
                 }
             }
         } finally {
@@ -126,17 +132,19 @@ public abstract class AbstractCompensationScheduler {
     /**
      * 单条记录补偿：刷新时间戳 + 触发重试 + 异步回调计数
      */
-    private void compensateOne(MediaFile f) {
-        Long mediaId = f.getId();
-        Integer snapshotRetryCount = getRetryCount(f);
+    private void compensateOne(T entity) {
+        Long mediaId = getMediaId(entity);
+        Integer snapshotRetryCount = getRetryCount(entity);
+        Integer snapshotVersion = getVersion(entity);
 
-        // 刷新时间戳（乐观锁）
-        LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
-            .eq(MediaFile::getId, f.getId())
-            .eq(MediaFile::getVersion, f.getVersion());
-        refreshProcessAtField(wrapper, LocalDateTime.now());
+        // 刷新 process_at（使用乐观锁）
+        LocalDateTime newProcessAt = LocalDateTime.now();
+        LambdaUpdateWrapper<T> wrapper = new LambdaUpdateWrapper<T>()
+            .eq("media_id", mediaId)
+            .eq("version", snapshotVersion)
+            .set("process_at", newProcessAt);
 
-        int updated = mediaFileMapper.update(null, wrapper);
+        int updated = getChildTableMapper().update(null, wrapper);
 
         if (updated == 0) {
             log.info("{}刷新时间戳被跳过（版本冲突）, mediaId={}", getSchedulerName(), mediaId);
@@ -170,7 +178,11 @@ public abstract class AbstractCompensationScheduler {
      * 递增重试计数（retryCount 冲突检测 + 乐观锁 + 达到上限标记 FAILED）
      */
     private void incrementAttemptsIfStillPending(Long mediaId, Integer snapshotRetryCount) {
-        MediaFile latest = mediaFileMapper.selectById(mediaId);
+        // 重新查询子表最新记录
+        T latest = getChildTableMapper().selectOne(
+            new LambdaQueryWrapper<T>().eq("media_id", mediaId)
+        );
+
         if (latest == null || !AiStatus.PROCESSING.name().equals(getStatus(latest))) {
             return;
         }
@@ -186,19 +198,19 @@ public abstract class AbstractCompensationScheduler {
             return;
         }
 
-        // 递增计数
+        // 递增子表的 compensation_attempts（乐观锁）
         int attempts = (getCompensationAttempts(latest) == null ? 0 : getCompensationAttempts(latest)) + 1;
-        LambdaUpdateWrapper<MediaFile> wrapper = new LambdaUpdateWrapper<MediaFile>()
-            .eq(MediaFile::getId, latest.getId())
-            .eq(MediaFile::getVersion, latest.getVersion());
 
-        setCompensationAttempts(wrapper, attempts);
+        LambdaUpdateWrapper<T> wrapper = new LambdaUpdateWrapper<T>()
+            .eq("media_id", mediaId)
+            .eq("version", getVersion(latest))
+            .set("compensation_attempts", attempts);
 
         if (attempts >= getMaxAttempts()) {
-            setStatus(wrapper, AiStatus.FAILED.name());
+            wrapper.set("status", AiStatus.FAILED.name());
         }
 
-        int updated = mediaFileMapper.update(null, wrapper);
+        int updated = getChildTableMapper().update(null, wrapper);
         if (updated == 0) {
             return;
         }

@@ -147,106 +147,299 @@ protected void refreshProcessAtField(LambdaUpdateWrapper<MediaFile> wrapper, Loc
 
 ## 修复方案
 
-### 核心思路
+### ⚠️ 原计划缺陷分析（2026-09-18 补充）
 
-**彻底重构补偿调度器**，从"更新父表 + 提交任务"模式转为"更新子表 + 提交任务"模式：
+**致命问题 1：子表缺少 `version` 字段**
+- 原计划假设子表有 `version` 用于乐观锁（见步骤 2 第 286 行）
+- 实际检查：`MediaAiAnalysis` 和 `MediaTranscription` 实体类中**无 `version` 字段**
+- V10 迁移脚本建表语句中也**未定义 `version` 列**
+- 后果：乐观锁失效，并发冲突无法防御（补偿器 vs 用户重试 / MQ 消费者）
 
+**致命问题 2：`incrementAttemptsIfStillPending()` 未重构**
+- `AbstractCompensationScheduler:172-210` 负责递增 `compensation_attempts` 和标记 `FAILED`
+- 原计划删除了 `setStatus()`、`setCompensationAttempts()` 方法
+- 但 `incrementAttemptsIfStillPending()` 调用这些方法，**原计划未说明如何重构此方法**
+
+**致命问题 3：泛型化设计不完整**
+- 原计划将基类改为 `AbstractCompensationScheduler<T>`
+- `compensateOne(T entity)` 操作子表实体
+- 但 `incrementAttemptsIfStillPending()` 仍需查询/更新子表，逻辑缺失
+
+### 核心思路（修正版）
+
+**阶段 1：数据库迁移 - 添加 version 字段**
+```sql
+-- V11: 子表乐观锁字段补充
+ALTER TABLE media_ai_analysis ADD COLUMN version INT NOT NULL DEFAULT 0;
+ALTER TABLE media_transcription ADD COLUMN version INT NOT NULL DEFAULT 0;
+```
+
+**阶段 2：实体类同步**
+- `MediaAiAnalysis` 和 `MediaTranscription` 添加 `@Version` 注解字段
+- MyBatis-Plus 自动处理乐观锁递增
+
+**阶段 3：彻底重构补偿调度器**
 1. 抽象基类 `AbstractCompensationScheduler` 改为泛型设计，支持操作任意子表实体
 2. 子类 `AnalysisCompensationScheduler` 操作 `MediaAiAnalysis` 表
 3. 子类 `TranscriptionCompensationScheduler` 操作 `MediaTranscription` 表
-4. 移除对父表 `media_files` 的直接更新依赖
+4. **移除对父表 `media_files` 的所有更新操作**
+5. **重构 `incrementAttemptsIfStillPending()` 为抽象方法，由子类实现**
+
+**阶段 4：修复 MediaController.list()**
+- 使用外键 `media_id` 批量查询子表（替代主键查询）
 
 ### 实施步骤
+
+#### 步骤 0：数据库迁移 - 添加 version 字段
+
+**文件**：`server/src/main/resources/db/V11__add_child_table_version.sql`
+
+```sql
+-- ============================================================
+-- V11: 子表乐观锁字段补充
+-- 修复补偿调度器并发冲突问题
+-- ============================================================
+
+USE media_db;
+
+-- 为 AI 分析表添加 version 字段
+ALTER TABLE media_ai_analysis 
+ADD COLUMN version INT NOT NULL DEFAULT 0 COMMENT '乐观锁版本号';
+
+-- 为转写表添加 version 字段
+ALTER TABLE media_transcription 
+ADD COLUMN version INT NOT NULL DEFAULT 0 COMMENT '乐观锁版本号';
+
+-- 验证字段添加成功
+SELECT 
+    'media_ai_analysis' AS table_name,
+    COUNT(*) AS row_count,
+    MAX(version) AS max_version
+FROM media_ai_analysis
+UNION ALL
+SELECT 
+    'media_transcription',
+    COUNT(*),
+    MAX(version)
+FROM media_transcription;
+```
+
+#### 步骤 0.1：更新实体类 - 添加 @Version 字段
+
+**文件 1**：`server/src/main/java/com/example/server/entity/MediaAiAnalysis.java`
+
+在第 22 行（`private Integer retryCount;` 后）添加：
+
+```java
+@Version
+private Integer version;  // 乐观锁版本号
+```
+
+**文件 2**：`server/src/main/java/com/example/server/entity/MediaTranscription.java`
+
+在第 20 行（`private Integer retryCount;` 后）添加：
+
+```java
+@Version
+private Integer version;  // 乐观锁版本号
+```
 
 #### 步骤 1：重构抽象基类
 
 **文件**：`server/src/main/java/com/example/server/service/AbstractCompensationScheduler.java`
 
-**改动点 1.1**：引入子表 Mapper 抽象
+**核心改动**：从"操作父表 MediaFile + 子类实现字段设置器"模式，改为"操作子表泛型实体 T + 子类提供 Mapper"模式。
+
+**改动点 1.1**：类声明改为泛型
 
 ```java
-public abstract class AbstractCompensationScheduler<T> {  // 泛型化
-    
-    @Resource
-    protected MediaFileMapper mediaFileMapper;  // 保留，用于查询 media_id 列表
-    
-    // 新增：子类提供子表 Mapper
-    protected abstract BaseMapper<T> getChildTableMapper();
-    
-    // 新增：子类提供查询 stale 记录的 LambdaQueryWrapper
-    protected abstract LambdaQueryWrapper<T> buildStaleQuery(LocalDateTime staleThreshold);
-    
-    // 新增：子类提供更新 process_at 的 LambdaUpdateWrapper
-    protected abstract LambdaUpdateWrapper<T> buildProcessAtUpdate(T entity, LocalDateTime newTime);
-    
-    // 新增：子类从子表实体中提取 mediaId
-    protected abstract Long getMediaId(T entity);
-    
-    // 新增：子类从子表实体中提取 version
-    protected abstract Integer getVersion(T entity);
+// 第 25 行，改为：
+public abstract class AbstractCompensationScheduler<T> {
+```
+
+**改动点 1.2**：移除构造函数中的 MediaFileMapper 依赖
+
+```java
+// 第 34-40 行（原构造函数）删除，替换为：
+protected final RedissonClient redissonClient;
+protected final TaskEventService taskEventService;
+
+public AbstractCompensationScheduler(RedissonClient redissonClient,
+                                    TaskEventService taskEventService) {
+    this.redissonClient = redissonClient;
+    this.taskEventService = taskEventService;
 }
 ```
 
-**改动点 1.2**：重构 `findStaleTasks()` 方法
+**改动点 1.3**：新增子类必须实现的抽象方法
 
 ```java
-// 第 66-99 行（原逻辑）删除，替换为：
-@Scheduled(fixedRate = 60000)
-public void findStaleTasks() {
-    LocalDateTime staleThreshold = LocalDateTime.now().minusMinutes(getStaledMinutes());
-    
-    // 直接查询子表中的 stale 记录
-    LambdaQueryWrapper<T> query = buildStaleQuery(staleThreshold);
-    List<T> staleRecords = getChildTableMapper().selectList(query);
-    
-    if (staleRecords.isEmpty()) {
+// 在第 55 行后（getSchedulerName() 方法后）添加：
+
+// ========== 子类提供子表访问能力 ==========
+
+/** 子表 Mapper（用于查询和更新子表记录） */
+protected abstract BaseMapper<T> getChildTableMapper();
+
+/** 从子表实体提取 mediaId */
+protected abstract Long getMediaId(T entity);
+
+/** 从子表实体提取 version */
+protected abstract Integer getVersion(T entity);
+
+/** 从子表实体提取 retryCount */
+protected abstract Integer getRetryCount(T entity);
+
+/** 从子表实体提取 compensationAttempts */
+protected abstract Integer getCompensationAttempts(T entity);
+
+/** 从子表实体提取 status */
+protected abstract String getStatus(T entity);
+```
+
+**改动点 1.4**：删除废弃的抽象方法
+
+```java
+// 第 57-85 行（原抽象方法）全部删除：
+// protected abstract List<MediaFile> scanStalledTasks(...);
+// protected abstract String getStatus(MediaFile file);
+// protected abstract Integer getCompensationAttempts(MediaFile file);
+// protected abstract Integer getRetryCount(MediaFile file);
+// protected abstract LocalDateTime getProcessAt(MediaFile file);
+// protected abstract void setStatus(...);
+// protected abstract void setCompensationAttempts(...);
+// protected abstract void setProcessAt(...);
+// protected abstract void refreshProcessAtField(...);  // ← 罪魁祸首
+```
+
+**改动点 1.5**：重构 `compensate()` 主流程
+
+```java
+// 第 92-124 行（原逻辑）替换为：
+public void compensate() {
+    RLock lock = redissonClient.getLock(getLockKey());
+    boolean locked;
+    try {
+        locked = lock.tryLock(0, 50, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
         return;
     }
-    
-    log.info("[Compensation-{}] Found {} stale tasks", getTaskType(), staleRecords.size());
-    
-    for (T record : staleRecords) {
-        try {
-            compensateOne(record);
-        } catch (Exception e) {
-            log.error("[Compensation-{}] Error: mediaId={}", 
-                getTaskType(), getMediaId(record), e);
+    if (!locked) {
+        return;
+    }
+
+    try {
+        LocalDateTime threshold = LocalDateTime.now().minus(Duration.ofMinutes(getThresholdMinutes()));
+        
+        // ✅ 直接查询子表中的 stale 记录
+        List<T> stalled = scanStalledTasks(threshold, SCAN_LIMIT);
+        
+        if (stalled.isEmpty()) {
+            return;
+        }
+        
+        log.info("{}扫到 {} 条卡死记录", getSchedulerName(), stalled.size());
+        
+        for (T entity : stalled) {
+            try {
+                compensateOne(entity);
+            } catch (Exception e) {
+                log.warn("单条补偿处理异常, mediaId={}, err={}", getMediaId(entity), e.getMessage(), e);
+            }
+        }
+    } finally {
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock();
         }
     }
 }
+
+/** 扫描卡死任务（子类实现，直接查子表） */
+protected abstract List<T> scanStalledTasks(LocalDateTime threshold, int limit);
 ```
 
-**改动点 1.3**：重构 `compensateOne()` 方法
+**改动点 1.6**：重构 `compensateOne()` 方法
 
 ```java
-// 第 129-150 行（原逻辑）删除，替换为：
-protected void compensateOne(T entity) {
+// 第 129-155 行（原逻辑）替换为：
+private void compensateOne(T entity) {
     Long mediaId = getMediaId(entity);
-    Integer version = getVersion(entity);
-    
-    // 构建子表更新 wrapper（带乐观锁）
-    LambdaUpdateWrapper<T> wrapper = buildProcessAtUpdate(entity, LocalDateTime.now());
-    
+    Integer snapshotRetryCount = getRetryCount(entity);
+    Integer snapshotVersion = getVersion(entity);
+
+    // ✅ 刷新子表的 process_at（乐观锁）
+    LambdaUpdateWrapper<T> wrapper = new LambdaUpdateWrapper<T>()
+        .eq("media_id", mediaId)
+        .eq("version", snapshotVersion)
+        .set("process_at", LocalDateTime.now());
+
     int updated = getChildTableMapper().update(null, wrapper);
-    
+
     if (updated == 0) {
-        log.info("[Compensation-{}] Optimistic lock failed: mediaId={}", 
-            getTaskType(), mediaId);
+        log.info("{}刷新时间戳被跳过（版本冲突）, mediaId={}", getSchedulerName(), mediaId);
         return;
     }
-    
-    log.info("[Compensation-{}] Refreshed process_at: mediaId={}", 
-        getTaskType(), mediaId);
-    
-    submitTask(mediaId);
+
+    // 触发重试
+    CompletableFuture<?> future = triggerRetry(mediaId);
+    future.whenComplete((outcome, ex) -> {
+        if (shouldSkipIncrement(outcome, ex)) {
+            log.warn("补偿触发未产生进展（DEFER/异常/REUSE），mediaId={}", mediaId);
+            return;
+        }
+        incrementAttemptsIfStillPending(mediaId, snapshotRetryCount);
+    });
 }
 ```
 
-**改动点 1.4**：移除废弃方法
+**改动点 1.7**：重构 `incrementAttemptsIfStillPending()` 方法
 
 ```java
-// 删除以下方法：
-// protected abstract void refreshProcessAtField(LambdaUpdateWrapper<MediaFile> wrapper, LocalDateTime time);
+// 第 172-210 行（原逻辑）替换为：
+private void incrementAttemptsIfStillPending(Long mediaId, Integer snapshotRetryCount) {
+    // ✅ 重新查询子表最新记录
+    T latest = getChildTableMapper().selectOne(
+        new LambdaQueryWrapper<T>().eq("media_id", mediaId)
+    );
+    
+    if (latest == null || !AiStatus.PROCESSING.name().equals(getStatus(latest))) {
+        return;
+    }
+
+    // P1 修复：retryCount 冲突检测
+    Integer currentRetryCount = getRetryCount(latest);
+    Integer originalRetryCount = (snapshotRetryCount == null ? 0 : snapshotRetryCount);
+    currentRetryCount = (currentRetryCount == null ? 0 : currentRetryCount);
+
+    if (!currentRetryCount.equals(originalRetryCount)) {
+        log.info("检测到 retryCount 变化（{}→{}），用户已手动重试，跳过补偿计数 mediaId={}",
+            originalRetryCount, currentRetryCount, mediaId);
+        return;
+    }
+
+    // ✅ 递增子表的 compensation_attempts（乐观锁）
+    int attempts = (getCompensationAttempts(latest) == null ? 0 : getCompensationAttempts(latest)) + 1;
+    
+    LambdaUpdateWrapper<T> wrapper = new LambdaUpdateWrapper<T>()
+        .eq("media_id", mediaId)
+        .eq("version", getVersion(latest))
+        .set("compensation_attempts", attempts);
+
+    if (attempts >= getMaxAttempts()) {
+        wrapper.set("status", AiStatus.FAILED.name());
+    }
+
+    int updated = getChildTableMapper().update(null, wrapper);
+    if (updated == 0) {
+        return;
+    }
+
+    if (attempts >= getMaxAttempts()) {
+        recordFailure(mediaId, new AiAnalysisException("重试耗尽，判定失败", false), attempts);
+        publishFailure(mediaId, "重试耗尽，判定失败");
+    }
+}
 ```
 
 #### 步骤 2：重构 AI 分析补偿调度器
@@ -551,10 +744,13 @@ WHERE media_id = 999;
 
 | 步骤 | 预计耗时 | 责任人 | 状态 |
 |-----|---------|--------|------|
-| 重构 `AbstractCompensationScheduler` | 30 分钟 | 开发 | ⏳ 待开始 |
-| 重构 `AnalysisCompensationScheduler` | 15 分钟 | 开发 | ⏳ 待开始 |
-| 重构 `TranscriptionCompensationScheduler` | 15 分钟 | 开发 | ⏳ 待开始 |
-| 修复 `MediaController.list()` | 10 分钟 | 开发 | ⏳ 待开始 |
+| 添加 version 字段（V11 迁移脚本） | 5 分钟 | 开发 | ✅ 已完成 |
+| 更新实体类（@Version 字段） | 5 分钟 | 开发 | ✅ 已完成 |
+| 重构 `AbstractCompensationScheduler` | 30 分钟 | 开发 | ✅ 已完成 |
+| 重构 `AnalysisCompensationScheduler` | 15 分钟 | 开发 | ✅ 已完成 |
+| 重构 `TranscriptionCompensationScheduler` | 15 分钟 | 开发 | ✅ 已完成 |
+| 更新 `AiService` 刷新 process_at | 10 分钟 | 开发 | ✅ 已完成 |
+| 修复 `MediaController.list()` | 10 分钟 | 开发 | ✅ 已完成 |
 | 编写单元测试 | 20 分钟 | 开发 | ⏳ 待开始 |
 | 集成测试 | 15 分钟 | QA | ⏳ 待开始 |
 | 前端验证 | 10 分钟 | QA | ⏳ 待开始 |
