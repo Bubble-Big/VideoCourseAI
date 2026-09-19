@@ -47,9 +47,6 @@ class TaskEventServiceTest {
 
     @Test
     void testPublishAnalysis_redisAvailable_shouldBroadcast() throws Exception {
-        // 模拟 Redis 可用
-        doNothing().when(redisTemplate).convertAndSend(anyString(), anyString());
-
         // 先订阅（建立连接）
         TaskEvent initialEvent = TaskEvent.analysis(1L, "NONE", null, null);
         taskEventService.subscribe(1L, "ai", initialEvent);
@@ -68,9 +65,6 @@ class TaskEventServiceTest {
 
     @Test
     void testPublishTranscription_redisAvailable_shouldBroadcast() throws Exception {
-        // 模拟 Redis 可用
-        doNothing().when(redisTemplate).convertAndSend(anyString(), anyString());
-
         // 先订阅
         TaskEvent initialEvent = TaskEvent.transcription(2L, "NONE", null, null);
         taskEventService.subscribe(2L, "transcribe", initialEvent);
@@ -109,9 +103,6 @@ class TaskEventServiceTest {
 
     @Test
     void testTerminalEvent_shouldCloseConnection() throws Exception {
-        // 模拟 Redis 可用
-        doNothing().when(redisTemplate).convertAndSend(anyString(), anyString());
-
         // 订阅
         TaskEvent initialEvent = TaskEvent.analysis(4L, "PROCESSING", null, null);
         SseEmitter emitter = taskEventService.subscribe(4L, "ai", initialEvent);
@@ -132,9 +123,6 @@ class TaskEventServiceTest {
 
     @Test
     void testTerminalEvent_failed_shouldCloseConnection() throws Exception {
-        // 模拟 Redis 可用
-        doNothing().when(redisTemplate).convertAndSend(anyString(), anyString());
-
         // 订阅
         TaskEvent initialEvent = TaskEvent.analysis(5L, "PROCESSING", null, null);
         taskEventService.subscribe(5L, "ai", initialEvent);
@@ -150,9 +138,6 @@ class TaskEventServiceTest {
 
     @Test
     void testMultipleSubscribers_sameTask() throws Exception {
-        // 模拟 Redis 可用
-        doNothing().when(redisTemplate).convertAndSend(anyString(), anyString());
-
         // 多个订阅者订阅同一任务（多标签页场景）
         TaskEvent initialEvent = TaskEvent.analysis(6L, "PENDING", null, null);
         taskEventService.subscribe(6L, "ai", initialEvent);
@@ -171,9 +156,6 @@ class TaskEventServiceTest {
 
     @Test
     void testCheckRedisConnection_success() {
-        // 模拟 Redis 可用
-        doNothing().when(redisTemplate).convertAndSend(anyString(), anyString());
-
         // 调用启动检查
         taskEventService.checkRedisConnection();
 

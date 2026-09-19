@@ -1,9 +1,14 @@
 package com.example.server.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.example.server.common.AiStatus;
 import com.example.server.common.GateOutcome;
+import com.example.server.entity.MediaAiAnalysis;
 import com.example.server.entity.MediaFile;
+import com.example.server.entity.MediaTranscription;
+import com.example.server.mapper.MediaAiAnalysisMapper;
 import com.example.server.mapper.MediaFileMapper;
+import com.example.server.mapper.MediaTranscriptionMapper;
 import com.example.server.utils.AnalysisTaskKeys;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -24,9 +29,9 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
- * ContentTaskGate 单元测试
+ * ContentTaskGate 单元测试（子表适配版）
  * <p>
- * 覆盖 Phase 1 核心逻辑：
+ * 覆盖核心逻辑：
  * - 提交侧幂等键（tryMarkSubmitting / rollbackSubmitting）
  * - 分析锁（inAnalysisLock）的 PROCEED / DEFER 分支
  * - 转写锁（inTranscribeLock）的 PROCEED / DEFER 分支
@@ -45,6 +50,15 @@ class ContentTaskGateTest {
 
     @Mock
     private MediaFileMapper mediaFileMapper;
+
+    @Mock
+    private MediaAiAnalysisMapper aiAnalysisMapper;
+
+    @Mock
+    private MediaTranscriptionMapper transcriptionMapper;
+
+    @Mock
+    private TaskEventService taskEventService;
 
     @Mock
     private ValueOperations<String, String> valueOps;
@@ -163,8 +177,11 @@ class ContentTaskGateTest {
     @Test
     void testResolveAnalysis_Idempotent() {
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
-        mediaFile.setAiStatus(AiStatus.SUCCESS.name());
-        mediaFile.setAiSummary("已有总结");
+        MediaAiAnalysis currentAnalysis = createAnalysis(MEDIA_ID);
+        currentAnalysis.setStatus(AiStatus.SUCCESS.name());
+        currentAnalysis.setSummary("已有总结");
+
+        when(aiAnalysisMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(currentAnalysis);
 
         boolean result = gate.resolveAnalysis(mediaFile, CONTENT_HASH);
 
@@ -175,45 +192,60 @@ class ContentTaskGateTest {
     void testResolveAnalysis_ReuseFromRedis() {
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
-        MediaFile owner = createMediaFile(OWNER_ID);
-        owner.setAiStatus(AiStatus.SUCCESS.name());
-        owner.setAiSummary("归属总结");
-        owner.setTranscriptText("归属转写");
-        owner.setTranscriptStatus(AiStatus.SUCCESS.name());
+        MediaAiAnalysis currentAnalysis = createAnalysis(MEDIA_ID);
+        MediaAiAnalysis ownerAnalysis = createAnalysis(OWNER_ID);
+        ownerAnalysis.setStatus(AiStatus.SUCCESS.name());
+        ownerAnalysis.setSummary("归属总结");
+        MediaTranscription ownerTranscription = createTranscription(OWNER_ID);
+        ownerTranscription.setStatus(AiStatus.SUCCESS.name());
+        ownerTranscription.setTranscriptText("归属转写");
 
+        when(aiAnalysisMapper.selectOne(any(LambdaQueryWrapper.class)))
+                .thenReturn(currentAnalysis)  // 当前分析记录
+                .thenReturn(ownerAnalysis);   // 归属分析记录
         when(valueOps.get(AnalysisTaskKeys.completedOwner(CONTENT_HASH)))
                 .thenReturn(String.valueOf(OWNER_ID));
-        when(mediaFileMapper.selectById(OWNER_ID)).thenReturn(owner);
+        when(transcriptionMapper.selectOne(any(LambdaQueryWrapper.class)))
+                .thenReturn(ownerTranscription)  // 归属转写记录
+                .thenReturn(null);               // 当前转写记录不存在
 
         boolean result = gate.resolveAnalysis(mediaFile, CONTENT_HASH);
 
         assertTrue(result);
-        assertEquals("归属总结", mediaFile.getAiSummary());
-        assertEquals(AiStatus.SUCCESS.name(), mediaFile.getAiStatus());
-        verify(mediaFileMapper).updateById(eq(mediaFile));
-        verify(valueOps).set(eq(AnalysisTaskKeys.completedOwner(CONTENT_HASH)),
-                eq(String.valueOf(OWNER_ID)), any());
+        verify(aiAnalysisMapper).updateById(argThat((MediaAiAnalysis analysis) ->
+            analysis != null && "归属总结".equals(analysis.getSummary())
+        ));
+        verify(transcriptionMapper).insert(argThat((MediaTranscription transcription) ->
+            transcription != null && "归属转写".equals(transcription.getTranscriptText())
+        ));
     }
 
     @Test
     void testResolveAnalysis_ReuseFromDB() {
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
-        mediaFile.setFileMd5(CONTENT_HASH);  // 设置真实 MD5
-        MediaFile owner = createMediaFile(OWNER_ID);
-        owner.setAiStatus(AiStatus.SUCCESS.name());
-        owner.setAiSummary("DB 归属总结");
-        owner.setTranscriptText("DB 归属转写");
-        owner.setTranscriptStatus(AiStatus.SUCCESS.name());
+        mediaFile.setFileMd5(CONTENT_HASH);
+        MediaAiAnalysis currentAnalysis = createAnalysis(MEDIA_ID);
+        MediaAiAnalysis ownerAnalysis = createAnalysis(OWNER_ID);
+        ownerAnalysis.setStatus(AiStatus.SUCCESS.name());
+        ownerAnalysis.setSummary("DB 归属总结");
+        MediaTranscription ownerTranscription = createTranscription(OWNER_ID);
+        ownerTranscription.setStatus(AiStatus.SUCCESS.name());
+        ownerTranscription.setTranscriptText("DB 归属转写");
 
+        when(aiAnalysisMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(currentAnalysis);
         when(valueOps.get(anyString())).thenReturn(null);
-        when(mediaFileMapper.selectCompletedAnalysisByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(owner);
+        when(aiAnalysisMapper.selectCompletedAnalysisByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(ownerAnalysis);
+        when(transcriptionMapper.selectOne(any(LambdaQueryWrapper.class)))
+                .thenReturn(ownerTranscription)  // 归属转写记录
+                .thenReturn(null);               // 当前转写记录不存在
 
         boolean result = gate.resolveAnalysis(mediaFile, CONTENT_HASH);
 
         assertTrue(result);
-        assertEquals("DB 归属总结", mediaFile.getAiSummary());
-        verify(mediaFileMapper).updateById(eq(mediaFile));
+        verify(aiAnalysisMapper).updateById(argThat((MediaAiAnalysis analysis) ->
+            analysis != null && "DB 归属总结".equals(analysis.getSummary())
+        ));
         verify(valueOps).set(eq(AnalysisTaskKeys.completedOwner(CONTENT_HASH)),
                 eq(String.valueOf(OWNER_ID)), any());
     }
@@ -223,14 +255,16 @@ class ContentTaskGateTest {
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
         mediaFile.setFileMd5(CONTENT_HASH);
+        MediaAiAnalysis currentAnalysis = createAnalysis(MEDIA_ID);
 
+        when(aiAnalysisMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(currentAnalysis);
         when(valueOps.get(anyString())).thenReturn(null);
-        when(mediaFileMapper.selectCompletedAnalysisByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(null);
+        when(aiAnalysisMapper.selectCompletedAnalysisByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(null);
 
         boolean result = gate.resolveAnalysis(mediaFile, CONTENT_HASH);
 
         assertFalse(result);
-        verify(mediaFileMapper, never()).updateById(any(MediaFile.class));
+        verify(aiAnalysisMapper, never()).updateById(any(MediaAiAnalysis.class));
     }
 
     // ==================== 转写结果复用测试 ====================
@@ -238,8 +272,11 @@ class ContentTaskGateTest {
     @Test
     void testResolveTranscript_Idempotent() {
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
-        mediaFile.setTranscriptStatus(AiStatus.SUCCESS.name());
-        mediaFile.setTranscriptText("已有转写");
+        MediaTranscription currentTranscription = createTranscription(MEDIA_ID);
+        currentTranscription.setStatus(AiStatus.SUCCESS.name());
+        currentTranscription.setTranscriptText("已有转写");
+
+        when(transcriptionMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(currentTranscription);
 
         String result = gate.resolveTranscript(mediaFile, CONTENT_HASH);
 
@@ -250,37 +287,48 @@ class ContentTaskGateTest {
     void testResolveTranscript_ReuseFromRedis() {
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
-        MediaFile owner = createMediaFile(OWNER_ID);
-        owner.setTranscriptStatus(AiStatus.SUCCESS.name());
-        owner.setTranscriptText("归属转写");
+        MediaTranscription currentTranscription = createTranscription(MEDIA_ID);
+        MediaTranscription ownerTranscription = createTranscription(OWNER_ID);
+        ownerTranscription.setStatus(AiStatus.SUCCESS.name());
+        ownerTranscription.setTranscriptText("归属转写");
 
+        when(transcriptionMapper.selectOne(any(LambdaQueryWrapper.class)))
+                .thenReturn(currentTranscription)  // 当前转写记录
+                .thenReturn(ownerTranscription);   // 归属转写记录
         when(valueOps.get(AnalysisTaskKeys.contextOwner(CONTENT_HASH)))
                 .thenReturn(String.valueOf(OWNER_ID));
-        when(mediaFileMapper.selectById(OWNER_ID)).thenReturn(owner);
 
         String result = gate.resolveTranscript(mediaFile, CONTENT_HASH);
 
         assertEquals("归属转写", result);
-        assertEquals(AiStatus.SUCCESS.name(), mediaFile.getTranscriptStatus());
-        verify(mediaFileMapper).updateById(eq(mediaFile));
+        verify(transcriptionMapper).updateById(argThat((MediaTranscription transcription) ->
+            transcription != null && "归属转写".equals(transcription.getTranscriptText())
+        ));
     }
 
     @Test
     void testResolveTranscript_ReuseFromDB() {
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
-        mediaFile.setFileMd5(CONTENT_HASH);  // 设置真实 MD5
-        MediaFile owner = createMediaFile(OWNER_ID);
-        owner.setTranscriptStatus(AiStatus.SUCCESS.name());
-        owner.setTranscriptText("DB 归属转写");
+        mediaFile.setFileMd5(CONTENT_HASH);
+        MediaTranscription currentTranscription = createTranscription(MEDIA_ID);
+        MediaTranscription ownerTranscription = createTranscription(OWNER_ID);
+        ownerTranscription.setStatus(AiStatus.SUCCESS.name());
+        ownerTranscription.setTranscriptText("DB 归属转写");
 
+        when(transcriptionMapper.selectOne(any(LambdaQueryWrapper.class)))
+                .thenReturn(currentTranscription)  // 当前转写记录
+                .thenReturn(ownerTranscription);   // 归属转写记录
         when(valueOps.get(anyString())).thenReturn(null);
-        when(mediaFileMapper.selectCompletedTranscriptByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(owner);
+        when(transcriptionMapper.selectCompletedTranscriptByMd5(CONTENT_HASH, MEDIA_ID))
+                .thenReturn(ownerTranscription);
 
         String result = gate.resolveTranscript(mediaFile, CONTENT_HASH);
 
         assertEquals("DB 归属转写", result);
-        verify(mediaFileMapper).updateById(eq(mediaFile));
+        verify(transcriptionMapper).updateById(argThat((MediaTranscription transcription) ->
+            transcription != null && "DB 归属转写".equals(transcription.getTranscriptText())
+        ));
         verify(valueOps).set(eq(AnalysisTaskKeys.contextOwner(CONTENT_HASH)),
                 eq(String.valueOf(OWNER_ID)), any());
     }
@@ -290,22 +338,48 @@ class ContentTaskGateTest {
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         MediaFile mediaFile = createMediaFile(MEDIA_ID);
         mediaFile.setFileMd5(CONTENT_HASH);
+        MediaTranscription currentTranscription = createTranscription(MEDIA_ID);
 
+        when(transcriptionMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(currentTranscription);
         when(valueOps.get(anyString())).thenReturn(null);
-        when(mediaFileMapper.selectCompletedTranscriptByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(null);
+        when(transcriptionMapper.selectCompletedTranscriptByMd5(CONTENT_HASH, MEDIA_ID)).thenReturn(null);
 
         String result = gate.resolveTranscript(mediaFile, CONTENT_HASH);
 
         assertNull(result);
-        verify(mediaFileMapper, never()).updateById(any(MediaFile.class));
+        verify(transcriptionMapper, never()).updateById(any(MediaTranscription.class));
     }
+
+    // ==================== 辅助方法 ====================
 
     private MediaFile createMediaFile(Long id) {
         MediaFile file = new MediaFile();
         file.setId(id);
-        file.setAiStatus(AiStatus.NONE.name());
-        file.setTranscriptStatus(AiStatus.NONE.name());
-        file.setFileMd5("default-hash");  // 默认设置为非真实 MD5
+        file.setFileMd5("default-hash");
         return file;
+    }
+
+    private MediaAiAnalysis createAnalysis(Long mediaId) {
+        MediaAiAnalysis analysis = new MediaAiAnalysis();
+        analysis.setId(mediaId);
+        analysis.setMediaId(mediaId);
+        analysis.setStatus(AiStatus.NONE.name());
+        analysis.setAttempts(0);
+        analysis.setCompensationAttempts(0);
+        analysis.setRetryCount(0);
+        analysis.setVersion(0);
+        return analysis;
+    }
+
+    private MediaTranscription createTranscription(Long mediaId) {
+        MediaTranscription transcription = new MediaTranscription();
+        transcription.setId(mediaId);
+        transcription.setMediaId(mediaId);
+        transcription.setStatus(AiStatus.NONE.name());
+        transcription.setAttempts(0);
+        transcription.setCompensationAttempts(0);
+        transcription.setRetryCount(0);
+        transcription.setVersion(0);
+        return transcription;
     }
 }
