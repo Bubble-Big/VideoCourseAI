@@ -361,7 +361,28 @@ public class AiService {
         aiAnalysis.setStatus(AiStatus.FAILED.name());
         aiAnalysis.setSummary(null);
         aiAnalysis.setProcessAt(LocalDateTime.now());
-        aiAnalysisMapper.updateById(aiAnalysis);
+        int updated = aiAnalysisMapper.updateById(aiAnalysis);
+        if (updated == 0) {
+            // 乐观锁冲突：可能是并发的 asyncAnalyze 抢先写入了最终态，重新查询后再判断
+            MediaAiAnalysis latest = aiAnalysisMapper.selectOne(
+                new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, mediaId)
+            );
+            if (latest == null
+                || AiStatus.SUCCESS.name().equals(latest.getStatus())
+                || AiStatus.FAILED.name().equals(latest.getStatus())) {
+                log.info("落 FAILED 被跳过（记录已丢失或已被并发写为最终态），mediaId={}", mediaId);
+                return;
+            }
+            // 仍处于 PROCESSING：基于最新 version 重试一次，不再无限重试
+            latest.setStatus(AiStatus.FAILED.name());
+            latest.setSummary(null);
+            latest.setProcessAt(LocalDateTime.now());
+            int retried = aiAnalysisMapper.updateById(latest);
+            if (retried == 0) {
+                log.warn("落 FAILED 重试仍冲突，放弃本次兜底, mediaId={}", mediaId);
+                return;
+            }
+        }
 
         // 若转写阶段尚未成功（即失败发生在 transcribe），同步置 FAILED，避免与 aiStatus 不一致
         MediaTranscription transcription = transcriptionMapper.selectOne(
