@@ -1,59 +1,40 @@
 package com.example.server.consumer;
 
 import com.example.server.dto.AnalysisTaskMsg;
-import com.example.server.entity.MediaFile;
-import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.AiService;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 @Component
-// 监听 "video-analysis-topic" 主题，组名随便起
-@RocketMQMessageListener(topic = "video-analysis-topic", consumerGroup = "video-group")
+// 监听 "video-analysis-topic" 主题；maxReconsumeTimes=2 仅作防御（消息反序列化等异常仍会重投），
+// 核心重试已下沉到 AiService 的 DB 状态机 + 定时补偿（见 AnalysisCompensationScheduler）
+@RocketMQMessageListener(topic = "video-analysis-topic", consumerGroup = "video-group", maxReconsumeTimes = 2)
 public class VideoAnalysisConsumer implements RocketMQListener<AnalysisTaskMsg> {
 
-    private final AiService aiService;
-    private final MediaFileMapper mediaFileMapper;
-    // 注入之前配置好的 IO 密集型线程池
-    private final Executor aiTaskExecutor;
+    private static final Logger log = LoggerFactory.getLogger(VideoAnalysisConsumer.class);
 
-    public VideoAnalysisConsumer(AiService aiService,
-                                 MediaFileMapper mediaFileMapper,
-                                 Executor aiTaskExecutor) {
+    private final AiService aiService;
+
+    public VideoAnalysisConsumer(AiService aiService) {
         this.aiService = aiService;
-        this.mediaFileMapper = mediaFileMapper;
-        this.aiTaskExecutor = aiTaskExecutor;
     }
 
     @Override
     public void onMessage(AnalysisTaskMsg msg) {
         Long mediaId = msg.getMediaId();
-        System.out.println("⚡ [MQ消费者] 收到任务 ID: " + mediaId + "，准备派发给线程池...");
-
-        //CompletableFuture异步编排
-        //即使MQ消费者线程很快，我们也不阻塞它，而是把重活扔给业务线程池
-        CompletableFuture.runAsync(() -> {
-            System.out.println("🧵 [线程池] 开始执行 DeepSeek 分析逻辑...");
-            try {
-
-                aiService.asyncAnalyze(mediaId);
-            } catch (Exception e) {
-                System.err.println("❌ 任务执行失败: " + e.getMessage());
-                //这里可以扩展：写数据库记录失败状态
-                markAsFailed(mediaId, e.getMessage());
-            }
-        }, aiTaskExecutor);
-    }
-
-    private void markAsFailed(Long id, String error) {
-        MediaFile file = mediaFileMapper.selectById(id);
-        if (file != null) {
-            file.setAiSummary("❌ 分析失败: " + error);
-            mediaFileMapper.updateById(file);
+        Boolean force = msg.getForce();
+        log.info("收到分析任务, mediaId={}, force={}", mediaId, force);
+        try {
+            // 只做触发派发：@Async 立即返回，监听线程快进快出，不执行重活
+            aiService.asyncAnalyze(mediaId, force);
+        } catch (RejectedExecutionException e) {
+            // 线程池队列满：吞掉并正常 ACK，状态仍是 PENDING，交给定时补偿兜底
+            log.warn("分析任务派发被拒绝（线程池过载），等待补偿重试, mediaId={}", mediaId);
         }
     }
 }

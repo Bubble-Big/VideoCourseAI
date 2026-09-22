@@ -61,6 +61,10 @@ public class MinioConfig {
                             .build()
             );
 
+            // 注意：chunks/ 前缀的 2 天自动过期规则需在 MinIO 控制台手动配置：
+            // http://127.0.0.1:9001 → Buckets → media → Lifecycle → Add Rule
+            //   Prefix: chunks/   Expiry: 2 days
+
             log.info("MinIO 配置成功，桶权限已强制设置为 Public！");
             return client;
 

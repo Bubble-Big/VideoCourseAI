@@ -32,6 +32,9 @@ build/
 ### VS Code ###
 .vscode/
 
+# --- 本地配置文件（包含敏感信息和本地路径）---
+application-local.properties
+
 # --- Java / Maven ---
 target/
 *.class

@@ -1,6 +1,7 @@
 # VideoCourseAI — 智能视频内容理解平台 架构分析文档
 
-> 分析日期：2026-06-24  
+> 分析日期：2026-08-15  
+> 最后更新：2026-09-22  
 > 项目仓库：https://github.com/Bubble-Big/VideoCourseAI
 
 ---
@@ -9,7 +10,7 @@
 
 **VideoCourseAI** 是一个全链路视频内容理解平台，集成用户鉴权、视频上传（本地/URL）、音频提取、AI 语音转文字与智能总结等能力。项目针对视频处理场景中的 **长耗时阻塞**、**高并发资源冲突**、**大文件传输不稳定** 等痛点，基于 **RocketMQ + Redisson + 分片续传** 重构了系统架构，抛弃了传统的同步处理模式。
 
-**核心标语**：DECODE YOUR VIDEO — 影视重构 · 算力赋能
+**核心标语**：DECODE ALL VIDEOS — 视频解构 · AI赋能
 
 ---
 
@@ -23,10 +24,11 @@
 | **ORM** | MyBatis Plus | 3.5.9 |
 | **数据库** | MySQL | 8.0 |
 | **缓存** | Redis | 7.x |
-| **分布式锁** | Redisson | 3.23.5 |
+| **分布式锁** | Redisson | 3.52.0 |
 | **消息队列** | RocketMQ | 4.9.4 |
 | **对象存储** | MinIO | latest |
-| **AI SDK** | DashScope SDK (阿里云) | 2.16.0 |
+| **AI 服务** | SiliconFlow API（DeepSeek-V3.2 + TeleAI/TeleSpeechASR） | — |
+| **AI SDK（遗留）** | DashScope SDK (阿里云) | 2.16.0 |
 | **HTTP 客户端** | OkHttp | 4.12.0 |
 | **JSON** | FastJSON2 | 2.0.43 |
 | **前端框架** | Vue 3 | 3.5.24 |
@@ -48,48 +50,105 @@ VideoCourseAI-main/
 │   ├── vite.config.js               # Vite 构建配置
 │   └── src/
 │       ├── main.js                  # Vue 应用入口
-│       ├── App.vue                  # 根组件（全部业务逻辑在内）
-│       ├── style.css                # 全局样式
-│       └── assets/                  # 静态资源
+│       ├── App.vue                  # 根组件（纯布局组合 + 启动编排，约 30 行）
+│       ├── api/
+│       │   └── index.js             # 后端接口统一封装（BASE_URL + 全部请求）
+│       ├── utils/
+│       │   └── format.js            # formatSize / formatTime 格式化工具
+│       ├── styles/
+│       │   └── main.css             # 全局样式（由原 App.vue <style> 迁移）
+│       ├── composables/
+│       │   ├── useNotice.js         # 全局通知条（message + showMsg）
+│       │   ├── useAuth.js           # 登录态 + 认证弹窗
+│       │   ├── useMedia.js          # 列表/侧边栏/轮询/删除/下载/转写/AI
+│       │   ├── useUpload.js         # 上传编排（文件/URL/续传/去重/进度）
+│       │   ├── useBootstrap.js      # 启动/卸载编排（封装初始化顺序）
+│       │   └── useChunkedUpload.js  # 分片上传核心（单例）
+│       └── components/
+│           ├── AppNavbar.vue        # 导航栏（品牌/登录/状态灯）
+│           ├── UploadZone.vue       # 上传区（磁贴/进度条/横幅）
+│           ├── VideoList.vue        # 工作台列表
+│           ├── ResultSidebar.vue    # AI 总结 / 文字提取侧边栏
+│           └── AuthModal.vue        # 登录/注册弹窗
 │
 ├── server/                          # Spring Boot 后端项目
 │   ├── pom.xml                      # Maven 依赖配置
 │   ├── mvnw / mvnw.cmd              # Maven Wrapper
 │   └── src/main/
 │       ├── resources/
-│       │   └── application.properties   # 应用配置
+│       │   ├── application.properties   # 应用配置
+│       │   └── db/                      # 数据库脚本
+│       │       ├── schema.sql           # 完整建表语句（5张表）
+│       │       ├── V1__add_file_size_and_md5.sql     # 分片上传字段迁移
+│       │       ├── V2__add_ai_status.sql             # AI/转写状态字段迁移
+│       │       ├── V3__add_failed_analysis_task.sql  # 失败台账建表
+│       │       ├── V4__add_ai_compensation.sql       # AI 补偿计数字段
+│       │       ├── V5__add_content_reuse_indexes.sql # 内容复用索引
+│       │       ├── V6__add_media_file_version.sql    # 父表乐观锁版本号
+│       │       ├── V7__add_retry_count.sql           # 重试计数字段
+│       │       ├── V8__add_transcript_compensation_fields.sql # 转写补偿字段
+│       │       ├── V9__add_transcript_process_at.sql # 转写时间戳字段
+│       │       ├── V10__split_media_files_table.sql  # 表拆分迁移（父子表分离）
+│       │       ├── V11__add_child_table_version.sql  # 子表乐观锁版本号
+│       │       └── rollback_v10.sql                  # V10 回滚脚本
 │       └── java/com/example/server/
 │           ├── ServerApplication.java   # 启动类
+│           ├── common/                  # 公共组件 (新增)
+│           │   ├── Result.java          # 统一 API 响应体
+│           │   ├── ErrorCode.java       # 统一错误码枚举
+│           │   ├── AiStatus.java        # AI 分析/文字提取状态枚举 (新增)
+│           │   └── GateOutcome.java     # ContentTaskGate 三态返回契约 (新增)
 │           ├── config/                  # 配置层
-│           │   ├── MinioConfig.java     # MinIO 客户端配置
+│           │   ├── MinioConfig.java     # MinIO 客户端配置 (含分片生命周期)
 │           │   ├── ThreadPoolConfig.java# 线程池配置
 │           │   └── WebConfig.java       # 跨域 CORS 配置
 │           ├── controller/              # 控制层
 │           │   ├── UserController.java  # 用户注册/登录
-│           │   ├── MediaController.java # 媒体上传/列表/删除
-│           │   └── DebugController.java # AI分析/转写/音频下载
+│           │   ├── MediaController.java # URL 上传/列表/删除
+│           │   ├── ChunkController.java # 分片上传 (新增)
+│           │   ├── DebugController.java # AI分析/转写/音频下载
+│           │   └── ApiExceptionHandler.java # 全局异常处理 (新增)
 │           ├── service/                 # 服务层
-│           │   ├── MediaService.java    # 媒体处理服务
-│           │   └── AiService.java       # AI 分析服务
+│           │   ├── MediaService.java    # 媒体处理服务 (+contentHash MD5 指纹)
+│           │   ├── ChunkUploadService.java  # 分片上传核心逻辑 (新增)
+│           │   ├── AiService.java       # AI 分析服务 (状态机 + 内容复用)
+│           │   ├── ContentTaskGate.java # 内容级串行原语统一收敛 (新增)
+│           │   ├── RateLimitService.java   # 双层令牌桶限流 (新增)
+│           │   ├── TaskEventService.java   # SSE 实时推送服务 (新增)
+│           │   ├── FailedAnalysisTaskService.java # 失败台账服务 (新增)
+│           │   ├── AbstractCompensationScheduler.java # 补偿调度器泛型基类 (新增)
+│           │   ├── AnalysisCompensationScheduler.java # AI 分析补偿调度器 (新增)
+│           │   └── TranscriptionCompensationScheduler.java # 文字转写补偿调度器 (新增)
 │           ├── consumer/                # MQ 消费者
 │           │   └── VideoAnalysisConsumer.java
 │           ├── strategy/                # 策略模式
 │           │   ├── AiAnalysisStrategy.java        # 策略接口
-│           │   └── impl/AliyunDeepSeekStrategy.java # 阿里云+DeepSeek实现
+│           │   └── impl/AliyunDeepSeekStrategy.java # FFmpeg + ASR + DeepSeek 实现
 │           ├── dto/                     # 数据传输对象
-│           │   └── AnalysisTaskMsg.java # MQ 消息体
+│           │   ├── AnalysisTaskMsg.java # MQ 消息体
+│           │   └── ChunkUploadDTO.java  # 分片上传请求/响应 DTO (新增)
 │           ├── entity/                  # 实体层
 │           │   ├── User.java
-│           │   └── MediaFile.java
+│           │   ├── MediaFile.java       # 父表 (+file_size/file_md5 +ai_status/transcript_status)
+│           │   ├── MediaAiAnalysis.java # AI 分析子表 (新增，V10 拆分)
+│           │   ├── MediaTranscription.java # 文字转写子表 (新增，V10 拆分)
+│           │   └── FailedAnalysisTask.java # AI 失败台账实体 (新增)
+│           ├── exception/               # 异常定义 (新增)
+│           │   ├── BusinessException.java
+│           │   └── AiAnalysisException.java # 带 retryable 标志的 AI 异常 (新增)
 │           ├── mapper/                  # 数据访问层
 │           │   ├── UserMapper.java
-│           │   └── MediaFileMapper.java
+│           │   ├── MediaFileMapper.java
+│           │   ├── MediaAiAnalysisMapper.java # AI 分析子表 DAO (新增，V10 拆分)
+│           │   ├── MediaTranscriptionMapper.java # 文字转写子表 DAO (新增，V10 拆分)
+│           │   └── FailedAnalysisTaskMapper.java # 台账 DAO (新增)
 │           └── utils/                   # 工具类
 │               ├── FfmpegUtils.java     # FFmpeg 音频提取（统一入口）
-│               ├── MinioUtils.java      # MinIO 上传/删除
+│               ├── MinioUtils.java      # MinIO 上传/删除/分片/流式拷贝
 │               ├── YtDlpUtils.java      # yt-dlp 视频下载
 │               ├── DeepSeekUtils.java   # DeepSeek AI 调用
-│               └── AliyunAsrUtils.java  # 阿里云语音识别
+│               ├── AliyunAsrUtils.java  # 语音识别 (SiliconFlow TeleSpeechASR)
+│               └── AnalysisTaskKeys.java # 分析任务 Key + contentHash 标准化 (新增)
 │
 ├── rocketmq/
 │   └── broker.conf                  # RocketMQ Broker 配置
@@ -107,7 +166,7 @@ VideoCourseAI-main/
 │                          FRONTEND (Vue 3)                            │
 │                      http://localhost:5173                          │
 │   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
-│   │ 用户登录  │  │ 本地上传  │  │ URL下载   │  │ AI分析/文字提取  │   │
+│   │ 用户登录  │  │ 本地上传 │  │ URL下载   │ │ AI分析/文字提取   │   │
 │   └──────────┘  └──────────┘  └──────────┘  └──────────────────┘   │
 └────────────────────────────┬────────────────────────────────────────┘
                              │ HTTP REST (CORS enabled)
@@ -117,11 +176,17 @@ VideoCourseAI-main/
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                     CONTROLLER LAYER                          │   │
-│  │  UserController    MediaController      DebugController       │   │
-│  │  /user/register    /media/upload        /debug/ai             │   │
-│  │  /user/login       /media/upload-url    /debug/transcribe     │   │
-│  │                    /media/list          /debug/download       │   │
-│  │                    /media/delete                               │   │
+│  │  UserController    MediaController      ChunkController       │   │
+│  │  /user/register    /media/upload-url    /media/api/chunk/init │   │
+│  │  /user/login       /media/list          /media/api/chunk/check│   │
+│  │                    /media/delete        /media/api/chunk/upload│  │
+│  │                                         /media/api/chunk/merge│  │
+│  │                                         /media/api/chunk/cancel│ │
+│  │                    DebugController                            │   │
+│  │                    /debug/ai                                  │   │
+│  │                    /debug/transcribe                           │   │
+│  │                    /debug/download                             │   │
+│  │                    /debug/task-events (SSE 实时推送)          │   │
 │  └────────┬──────────────────┬───────────────────┬──────────────┘   │
 │           │                  │                   │                  │
 │  ┌────────▼──────┐  ┌───────▼────────┐  ┌───────▼──────────────┐   │
@@ -135,26 +200,27 @@ VideoCourseAI-main/
     ┌──────────┐       ┌──────────────┐    ┌─────────────────┐
     │  MySQL   │       │    Redis      │    │    RocketMQ     │
     │  :3307   │       │    :6379      │    │  NameServer:9876│
-    │ media_db │       │ 缓存/锁/限流   │    │  Broker:10911   │
+    │ media_db │       │缓存/锁/限流/身份化│   │  Broker:10911   │
     └──────────┘       └──────────────┘    └────────┬────────┘
                                                     │ 消费消息
     ┌──────────┐                           ┌────────▼────────┐
     │  MinIO   │                           │ VideoAnalysis   │
     │ :9000    │◄──── 文件上传 ────────────│ Consumer        │
-    │ 对象存储  │                           │ (CompletableFuture│
-    └──────────┘                           │  + 线程池)       │
+    │ 对象存储  │                           │ (触发派发+内容级锁│
+    └──────────┘                           │  + 失败台账)     │
                                            └────────┬────────┘
                                                     │
                                            ┌────────▼────────┐
                                            │   AiService     │
                                            │ asyncAnalyze()  │
+                                           │ 状态机+内容复用  │
                                            └────────┬────────┘
                                                     │
                                     ┌───────────────┼───────────────┐
                                     ▼                               ▼
                            ┌──────────────┐                ┌──────────────┐
                            │FFmpeg 提取音频│                │ Aliyun ASR   │
-                           │(本地进程调用)  │                │ 语音转文字    │
+                           │(本地进程调用) │                │ 语音转文字    │
                            └──────┬───────┘                └──────┬───────┘
                                   │                               │
                                   ▼                               ▼
@@ -168,33 +234,74 @@ VideoCourseAI-main/
 
 ## 五、核心业务流程详解
 
-### 5.1 视频上传流程
+### 5.1 视频上传流程（分片上传 + 断点续传）
+
+所有文件（含小文件）统一走分片上传，小于 5MB 的文件只有 1 片。
 
 ```
-用户操作 ──► 前端校验登录 ──► POST /media/upload (FormData)
-                                  │
-                    ┌─────────────┴─────────────┐
-                    ▼                           ▼
-            本地上传 (MultipartFile)      URL 下载 (yt-dlp)
-                    │                           │
-                    ▼                           ▼
-            MinIO.uploadFile()          YtDlpUtils.downloadVideo()
-                    │                    → MinIO.uploadLocalFile()
-                    ▼                           │
-            返回文件URL ◄────────────────────────┘
+用户选择文件 ──► 统一走分片上传
                     │
                     ▼
-          MediaFileMapper.insert() ──► 写入数据库 (status=COMPLETED)
+          POST /media/api/chunk/init
+          {fileName, fileSize, totalChunks, userId, force}
                     │
                     ▼
-          Redis 删除用户列表缓存 ──► 返回成功 (50ms 内响应)
+          去重检测(force=false) → Redis meta Hash → 返回 uploadId
+                    │
+                    ▼
+          POST /media/api/chunk/upload × N
+          (并发 3 片, 每片 5MB, 3 次指数退避重试)
+                    │
+                    ▼
+          "先落盘后记账":
+          ① 校验 uploadId / chunkIndex
+          ② MinIO: chunks/{uploadId}/{idx}
+          ③ Redis: SADD upload:chunks:{uploadId}
+                    │
+                    ▼
+          全部完成 → POST /media/api/chunk/merge
+                    │
+                    ▼
+          Redisson 分布式锁 lock:merge:{uploadId}
+                    │
+                    ▼
+          本地合并: 逐分片 copyObjectTo 下载到本地临时文件
+          (DigestOutputStream 边写边算全文件 MD5)
+                    │
+                    ▼
+          uploadLocalFile 回传 MinIO
+                    │
+                    ▼
+          ┌─────────┴─────────┐
+          ▼ (force 上传)      ▼ (普通上传)
+     MD5 比对同名文件      写 DB → 清理分片
+      ├相同: 删新+更新旧时间
+      └不同: 文件名加 (1)(2) 后缀
+                    │
+                    ▼
+  列表刷新 ←──── Redis 缓存清除
 ```
+
+**断点续传（两个场景）**：
+- **场景一（页面未刷新，File 对象仍在内存）**：上传中断/取消后，前端显示续传横幅，用户点击「继续上传」直接续传，无需重新选择文件。
+- **场景二（页面刷新，File 对象已丢失）**：用户重新选择同一文件，前端用文件指纹（`fileName + fileSize + lastModified`）匹配 localStorage 中的 uploadId，调 `/check` 获取已传分片后自动续传。
+
+**去重策略（三层）**：
+1. **init 阶段（轻量启发式）**：`(userId, fileName, fileSize)` 查 DB，命中则内嵌横幅提示「资料库中已存在」
+2. **坚持上传（force=true）**：跳过 init 去重，正常分片上传；合并后计算 MD5 与疑似重复文件比对
+   - MD5 相同 → 同一文件，删除新上传，更新旧记录 `upload_time` 使其排列到列表顶部
+   - MD5 不同 → 同名不同文件，文件名自动加 `(1)`、`(2)` 后缀
+3. **merge 阶段（精确 MD5）**：全文件 MD5 存入 `media_files.file_md5`，供后续精确去重
+
+**列表排序**：`ORDER BY upload_time DESC`（最新上传排顶部），去重替换时更新旧记录时间即可自然置顶。
 
 **关键文件**：
-- `MediaController.java:52-89` — 文件上传接口
-- `MediaController.java:92-137` — URL 上传接口
-- `MinioUtils.java:29-52` — MinIO 上传实现
-- `YtDlpUtils.java:22-87` — yt-dlp 视频下载
+- `ChunkController.java` — 分片上传 5 个 REST 端点
+- `ChunkUploadService.java` — 分片上传核心业务逻辑（含本地合并/去重/后缀生成）
+- `MinioUtils.java` — MinIO 分片/流式拷贝(copyObjectTo)/清理方法
+- `client/src/composables/useChunkedUpload.js` — 前端分片上传组合式函数（含文件指纹匹配）
+- `MediaController.java` — URL 上传（补算 MD5 去重）/ 列表查询与缓存
+- `MediaController.java:53-118` — URL 上传（yt-dlp 下载 → 算 MD5 → 去重 → 入库）
 
 ### 5.2 AI 异步分析流程 (核心链路)
 
@@ -202,55 +309,116 @@ VideoCourseAI-main/
 前端点击 "AI智能总结" ──► GET /debug/ai?id={mediaId}
                               │
                               ▼
-                    ┌─ Redisson 分布式锁 ─┐
-                    │ lock:analyze:{id}   │
-                    │ (防重复点击)         │
-                    └────────┬────────────┘
-                             │ 获取锁成功
+                    ┌─ 校验 aiStatus ───────────┐
+                    │ PENDING/PROCESSING         │
+                    │ → 幂等返回成功（不重复投递） │
+                    └────────┬──────────────────┘
+                             │ 非运行中
                              ▼
-                    ┌─ Redisson 令牌桶限流 ─┐
-                    │ limit:ai:global       │
-                    │ (10次/分钟, 防费用爆炸) │
-                    └────────┬──────────────┘
+                    ┌─ 提交侧幂等键 ────────────┐
+                    │ ContentTaskGate            │
+                    │   .tryMarkSubmitting()      │
+                    │ (30s TTL, 抢不到→返回成功)  │
+                    └────────┬──────────────────┘
+                             │ 获取成功
+                             ▼
+                    ┌─ 双层令牌桶限流 ──────────┐
+                    │ 用户级 5次/分 + 全局 30次/分│
+                    │ (真超限 429 / Redis 异常 503)│
+                    └────────┬──────────────────┘
                              │ 获取令牌成功
                              ▼
-                    ┌─ 更新状态为"排队中" ─┐
-                    │ 发送 AnalysisTaskMsg  │
-                    │ → RocketMQ            │
-                    │ topic: video-analysis │
-                    └────────┬──────────────┘
+                    ┌─ 置 PENDING ─────────────┐
+                    │ 发送 AnalysisTaskMsg      │
+                    │ (携带 contentHash)        │
+                    │ → RocketMQ                │
+                    │ → SSE 推送 PENDING 事件   │
+                    └────────┬──────────────────┘
                              │ 接口立即返回 ✅
-                             ▼
-          ┌─────────────────────────────────────┐
-          │     VideoAnalysisConsumer           │
-          │     (RocketMQ 消费者)                │
-          │     onMessage() → CompletableFuture  │
-          │     → 提交到 aiTaskExecutor 线程池   │
-          └────────────────┬────────────────────┘
-                           │
-                           ▼
-          ┌─────────────────────────────────────┐
-          │           AiService.asyncAnalyze()   │
-          │                                      │
-          │  1. Ffmpeg 提取音频 (extractAudio)   │
-          │  2. Aliyun ASR 语音转文字            │
-          │     (3次指数退避重试, 2s间隔)         │
-          │  3. DeepSeek AI 智能总结             │
-          │     (R1-Distill-Qwen-32B 模型)       │
-          │  4. 数据库更新 (aiSummary,            │
-          │     transcriptText)                  │
-          │  5. 删除 Redis 用户列表缓存           │
-          └─────────────────────────────────────┘
-                           │
-                           ▼
-              前端 3秒轮询检测 ──► 发现结果 ──► 侧边栏展示 Markdown
+                             │
+          ┌──────────────────┴────────────────────┐
+          │                                        │
+          ▼ 前端建立 SSE 连接                      ▼
+   GET /debug/task-events?id={id}    VideoAnalysisConsumer
+     &type=ai&userId={userId}         触发派发（@Async 提交线程池后 ACK）
+          │                            队列满 → 吞异常，交补偿兜底
+          ▼                                   │
+   ┌─────────────────────┐                   │ @Async
+   │ TaskEventService    │                   ▼
+   │ .subscribe()        │     ┌─────────────────────────────────────┐
+   │ - 查询当前状态      │     │        AiService.asyncAnalyze()      │
+   │ - 推送初始事件      │     │  contentTaskGate.inAnalysisLock()    │
+   │ - 注册到连接池      │     │  抢不到 → DEFER（让位，交补偿兜底）  │
+   │ - 等待后续事件      │     │  0. 结果复用(resolveAnalysis)         │
+   └──────┬──────────────┘     │  1. 转写(transcribeWithReuse)         │
+          │ 收到事件             │     内容级锁 + 归属复用               │
+          │ (Redis Pub/Sub)     │  2. DeepSeek 总结(generateSummaryFromText)│
+          ▼                     │  3. 写 aiStatus=SUCCESS / markFailed  │
+   前端实时更新侧边栏          │  4. 删 Redis 用户列表缓存             │
+   (PENDING→PROCESSING→SUCCESS)│  5. SSE 推送状态变更事件              │
+                               └────────────────┬────────────────────┘
+                                                │ 异常内部消化
+                                         ┌──────┴────────┐
+                                         ▼               ▼
+                                   retryable=false   retryable=true
+                                   落 FAILED + 台账   保持 PROCESSING
+                                                    + 刷新 ai_process_at
+                                                        │
+                                                        ▼
+                                     AnalysisCompensationScheduler（每 1min）
+                                     扫卡死记录：ai_attempts<3 重新触发 / >=3 落 FAILED
 ```
 
+**SSE 实时推送机制**（2026-09-13 新增）:
+
+- **端点**: `GET /debug/task-events?id={mediaId}&type={ai|transcribe}&userId={userId}`
+- **协议**: Server-Sent Events (text/event-stream)
+- **连接管理**: `TaskEventService` 维护连接池 `Map<String, List<SseEmitter>>`
+- **跨实例广播**: Redis Pub/Sub 频道 `videocourse:task-events`
+- **初始状态**: 连接建立时立即推送当前状态（查询数据库）
+- **事件格式**: `data: {"mediaId":65,"state":"PROCESSING","aiSummary":null,"error":null,"timestamp":1789288152156,"terminal":false}`
+- **终态自动关闭**: `SUCCESS` / `FAILED` 事件后自动 `emitter.complete()`
+- **权限校验**: 验证 userId 参数与文件归属
+- **心跳机制**: 每 25 秒推送 keepalive 注释行，防止反向代理超时
+- **降级策略**: Redis 故障时自动降级到本地推送（单实例仍可用）
+- **自动恢复**: 定时探测 Redis，恢复后重置 `redisAvailable` 标志
+
+**前端 SSE 集成**:
+
+- **连接管理**: `useTaskEvents.js` - 自动重连（指数退避，最大 15s，最多 10 次）
+- **终态识别**: 收到 `terminal: true` 事件后自动关闭连接
+- **生命周期**: 侧边栏关闭时调用 `taskStreams.stop()` 释放连接
+- **本地状态更新**: 事件到达后直接更新本地列表，无需轮询 `fetchList()`
+- **多标签页**: 本地列表不含 mediaId 时优雅忽略事件
+
+**状态流转**（枚举 `AiStatus`，独立字段替代文案判断）：
+
+```
+AI 分析：  NONE → PENDING → PROCESSING → SUCCESS / FAILED
+                (投递MQ)    (消费者接单)    (结果落库)
+
+文字提取： NONE → PROCESSING → SUCCESS / FAILED
+                (提交线程池)     (结果落库)
+```
+
+**异常分层**（沿调用链逐层上抛，每层只做该做的）：
+
+| 层 | 组件 | 职责 |
+|----|------|------|
+| L1 工具层 | `DeepSeekUtils` / `AliyunAsrUtils` | 模型级 3 次重试 + 语义化抛 `AiAnalysisException(retryable)` |
+| L2 策略层 | `AliyunDeepSeekStrategy` | 编排 FFmpeg/ASR/DeepSeek，异常透传 |
+| L3 服务层 | `AiService` | 状态机落库（SUCCESS/markFailed）+ 异常继续上抛 |
+| L4 消费层 | `VideoAnalysisConsumer` | 只做触发派发 + ACK，异常决策下沉到 `AiService` + `AnalysisCompensationScheduler` |
+| L5 Controller | `DebugController` | 统一 `Result` + `BusinessException` |
+
 **关键文件**：
-- `DebugController.java:53-103` — AI 分析入口
-- `VideoAnalysisConsumer.java:17-57` — MQ 消费者
-- `AiService.java:27-71` — 异步分析核心逻辑
-- `AliyunDeepSeekStrategy.java:15-109` — FFmpeg + ASR + AI 策略实现
+- `DebugController.java` — AI 分析入口（幂等键 + 双层限流 + 发 MQ）
+- `VideoAnalysisConsumer.java` — MQ 消费者（触发派发 + ACK，异常决策下沉）
+- `AiService.java` — 异步分析核心逻辑（状态机 + 结果/转写复用，`asyncAnalyze` 分发 Gate/Legacy）
+- `ContentTaskGate.java` — 内容级串行原语统一抽象（锁语义 + 提交标记 + 归属复用），详见 7.4
+- `AliyunDeepSeekStrategy.java:29-74` — FFmpeg + ASR + 总结策略实现
+- `RateLimitService.java:35-65` — 双层令牌桶限流
+- `AnalysisTaskKeys.java` — 分析任务 Key 定义 + contentHash 标准化
 
 ### 5.3 用户认证流程
 
@@ -281,37 +449,93 @@ VideoCourseAI-main/
 | avatar | VARCHAR | 头像 URL |
 | role | VARCHAR | 角色 (USER) |
 
-**media_files 表** (`MediaFile.java`)
+**media_files 表** (`MediaFile.java`) — 父表（V10 拆分后保留基础文件信息）
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | BIGINT (自增) | 主键 |
 | user_id | BIGINT | 上传者 ID |
 | filename | VARCHAR | 文件名 |
-| status | VARCHAR | 状态 (UPLOADED/COMPLETED) |
+| status | VARCHAR | 上传状态 (UPLOADED/COMPLETED) |
 | file_path | VARCHAR | MinIO 文件 URL |
-| ai_summary | TEXT | AI 总结内容 (Markdown) |
-| transcript_text | TEXT | 语音转写全文 |
+| file_size | BIGINT | 文件大小(字节) — 分片上传重构新增 |
+| file_md5 | VARCHAR(32) | 全文件 MD5 = 内容指纹 contentHash — 分片上传重构新增 |
+| ai_status | VARCHAR(32) | AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED — 状态字段化新增 |
+| transcript_status | VARCHAR(32) | 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED — 状态字段化新增 |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理，V6 新增） |
 | cover_url | VARCHAR | 封面 URL |
 | upload_time | DATETIME | 上传时间 (DB 自动填充) |
+
+**media_ai_analysis 表** (`MediaAiAnalysis.java`) — AI 分析子表（V10 拆分新增）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT (自增) | 主键 |
+| media_id | BIGINT | 外键关联 media_files.id |
+| status | VARCHAR(32) | AI 分析状态: NONE/PENDING/PROCESSING/SUCCESS/FAILED |
+| summary | TEXT | AI 总结内容 (Markdown) |
+| process_at | DATETIME | AI 分析最后处理时间（用于补偿调度器扫描卡死任务） |
+| attempts | INT | 当前补偿批次重试计数（V10 重命名，原 ai_attempts） |
+| compensation_attempts | INT | 补偿调度器累计重试计数（≥3 标记 FAILED） |
+| retry_count | INT | 用户 AI 分析手动重试次数（用于检测补偿调度器计数冲突） |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理，V11 新增） |
+| created_at | DATETIME | 记录创建时间 |
+| updated_at | DATETIME | 记录更新时间 |
+
+**media_transcription 表** (`MediaTranscription.java`) — 文字转写子表（V10 拆分新增）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT (自增) | 主键 |
+| media_id | BIGINT | 外键关联 media_files.id |
+| status | VARCHAR(32) | 文字提取状态: NONE/PROCESSING/SUCCESS/FAILED |
+| transcript_text | TEXT | 语音转写全文 |
+| process_at | DATETIME | 文字提取最后处理时间（用于文字提取补偿调度器） |
+| attempts | INT | 当前补偿批次重试计数（V10 重命名，原 transcript_attempts） |
+| compensation_attempts | INT | 文字提取补偿调度器累计重试计数（≥3 标记 FAILED） |
+| retry_count | INT | 用户文字提取手动重试次数（用于检测补偿调度器计数冲突） |
+| version | INT | 乐观锁版本号（MyBatis-Plus 自动管理，V11 新增） |
+| created_at | DATETIME | 记录创建时间 |
+| updated_at | DATETIME | 记录更新时间 |
+
+**failed_analysis_task 表** (`FailedAnalysisTask.java`) — AI 分析失败台账
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT (自增) | 主键 |
+| media_id | BIGINT | 关联 media_files.id |
+| error_type | VARCHAR | 异常类型（AiAnalysisException/Exception 等） |
+| error_msg | VARCHAR(2000) | 错误摘要（受控，不含堆栈） |
+| attempts | INT | 累计投递次数 |
+| created_at | DATETIME | 首次失败时间 |
 
 ### 6.2 Redis 缓存键设计
 
 | 缓存键 | 类型 | TTL | 说明 |
 |--------|------|-----|------|
 | `media:list:user:{userId}` | String (JSON) | 30 分钟 | 用户媒体列表缓存 |
-| `upload:chunked:{uploadId}` | String | 1 天 | 分片上传状态 |
-| `lock:analyze:{id}` | Redisson Lock | WatchDog | 分析任务分布式锁 |
-| `limit:ai:global` | RateLimiter | — | 全局 AI 调用限流 |
+| `media:md5:{mediaId}` | String | 7 天 | contentHash 缓存（免查库，`MediaService.contentHash`） |
+| `upload:meta:{uploadId}` | Hash | 48 小时 | 分片上传元数据 (fileName, fileSize, totalChunks, userId, status, forceUpload, createdAt, mediaId) |
+| `upload:chunks:{uploadId}` | Set | 48 小时 | 已完成分片序号集合 |
+| `lock:merge:{uploadId}` | Redisson RLock | WatchDog | 分片合并分布式锁（按会话） |
+| `analysis:active:{contentHash}` | String (SET NX) | 30s | 提交侧幂等键，抢不到→返回成功，失败回滚 |
+| `lock:analysis:{contentHash}` | Redisson RLock | WatchDog | 执行侧内容级分析锁（`asyncAnalyze` 内） |
+| `lock:analysis-context:{contentHash}` | Redisson RLock | WatchDog | 内容级转写锁 |
+| `analysis:context-owner:{contentHash}` | String | 7 天 | 转写结果归属（跨 mediaId 复用转写文本） |
+| `analysis:completed-owner:{contentHash}` | String | 7 天 | 分析结果归属（跨 mediaId 复用 summary） |
+| `limit:ai:user:{userId}` / `limit:ai:global` | RRateLimiter | — | AI 分析双层限流（用户/全局 |
+| `limit:transcribe:user:{userId}` / `limit:transcribe:global` | RRateLimiter | — | 文字提取双层限流（用户 10/分 + 全局 60/分） |
 
 ### 6.3 RocketMQ 消息
 
 **Topic**: `video-analysis-topic`  
 **ConsumerGroup**: `video-group`  
+**重试**: 补偿式重试（`AnalysisCompensationScheduler` 扫卡死记录重新触发，`ai_attempts` 上限 3）；`maxReconsumeTimes=2` 仅作消息异常防御  
 **消息体** (`AnalysisTaskMsg.java`):
 ```java
 {
-  "mediaId": Long,    // 媒体文件 ID
-  "action": String    // 动作类型 (START_ANALYSIS)
+  "mediaId": Long,       // 媒体文件 ID
+  "action": String,      // 动作类型 (START_ANALYSIS)
+  "contentHash": String, // 内容指纹（MD5 标准化），供消费侧内容级锁/幂等/复用
+  "force": Boolean       // 是否强制重新生成（跳过复用逻辑，V8 新增）
+}
+```
 }
 ```
 
@@ -325,26 +549,31 @@ VideoCourseAI-main/
 AiAnalysisStrategy (接口)
     │
     └── AliyunDeepSeekStrategy (实现, @Component("defaultAiStrategy"))
-            ├── transcribe()      → Ffmpeg 提取音频 → Aliyun ASR
-            └── generateSummary() → transcribe() → DeepSeek AI 总结
+            ├── transcribe(videoPath)          → FFmpeg 提取音频 → ASR (SiliconFlow TeleSpeechASR)
+            ├── generateSummary(videoPath)     → transcribe() → DeepSeek 总结
+            └── generateSummaryFromText(text)  → 复用已转写文本直接总结（避免重复 ASR）
 ```
 
 - **优势**：可通过 `@Qualifier` 切换不同的 AI 实现（如替换为 OpenAI、文心一言等）
+- **`generateSummaryFromText`**：配合内容级转写复用，同一内容只真正 ASR 一次，后续只做 LLM 总结
 - **文件**：`AiAnalysisStrategy.java`, `AliyunDeepSeekStrategy.java`
 
 ### 7.2 生产者-消费者模式 (Producer-Consumer)
 
 ```
-MediaController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consumer)
+DebugController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consumer)
                                                │
-                                        CompletableFuture
+                                        触发派发（@Async）
                                                │
-                                        aiTaskExecutor (线程池)
+                                      AiService.asyncAnalyze()
 ```
 
-- **解耦**：Controller 发送消息后立即返回（< 50ms），耗时分析异步进行
-- **削峰填谷**：MQ 缓冲任务，线程池控制并发（核心4线程，最大8线程，队列100）
-- **文件**：`DebugController.java:90-91`, `VideoAnalysisConsumer.java`, `ThreadPoolConfig.java`
+- **解耦**：Controller 发送消息后立即返回，耗时分析异步进行
+- **削峰填谷**：MQ 缓冲任务，消费线程快进快出（只派发不执行），执行在 `aiTaskExecutor`
+- **补偿式重试**：失败不靠 MQ 重投，瞬时失败保持 PROCESSING + 刷新 `ai_process_at`，由 `AnalysisCompensationScheduler` 定时扫卡死记录重试（`ai_attempts` 上限 3）
+- **文件**：`DebugController.java`, `VideoAnalysisConsumer.java`, `AnalysisCompensationScheduler.java`
+
+> 注：`aiTaskExecutor` 线程池（核心4/最大8/队列100，拒绝策略 `AbortPolicy`）同时承接 AI 分析 `asyncAnalyze` 与文字提取 `asyncTranscribe` 两个 `@Async` 任务。
 
 ### 7.3 缓存策略 (Cache-Aside)
 
@@ -355,34 +584,90 @@ MediaController (Producer) ──RocketMQ──► VideoAnalysisConsumer (Consum
 
 - **文件**：`MediaController.java:139-170` (列表查询缓存), `AiService.java:47-59` (分析完成后清除缓存)
 
-### 7.4 分布式锁 (Redisson + WatchDog)
+### 7.4 分布式锁 (Redisson + WatchDog) 与 ContentTaskGate 收敛
 
 ```
-lockKey = "lock:analyze:" + mediaId
-tryLock(0, -1, TimeUnit.SECONDS)  // 等待0秒, 自动续期(WatchDog)
+提交侧：contentTaskGate.tryMarkSubmitting(contentHash)   // 幂等键，非 RLock，30s TTL
+执行侧：contentTaskGate.inAnalysisLock(contentHash, action)   // 内容级分析锁，看门狗
+转写侧：contentTaskGate.inTranscribeLock(contentHash, action) // 内容级转写锁
 ```
 
-- **MD5 内容指纹去重**：同一视频的重复分析请求被锁拦截
+- **统一收敛**：原先分散在 `DebugController`/`AiService` 的「幂等键抢占/回滚」「锁获取/等待/释放」「归属复用查询/登记」六套语义，收敛为 `ContentTaskGate` 服务，用 `GateOutcome`（`PROCEED`/`REUSE`/`DEFER`）作为唯一返回契约
+- **强制不变量**：「跳过 ⇒ 复用或回滚」——`DEFER` 时调用方必须显式复用他人结果或回滚到可重试态，禁止静默成功
+- **身份 = contentHash**：锁以内容指纹为身份，而非 mediaId，实现跨 mediaId / 跨用户的串行化（换 mediaId 重复上传也被拦截）
+- **提交侧用幂等键**：秒级 TTL + 失败回滚，替代原 mediaId RLock（防重复点击）
 - **WatchDog 机制**：长耗时任务（AI 调用可达数分钟）自动续期，防止锁过期释放
-- **文件**：`DebugController.java:55-62`
+- **锁嵌套顺序**：`lock:analysis` → `lock:analysis-context`，固化进 `ContentTaskGate`（`asyncTranscribe` 仅拿 contextLock，无反向路径，不构成死锁）
+- **特性开关已下线**：`content.gate.enabled` 及配套的 Legacy 路径（`tryMarkSubmittingLegacy`/`asyncAnalyzeLegacy`/`transcribeWithReuseLegacy`）已于 2026-09-06 删除，现在只有 `ContentTaskGate` 一套实现
+- **文件**：`common/GateOutcome.java`（三态枚举）, `service/ContentTaskGate.java`（锁语义 + 提交标记 + 归属复用）, `controller/DebugController.java`（提交侧）, `service/AiService.java`（执行侧分析锁 + 转写锁）
+- **详见**：`plan/CONTENT_TASK_GATE_REFACTOR_PLAN.md`（收敛方案设计与迁移记录）
 
-### 7.5 令牌桶限流
-
-```
-RateType.OVERALL, 10 tokens/minute
-```
-
-- 全局每分钟最多 10 次 AI 分析请求，防止 API 费用爆炸
-- **文件**：`DebugController.java:65-74`
-
-### 7.6 指数退避重试
+### 7.5 令牌桶限流 (双层)
 
 ```
-ASR 请求: 最多3次重试, 遇到 5xx 错误等待2秒后重试
-AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
+AI 分析：  limit:ai:user:{userId} (5/分)  + limit:ai:global (30/分)
+文字提取： limit:transcribe:user:{userId} (10/分) + limit:transcribe:global (60/分)
 ```
 
-- **文件**：`AliyunAsrUtils.java:31-81`
+- **双层**：用户级 + 全局级，防止单用户刷爆配额 + 整体费用爆炸
+- **真超限 vs 异常**：真超限抛 `RATE_LIMITED`(429)；Redis 异常抛 `SERVICE_UNAVAILABLE`(503)，由 `ApiExceptionHandler` 按 `ErrorCode.httpStatus` 映射
+- **限流在提交侧（准入）**，锁在执行侧（`asyncAnalyze` 内互斥），身份统一为 contentHash
+- **文件**：`RateLimitService.java`
+
+### 7.6 统一响应体 (Result<T>)
+
+所有 API 统一返回 `Result<T>` JSON 结构：
+
+```json
+{ "code": 0, "message": "success", "data": {...} }
+```
+
+- `code == 0` 表示成功，非 0 承载业务/系统错误码
+- HTTP 状态码仅表达传输层语义，业务语义由 `code` 承载
+- `ErrorCode` 枚举集中管理错误码 (400/401/403/404/409/422/500)
+
+**文件**：`common/Result.java`, `common/ErrorCode.java`
+
+### 7.7 全局异常处理 (@RestControllerAdvice)
+
+`ApiExceptionHandler` 统一拦截 Controller 层异常，转换为 `Result` 响应：
+
+| 异常类型 | HTTP 状态码 | 说明 |
+|---------|------------|------|
+| `BusinessException` | 动态映射 | 携带 ErrorCode 语义（含 RATE_LIMITED→429、SERVICE_UNAVAILABLE→503） |
+| `MissingServletRequestParameterException` / `MethodArgumentTypeMismatchException` / `HttpMessageNotReadableException` | 400 | 参数缺失 / 类型不匹配 / 请求体不可读 |
+| `IllegalArgumentException` | 400 | 参数不合法 |
+| `IllegalStateException` | 409 | 状态冲突（如重复合并） |
+| `NoSuchElementException` | 404 | 资源不存在 |
+| `SecurityException` | 403 | 权限不足 |
+| `Exception` (兜底) | 500 | 未知异常不泄漏技术细节 |
+
+Controller 层无需 try-catch，专注业务逻辑。`ErrorCode` 通过 `httpStatus` 字段显式映射，避免 `HttpStatus.resolve(code)` 的数值巧合依赖。
+
+**文件**：`controller/ApiExceptionHandler.java`, `exception/BusinessException.java`, `common/ErrorCode.java`
+
+### 7.8 指数退避重试
+
+```
+ASR / DeepSeek: 最多 3 次重试, 遇 5xx/408/429 等待 2 秒后重试
+4xx 客户端错误: 直接抛 AiAnalysisException(retryable=false) 不重试
+```
+
+- **分层重试**：工具层做模型级 3 次重试，耗尽后抛 `AiAnalysisException(retryable=true)`，由消费层决定是否再走 MQ 重投
+- **文件**：`AliyunAsrUtils.java:40-102`, `DeepSeekUtils.java:129-178`
+
+### 7.9 内容身份化与结果复用 (MD5)
+
+```
+contentHash = normalizeContentHash(mediaId, fileMd5)   // 合法 MD5 小写；非法回退 media-{id}
+```
+
+- **身份统一**：锁、幂等、复用全链路以 contentHash 为身份，视频身份 = 内容指纹而非自增 id
+- **直传补算**：直传 / URL 上传前算 MD5 写 `fileMd5`（分片合并已有）；`MediaService.contentHash` 统一获取（Redis 缓存 `media:md5:{mediaId}` → DB → 标准化）
+- **转写复用**：`analysis:context-owner:{contentHash}` 记录归属，同一内容跨 mediaId 只 ASR 一次
+- **结果复用**：`analysis:completed-owner:{contentHash}` 记录归属，同一内容跨 mediaId 只完整分析一次（复制 summary + 转写文本）
+- **标准化回退**：历史数据（`fileMd5` 空 / 非 32 位）回退 `media-{id}`，功能不降级
+- **文件**：`AnalysisTaskKeys.java`, `MediaService.java:77-87`, `AiService.java:154-275`
 
 ---
 
@@ -421,8 +706,7 @@ AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
          │                 │                    │                     │
          │  Model:         │                    │  Model:             │
          │  TeleAI/        │                    │  deepseek-ai/       │
-         │  TeleSpeechASR  │                    │  DeepSeek-R1-       │
-         │                 │                    │  Distill-Qwen-32B   │
+         │  TeleSpeechASR  │                    │  DeepSeek-V3.2      │
          └─────────────────┘                    └─────────────────────┘
 ```
 
@@ -430,10 +714,10 @@ AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
 - API: `SiliconFlow → TeleAI/TeleSpeechASR`
 - 输入: MP3 音频文件 (MultipartFile)
 - 输出: 纯文本 transcription
-- 重试: 3次，5xx 错误等2秒重试
+- 重试: 3次，5xx/408/429 等2秒重试，4xx 直接抛 `AiAnalysisException(retryable=false)`
 
 **AI 智能总结**：
-- API: `SiliconFlow → DeepSeek-R1-Distill-Qwen-32B`
+- API: `SiliconFlow → DeepSeek-V3.2`
 - System Prompt: 设定为"信息架构师"角色
 - 输出格式: Markdown（核心摘要 → 深度洞察 → 原始内容精选 → 领域标签）
 - 超时: 连接60s, 读取300s
@@ -446,23 +730,51 @@ AI 请求: OkHttp 超时 5 分钟 (300s readTimeout)
 
 ### 10.1 技术特点
 
-- **单文件组件 (SFC)**：所有业务逻辑集中在 `App.vue`（约 890 行），未做组件拆分
+- **组件化拆分**：前端按功能模块拆分为 5 个组件 + 6 个组合式函数（Composable 单例），`App.vue` 仅负责布局组合与启动编排（约 30 行）
 - **赛博朋克风格**：自定义 CSS 变量、SVG 噪点背景、霓虹绿 (#c5f946) 主题色
-- **响应式状态**：Vue 3 Composition API (`ref`, `computed`, `onMounted`)
+- **响应式状态**：Vue 3 Composition API (`ref`, `computed`, `watch`, `onMounted`)
 - **Markdown 渲染**：`marked` 库解析 AI 返回的总结内容
-- **轮询机制**：3秒间隔轮询后端 `/media/list` 检测异步任务完成状态，5分钟强制超时兜底
+- **轮询机制**：3秒间隔轮询后端 `/media/list`，按 `aiStatus` / `transcriptStatus` 状态字段判断（SUCCESS/FAILED 结算，PENDING/PROCESSING 持续转圈）；连续 NONE 未启动约 30s 判定「任务未能启动」，10 分钟兜底判定「任务超时未完成」
 
 ### 10.2 前端功能模块
 
 | 功能 | 实现方式 |
 |------|---------|
 | 用户注册/登录 | 模态框 + localStorage 持久化 |
-| 本地上传 | `<input type="file">` + 拖拽 (drag & drop) + FormData |
+| 本地上传 | `<input type="file">` + 拖拽 (drag & drop) + 统一分片上传（小文件仅 1 片） |
+| 断点续传 | 场景一：内存 File + 续传横幅一键继续；场景二：文件指纹匹配 + 重新选择自动续传 |
+| 去重提示 | 内嵌横幅（红色警告）+ 坚持上传走 force 流程 |
 | URL 下载 | 输入框 + yt-dlp 后端下载 + 轮询结果 |
-| AI 分析 | 按钮触发 RocketMQ → 前端轮询检测 `##` 标记判定完成 |
-| 文字提取 | 异步提交 → 轮询结果 |
+| AI 分析 | 按钮触发 RocketMQ → SSE 实时推送状态（NONE → PENDING → PROCESSING → SUCCESS/FAILED），延迟 < 100ms |
+| 文字提取 | 异步提交 → SSE 实时推送状态（NONE → PROCESSING → SUCCESS/FAILED） |
 | 音频下载 | FFmpeg 转码 MP3 → Blob 下载 |
 | 视频删除 | DELETE 请求 + 前端列表移除 |
+| 工作台 | 单列横排列表，文件名左、按钮右 |
+
+### 10.3 前端目录结构与状态管理
+
+前端已从单文件（`App.vue` 约 1162 行）重构为按功能模块划分的多文件结构，采用 **Composable 单例** 共享状态（不引入 Pinia）。
+
+**分层职责**：
+
+| 层 | 目录/文件 | 职责 |
+|----|-----------|------|
+| 视图层 | `components/*.vue`（5 个） | 纯展示 + 事件触发，直接 import composable |
+| 状态/逻辑层 | `composables/*.js`（6 个） | 模块级响应式状态 + 业务逻辑，单例共享 |
+| 接口层 | `api/index.js` | 统一 `BASE_URL` 与全部后端请求，杜绝 URL 硬编码 |
+| 工具层 | `utils/format.js` | 通用格式化函数 |
+| 样式层 | `styles/main.css` | 全局样式（非 scoped，原 App.vue `<style>` 迁移） |
+
+**Composable 依赖关系（单向，无循环）**：
+
+```
+useNotice / useAuth / useChunkedUpload / useTaskEvents   ← 无依赖
+useUpload  → useChunkedUpload + useNotice + useAuth + useMedia + api
+useMedia   → useNotice + useAuth + useTaskEvents + api + marked
+useBootstrap → useAuth + useUpload          （仅编排启动顺序）
+```
+
+**首次数据加载**：`App.vue` 在 `onMounted` 调用 `useBootstrap.start()` → `restoreSession()` 恢复登录态 → `useMedia` 中的 `watch(currentUser)` 统一驱动列表刷新（登录刷新 / 登出清空），避免 `useAuth` 与 `useMedia` 形成循环依赖；`onUnmounted` 调用 `stop()` 注销 `beforeunload` 监听。
 
 ---
 
@@ -480,10 +792,13 @@ spring.datasource.url=jdbc:mysql://localhost:3307/media_db
 # 文件上传限制 (最大 2GB)
 spring.servlet.multipart.max-file-size=2048MB
 
-# AI API 密钥
-ai.deepseek.api-key=sk-xxx           # SiliconFlow API Key
+# AI 服务 (SiliconFlow)
+ai.deepseek.api-key=sk-xxx           # SiliconFlow API Key (ASR + 总结共用)
 ai.deepseek.base-url=https://api.siliconflow.cn/v1
-ai.aliyun.api-key=sk-xxx            # 阿里云 API Key
+ai.deepseek.model=deepseek-ai/DeepSeek-V3.2   # 智能总结模型
+ai.asr.url=https://api.siliconflow.cn/v1/audio/transcriptions
+ai.asr.model=TeleAI/TeleSpeechASR   # 语音识别模型
+# ai.aliyun.api-key                 # 遗留配置，代码已不再使用
 
 # MinIO 对象存储
 minio.endpoint=http://localhost:9000
@@ -509,7 +824,7 @@ rocketmq.producer.group=video-analysis-group
 | API 密钥 | 明文写在配置文件中 | 🟡 中 |
 | 跨域 | 全局允许所有来源 (`*`) | 🟡 中 |
 | 文件上传 | 无文件类型校验 (仅前端过滤) | 🟡 中 |
-| 限流 | Redis 令牌桶 (10次/分钟) | 🟢 低 |
+| 限流 | Redis 双层令牌桶 (用户/全局级) | 🟢 低 |
 | SQL 注入 | MyBatis Plus 参数化查询 | 🟢 低 |
 
 ---
@@ -518,53 +833,247 @@ rocketmq.producer.group=video-analysis-group
 
 1. **密码加密**：引入 BCrypt/SCrypt 对用户密码进行哈希存储
 2. **认证升级**：使用 JWT + Spring Security 替代简单的 token 机制
-3. **前端组件化**：将 App.vue 中的各功能模块拆分为独立组件（AuthPanel, UploadZone, WorkspaceCard, SidePanel 等）
-4. **配置安全**：API 密钥抽离到环境变量或 Spring Cloud Config / Vault
-5. **监控告警**：接入 Prometheus + Grafana 监控 MQ 积压、线程池状态、AI API 调用量
-6. **数据库优化**：对 `media_files.user_id` 和 `media_files.status` 建立索引
-7. **Function Calling**：README 中提到的基于 Function Calling 的智能问答功能尚未完整实现，可继续完善
-8. **AI Provider 扩展**：利用已有的策略模式，增加 OpenAI / 文心一言 / 通义千问等 provider
+3. **配置安全**：API 密钥抽离到环境变量或 Spring Cloud Config / Vault
+4. **监控告警**：接入 Prometheus + Grafana 监控 MQ 积压、线程池状态、AI API 调用量
+5. **数据库优化**：对 `media_files.user_id` 和 `media_files.status` 建立索引
+6. **Function Calling**：README 中提到的基于 Function Calling 的智能问答功能尚未完整实现，可继续完善
+7. **AI Provider 扩展**：利用已有的策略模式，增加 OpenAI / 文心一言 / 通义千问等 provider
 
 ---
 
-## 十四、文件清单
+## 十四、近期架构演进记录（2026-09-14 ~ 2026-09-18）
 
-### 后端 Java 文件 (22个)
+### 14.1 补偿调度器抽象重构（已完成）
+
+**背景**：AI 分析补偿调度器已实现，文字提取补偿调度器缺失，两者核心逻辑高度相似（90% 可复用）。
+
+**实施**：
+- ✅ 创建 `AbstractCompensationScheduler` 抽象基类，统一「分布式锁 + 扫描循环 + 乐观锁 + retryCount 冲突检测」通用逻辑
+- ✅ `AnalysisCompensationScheduler` 重构继承基类（代码量从 ~200 行降至 ~130 行）
+- ✅ 新增 `TranscriptionCompensationScheduler` 文字提取补偿调度器
+- ✅ V8 数据库迁移：新增 `transcript_compensation_attempts`、`transcript_retry_count`、`transcript_process_at` 字段及索引
+- ✅ `DebugController.transcribe()` 更新：用户手动重试时递增 `transcriptRetryCount` + 乐观锁保护
+
+**成果**：代码复用率达 90%，未来新增补偿调度器只需 100 行代码；文字提取卡死任务自动恢复机制上线。
+
+**详见**：`plan/COMPENSATION_SCHEDULER_REFACTOR_PLAN.md`
+
+### 14.2 重新生成功能（force 参数，已完成）
+
+**背景**：AI 分析失败或结果不满意时，无法直接重新生成，只能删除重新上传。
+
+**实施**：
+- ✅ 后端 `force` 参数支持：`AnalysisTaskMsg` 添加 `Boolean force` 字段，传递至 `AiService.asyncAnalyze()` / `asyncTranscribe()`
+- ✅ `force=true` 跳过复用逻辑（`resolveAnalysis` / `resolveTranscript`），不登记归属缓存（避免污染复用链）
+- ✅ 前端重新生成按钮：AI 分析（SUCCESS/FAILED 显示）、文字提取（仅 FAILED 显示），点击前确认弹窗
+- ✅ P0 修复：用户手动重试添加乐观锁（`DebugController.ai()` + `transcribe()`），防止覆盖补偿调度器结果
+- ✅ P1 修复：补偿调度器添加 `retryCount` 冲突检测，避免与用户手动重试计数混淆
+
+**设计原则**：简单（复用现有架构）、安全（限流 + 确认提示）、独立（不影响其他用户复用）。
+
+**详见**：`plan/REGENERATE_FEATURE_PLAN.md`
+
+### 14.3 系统性 Bug 修复（process_at 时间戳缺失）
+
+**问题**：所有任务完成路径（SUCCESS/FAILED/REUSE/ROLLBACK）缺失 `*_process_at` 时间戳更新，导致补偿调度器误判已完成任务为卡死状态，触发无限重试。
+
+**修复范围**（共 8 处）：
+- ✅ `AiService.transcribeWithReuse()` SUCCESS 路径
+- ✅ `AiService.asyncTranscribe()` FAILED 路径 + 超时回滚路径
+- ✅ `AiService.asyncAnalyze()` 无语音内容路径 + 正常分析路径
+- ✅ `AiService.markFailed()` 永久失败路径
+- ✅ `ContentTaskGate.resolveTranscript()` 复用路径
+- ✅ `ContentTaskGate.resolveAnalysis()` 复用路径
+
+**影响**：彻底解决补偿调度器误判问题，确保所有完成路径正确更新时间戳。
+
+### 14.4 数据库表拆分与补偿调度器子表适配（V10 + V11，已完成）
+
+**背景**：父表 `media_files` 承载 AI 分析 + 文字提取两套字段（共 12 个），职责不清晰，字段冗余。V10 拆分后补偿调度器仍依赖父表已移除字段，导致编译失败。
+
+**V10 数据库表拆分**：
+- ✅ 创建子表 `media_ai_analysis`（AI 分析字段：`status`, `summary`, `process_at`, `attempts`, `compensation_attempts`, `retry_count`）
+- ✅ 创建子表 `media_transcription`（文字提取字段：`status`, `transcript_text`, `process_at`, `attempts`, `compensation_attempts`, `retry_count`）
+- ✅ 父表 `media_files` 保留状态汇总字段（`ai_status`, `transcript_status`）+ 基础文件信息
+- ✅ 数据迁移：将现有数据从父表迁移至两张子表，保留原 `media_id` 关联
+- ✅ 创建对应 Mapper（`MediaAiAnalysisMapper`, `MediaTranscriptionMapper`）与 XML 自定义查询
+
+**V11 子表乐观锁支持**：
+- ✅ 子表添加 `version` 字段（`ALTER TABLE` + 实体类 `@Version` 注解）
+- ✅ 确保 MyBatis-Plus 乐观锁插件正确识别子表 `version` 字段
+
+**补偿调度器泛型重构**：
+- ✅ `AbstractCompensationScheduler` 改为 `AbstractCompensationScheduler<T>` 泛型基类
+- ✅ 移除对 `MediaFileMapper` / 父表字段的依赖
+- ✅ 新增抽象方法：`getChildTableMapper()`, `scanStalledTasks()`, `getMediaId()`, `getVersion()`, `getRetryCount()`, `getStatus()`, `getProcessAt()` 等
+- ✅ 递增计数与时间戳刷新改为直接操作子表（使用 `LambdaUpdateWrapper<T>` + 乐观锁）
+- ✅ `AnalysisCompensationScheduler` 重写为 `extends AbstractCompensationScheduler<MediaAiAnalysis>`
+- ✅ `TranscriptionCompensationScheduler` 重写为 `extends AbstractCompensationScheduler<MediaTranscription>`
+
+**MediaController 批量查询修复**：
+- ✅ `MediaController.list()` 批量查询改用外键 `media_id`（`LambdaQueryWrapper.in(MediaAiAnalysis::getMediaId, mediaIds)`），而非主键 `id`
+
+**AiService 适配**：
+- ✅ 查询/更新子表记录时使用 `media_id` 外键条件
+- ✅ 转写任务创建/重试时确保刷新子表 `process_at` 字段
+
+**编译验证**：
+- ✅ Maven 静默编译通过（`mvn -q -DskipTests compile`）
+- ✅ 泛型类型推断问题已修复（`LambdaUpdateWrapper` 编译错误）
+
+**Git 提交记录**（test 分支）：
+- ✅ 提交 1：补偿调度器子表适配修复（含 V11 迁移脚本、泛型重构、MediaController 修复）
+- ✅ 提交 2：泛型编译错误修复
+- ✅ 推送到远程仓库
+
+**成果**：
+- 数据库职责单一化：父表管状态汇总，子表管具体字段
+- 补偿调度器完全解耦父表依赖，直接操作子表
+- 编译通过且逻辑完整，可进行集成测试
+
+**详见**：`plan/COMPENSATION_SCHEDULER_CHILD_TABLE_FIX_PLAN.md`
+
+### 14.4 乐观锁 updateById 返回值全量巡查与修复（已完成）
+
+**背景**：`MybatisPlusConfig.java` 注册了 `OptimisticLockerInnerInterceptor` 后，所有带 `@Version` 字段实体（`MediaAiAnalysis`、`MediaTranscription`）的 `updateById()` 调用会自动拼接 `WHERE version=?` 条件——命中则更新并回填新 version，**未命中则静默返回 0，不抛异常**。补偿调度器在锁外使用原生 SQL 更新 `process_at`/`compensation_attempts`/`status` 字段时会推高 version，导致持锁中的 `updateById` 静默失败，未检查返回值的调用点会误以为落库成功，继续执行"宣布成功"动作（登记 Redis 归属、推送 SSE、返回结果）。
+
+**排查结果**：
+- 全量排查 `server/src/main/java` 目录下所有 `updateById` 调用，共 14 处
+- 5 处原本已安全（已检查返回值）
+- **9 处待修复**：4 处高危、3 处中危、2 处低危
+
+**修复范式**（统一采用）：
+```java
+int updated = mapper.updateById(entity);
+if (updated == 0) {
+    log.warn("乐观锁冲突，重新查询最新记录...");
+    Entity fresh = mapper.selectById(entity.getId());
+    if (fresh != null && !isTerminalState(fresh.getStatus())) {
+        fresh.setXxx(...);
+        int retryUpdated = mapper.updateById(fresh);
+        if (retryUpdated == 0) {
+            log.error("重试仍失败，放弃更新 id={}", entity.getId());
+        }
+    }
+}
+```
+
+**已修复 9 处**：
+- **Phase 1 (P0 高危，4 处)**：
+  - `ContentTaskGate.java:237` — resolveAnalysis 分析结果复用回填
+  - `ContentTaskGate.java:263` — resolveAnalysis 转写文本回填
+  - `ContentTaskGate.java:375` — resolveTranscript 转写结果复用回填
+  - `AiService.java:335` — transcribeWithReuse 真正转写成功落库
+- **Phase 2 (P1 中危，3 处)**：
+  - `AiService.java:203` — handleAnalysisException 瞬时失败分支
+  - `AiService.java:272` — asyncTranscribe 异常兜底落 FAILED
+  - `AiService.java:393` — markFailed 同步转写状态为 FAILED
+- **Phase 3 (P2 低危，2 处)**：
+  - `AiService.java:253` — asyncTranscribe 等待锁超时回滚 NONE
+  - `AiService.java:315` — transcribeWithReuse NONE→PROCESSING 刷新
+
+**编译验证**：
+- ✅ Phase 1 编译通过
+- ✅ Phase 2 编译通过
+- ✅ Phase 3 编译通过
+
+**成果**：
+- 全部 14 处 `updateById` 调用点已安全
+- 消除归属复用链污染风险（高危）
+- 消除向前端播报虚假成功的风险（高危）
+- 中危/低危问题加固，补偿容错性增强
+
+**详见**：`plan/OPTIMISTIC_LOCK_UPDATE_AUDIT_PLAN.md`
+
+---
+
+## 十五、文件清单
+
+### 后端 Java 文件 (35+个)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `ServerApplication.java` | 18 | Spring Boot 启动类 |
-| `config/MinioConfig.java` | 76 | MinIO 客户端初始化 + 桶策略 |
-| `config/ThreadPoolConfig.java` | 35 | AI 任务线程池配置 |
+| `common/Result.java` | 32 | 统一 API 响应体 (record) |
+| `common/ErrorCode.java` | 37 | 统一错误码枚举（含 httpStatus 显式映射） |
+| `common/AiStatus.java` | 22 | AI 分析/文字提取状态枚举 |
+| `common/GateOutcome.java` | 15 | ContentTaskGate 三态返回契约 |
+| `config/MinioConfig.java` | 76 | MinIO 客户端初始化 + 桶策略 + 生命周期 |
+| `config/ThreadPoolConfig.java` | 35 | AI 任务线程池配置（@Async 文字提取用） |
 | `config/WebConfig.java` | 24 | CORS 全局跨域配置 |
 | `controller/UserController.java` | 90 | 用户注册/登录 |
-| `controller/MediaController.java` | 198 | 媒体上传/列表/删除 |
-| `controller/DebugController.java` | 150 | AI分析/文字提取/音频下载 |
-| `service/MediaService.java` | 35 | 分片上传初始化 |
-| `service/AiService.java` | 103 | 异步 AI 分析 + 缓存清除 |
-| `consumer/VideoAnalysisConsumer.java` | 57 | RocketMQ 消费者 |
-| `strategy/AiAnalysisStrategy.java` | 20 | AI 分析策略接口 |
-| `strategy/impl/AliyunDeepSeekStrategy.java` | 71 | ASR + DeepSeek 实现 |
-| `dto/AnalysisTaskMsg.java` | 21 | RocketMQ 消息体 |
+| `controller/MediaController.java` | 179 | URL 上传（补算 MD5）/列表/删除 |
+| `controller/ChunkController.java` | 103 | 分片上传 5 个端点 |
+| `controller/DebugController.java` | 305 | AI分析（幂等键+限流+乐观锁）/文字提取/音频下载/SSE订阅 |
+| `controller/ApiExceptionHandler.java` | 105 | 全局异常处理 |
+| `service/MediaService.java` | 99 | 媒体处理服务（+calculateMd5/contentHash） |
+| `service/ChunkUploadService.java` | 449 | 分片上传核心逻辑（本地合并） |
+| `service/AiService.java` | 479 | 异步 AI 分析（状态机 + 内容复用 + force 支持 + 乐观锁防冲突） |
+| `service/ContentTaskGate.java` | 491 | 内容级串行原语统一收敛（锁语义+提交标记+归属复用 + 乐观锁防冲突） |
+| `service/TaskEventService.java` | 187 | SSE 实时推送服务（连接管理 + Redis Pub/Sub） |
+| `service/RateLimitService.java` | 71 | 双层令牌桶限流 |
+| `service/FailedAnalysisTaskService.java` | 44 | 失败台账服务（record） |
+| `service/AbstractCompensationScheduler.java` | 195 | 补偿调度器抽象基类（通用逻辑 + retryCount 冲突检测） |
+| `service/AnalysisCompensationScheduler.java` | 130 | AI 分析补偿调度器（继承抽象基类） |
+| `service/TranscriptionCompensationScheduler.java` | 130 | 文字提取补偿调度器（继承抽象基类，V8 新增） |
+| `consumer/VideoAnalysisConsumer.java` | 38 | RocketMQ 消费者（触发派发 + ACK） |
+| `consumer/VideoAnalysisDlqConsumer.java` | 33 | AI 分析死信兜底（落 FAILED） |
+| `exception/BusinessException.java` | 20 | 业务异常 |
+| `exception/AiAnalysisException.java` | 27 | 带 retryable 标志的 AI 异常 |
+| `strategy/AiAnalysisStrategy.java` | 26 | AI 分析策略接口 |
+| `strategy/impl/AliyunDeepSeekStrategy.java` | 76 | FFmpeg + ASR + DeepSeek 实现 |
+| `dto/AnalysisTaskMsg.java` | 35 | RocketMQ 消息体（+contentHash +force） |
+| `dto/ChunkUploadDTO.java` | 116 | 分片上传请求/响应 DTO |
+| `dto/TaskEvent.java` | 45 | SSE 任务事件 DTO（V8 新增） |
 | `entity/User.java` | 27 | 用户实体 |
-| `entity/MediaFile.java` | 30 | 媒体文件实体 |
+| `entity/MediaFile.java` | 52 | 媒体文件实体（+补偿字段 +时间戳字段 +乐观锁） |
+| `entity/FailedAnalysisTask.java` | 26 | AI 失败台账实体 |
 | `mapper/UserMapper.java` | 9 | 用户 DAO |
-| `mapper/MediaFileMapper.java` | 9 | 媒体文件 DAO |
-| `utils/MinioUtils.java` | 94 | MinIO 上传/删除工具 |
+| `mapper/MediaFileMapper.java` | 46 | 媒体文件 DAO（+selectStalledAnalysis +selectStalledTranscription +MD5 反查） |
+| `mapper/FailedAnalysisTaskMapper.java` | 9 | 台账 DAO |
+| `utils/MinioUtils.java` | 211 | MinIO 上传/删除/分片/流式拷贝（本地合并） |
 | `utils/YtDlpUtils.java` | 88 | yt-dlp 视频下载工具 |
-| `utils/DeepSeekUtils.java` | 123 | DeepSeek AI 调用 |
-| `utils/AliyunAsrUtils.java` | 83 | 阿里云 ASR 语音识别 |
-| `utils/FfmpegUtils.java` | 95 | FFmpeg 音频提取（统一入口） |
+| `utils/DeepSeekUtils.java` | 179 | DeepSeek AI 调用 |
+| `utils/AliyunAsrUtils.java` | 103 | 语音识别（SiliconFlow TeleSpeechASR） |
+| `utils/AnalysisTaskKeys.java` | 52 | 分析任务 Key + contentHash 标准化 |
+| `utils/FfmpegUtils.java` | 95 | FFmpeg 音频提取 |
+
+### 数据库迁移文件
+
+| 文件 | 版本 | 职责 |
+|------|------|------|
+| `V1__init.sql` | 1 | 初始化数据库结构 |
+| `V2__add_file_md5.sql` | 2 | 新增 file_md5 字段 + 索引 |
+| `V3__add_ai_status.sql` | 3 | 新增 ai_status 字段（AI 分析状态追踪） |
+| `V4__add_transcript_status.sql` | 4 | 新增 transcript_status 字段（文字提取状态追踪） |
+| `V5__add_analysis_indexes.sql` | 5 | 新增 file_md5 + ai_status 索引（优化归属复用查询） |
+| `V6__add_compensation_columns.sql` | 6 | 新增 ai_attempts + ai_process_at + analysis_retry_count 字段（补偿调度器支持） |
+| `V7__add_version_column.sql` | 7 | 新增 version 字段（乐观锁防冲突） |
+| `V8__add_transcript_compensation_columns.sql` | 8 | 新增 transcript_compensation_attempts + transcript_retry_count + transcript_process_at 字段及索引（文字提取补偿调度器支持） |
 
 ### 前端文件
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `App.vue` | 890+ | 全部前端 UI 与业务逻辑 |
-| `main.js` | 6 | Vue 应用入口 |
+| `App.vue` | 30 | 根组件（布局组合 + 启动编排） |
+| `main.js` | 5 | Vue 应用入口 |
+| `api/index.js` | 105 | 后端接口统一封装（BASE_URL + 全部请求） |
+| `utils/format.js` | 16 | formatSize / formatTime 格式化工具 |
+| `styles/main.css` | 274 | 全局样式（原 App.vue `<style>` 迁移） |
+| `composables/useChunkedUpload.js` | 399 | 分片上传核心（单例） |
+| `composables/useUpload.js` | 297 | 上传编排（文件/URL/续传/去重/进度） |
+| `composables/useMedia.js` | 268 | 列表/侧边栏/SSE 实时推送/删除/下载/转写/AI |
+| `composables/useTaskEvents.js` | 150 | SSE 连接管理（自动重连/终态识别/生命周期） |
+| `composables/useAuth.js` | 103 | 登录态 + 认证弹窗 |
+| `composables/useBootstrap.js` | 20 | 启动/卸载编排 |
+| `composables/useNotice.js` | 14 | 全局通知条（message + showMsg） |
+| `components/UploadZone.vue` | 147 | 上传区（磁贴/进度条/横幅） |
+| `components/VideoList.vue` | 64 | 工作台列表 |
+| `components/AuthModal.vue` | 41 | 登录/注册弹窗 |
+| `components/AppNavbar.vue` | 40 | 导航栏（品牌/登录/状态灯） |
+| `components/ResultSidebar.vue` | 30 | AI 总结 / 文字提取侧边栏 |
 | `vite.config.js` | 7 | Vite 构建配置 |
 | `index.html` | 14 | HTML 入口 |
-| `style.css` | — | 全局样式 |
 
 ---
 
@@ -572,10 +1081,14 @@ rocketmq.producer.group=video-analysis-group
 
 VideoCourseAI 是一个设计思路清晰的 **视频 + AI 异步处理平台**，核心亮点在于：
 
-1. **全链路异步化**：通过 RocketMQ + CompletableFuture + 线程池，将长耗时的 AI 分析从主请求链路剥离
-2. **分布式防护**：Redisson 分布式锁防重复处理 + 令牌桶限流保护 AI API 费用
-3. **面向失败设计**：ASR 3次指数退避重试、WatchDog 防止长任务锁过期、5分钟轮询超时兜底
-4. **策略模式扩展**：AI Provider 通过接口抽象，可灵活替换
-5. **容器化部署**：所有中间件 Docker Compose 一键启动
+1. **全链路异步化**：通过 RocketMQ + 触发派发（消费线程快进快出）+ 状态字段化 + 补偿式重试，将长耗时的 AI 分析从主请求链路剥离，失败可补偿、可台账
+2. **分片上传 + 断点续传**：5MB 固定切片，本地合并（`DigestOutputStream` 边写边算 MD5），Redis 维护上传状态；双场景续传（内存 File 横幅一键继续 + 文件指纹匹配自动恢复）；三层去重（init 轻量提示 + force 坚持上传 MD5 比对 + merge 精确 MD5）
+3. **内容身份化**：以 MD5 作为视频内容指纹（contentHash），锁 / 幂等 / 复用全链路以 contentHash 为身份，实现跨 mediaId / 跨用户的串行化与复用
+4. **分布式防护**：Redisson 分布式锁 (3.52.0) + 提交侧幂等键 + 双层令牌桶限流（真超限 429 / Redis 异常 503）
+5. **面向失败设计**：异常分层（retryable 语义）+ 双层重试（工具层 3 次 + MQ 重投）+ 失败台账 + WatchDog 防锁过期
+6. **状态字段化**：`AiStatus` 枚举独立表达状态，前端按字段判断，告别文案 `includes` 猜测
+7. **统一 API 规范**：`Result<T>` + `ErrorCode`(httpStatus) + `@RestControllerAdvice` 全局异常处理
+8. **策略模式扩展**：AI Provider 通过接口抽象，可灵活替换
+9. **容器化部署**：所有中间件 Docker Compose 一键启动
 
 技术栈成熟务实，适合作为 Spring Boot + RocketMQ + AI 集成方向的参考项目。
