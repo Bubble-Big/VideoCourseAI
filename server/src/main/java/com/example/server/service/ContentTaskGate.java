@@ -234,7 +234,27 @@ public class ContentTaskGate {
                 currentAnalysis.setSummary(owner.getSummary());
                 currentAnalysis.setStatus(AiStatus.SUCCESS.name());
                 currentAnalysis.setProcessAt(LocalDateTime.now());
-                aiAnalysisMapper.updateById(currentAnalysis);
+                int updated = aiAnalysisMapper.updateById(currentAnalysis);
+                if (updated == 0) {
+                    // 乐观锁冲突：重新查询最新记录
+                    MediaAiAnalysis latest = aiAnalysisMapper.selectOne(
+                        new LambdaQueryWrapper<MediaAiAnalysis>().eq(MediaAiAnalysis::getMediaId, mediaId)
+                    );
+                    if (latest == null || AiStatus.SUCCESS.name().equals(latest.getStatus())) {
+                        log.info("分析结果复用回填被跳过（记录已丢失或已为SUCCESS），mediaId={}", mediaId);
+                        return false;
+                    }
+                    // 基于最新 version 重试一次
+                    latest.setSummary(owner.getSummary());
+                    latest.setStatus(AiStatus.SUCCESS.name());
+                    latest.setProcessAt(LocalDateTime.now());
+                    int retried = aiAnalysisMapper.updateById(latest);
+                    if (retried == 0) {
+                        log.warn("分析结果复用回填重试仍冲突，放弃本次操作, mediaId={}", mediaId);
+                        return false;
+                    }
+                    currentAnalysis = latest;
+                }
             }
 
             // 转写文本一并复用（owner 分析成功必有转写）
@@ -260,12 +280,36 @@ public class ContentTaskGate {
                     currentTranscription.setTranscriptText(ownerTranscription.getTranscriptText());
                     currentTranscription.setStatus(AiStatus.SUCCESS.name());
                     currentTranscription.setProcessAt(LocalDateTime.now());
-                    transcriptionMapper.updateById(currentTranscription);
+                    int updatedTrans = transcriptionMapper.updateById(currentTranscription);
+                    if (updatedTrans == 0) {
+                        // 乐观锁冲突：重新查询最新记录
+                        MediaTranscription latestTrans = transcriptionMapper.selectOne(
+                            new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+                        );
+                        if (latestTrans == null || AiStatus.SUCCESS.name().equals(latestTrans.getStatus())) {
+                            log.info("转写结果复用回填被跳过（记录已丢失或已为SUCCESS），mediaId={}", mediaId);
+                            // 转写失败不影响分析结果已成功的事实，继续后续流程
+                        } else {
+                            // 基于最新 version 重试一次
+                            latestTrans.setTranscriptText(ownerTranscription.getTranscriptText());
+                            latestTrans.setStatus(AiStatus.SUCCESS.name());
+                            latestTrans.setProcessAt(LocalDateTime.now());
+                            int retriedTrans = transcriptionMapper.updateById(latestTrans);
+                            if (retriedTrans == 0) {
+                                log.warn("转写结果复用回填重试仍冲突，放弃本次操作, mediaId={}", mediaId);
+                                // 转写失败不影响分析结果已成功的事实，继续后续流程
+                            } else {
+                                currentTranscription = latestTrans;
+                            }
+                        }
+                    }
                 }
 
-                // SSE 推送：复用转写结果
-                taskEventService.publishTranscription(mediaId, AiStatus.SUCCESS.name(),
-                    ownerTranscription.getTranscriptText(), null);
+                // SSE 推送：复用转写结果（仅在成功落库或已存在时推送）
+                if (currentTranscription != null && AiStatus.SUCCESS.name().equals(currentTranscription.getStatus())) {
+                    taskEventService.publishTranscription(mediaId, AiStatus.SUCCESS.name(),
+                        ownerTranscription.getTranscriptText(), null);
+                }
             }
 
             rememberAnalysis(contentHash, owner.getMediaId());
@@ -372,7 +416,31 @@ public class ContentTaskGate {
                 currentTranscription.setTranscriptText(owner.getTranscriptText());
                 currentTranscription.setStatus(AiStatus.SUCCESS.name());
                 currentTranscription.setProcessAt(LocalDateTime.now());
-                transcriptionMapper.updateById(currentTranscription);
+                int updated = transcriptionMapper.updateById(currentTranscription);
+                if (updated == 0) {
+                    // 乐观锁冲突：重新查询最新记录
+                    MediaTranscription latest = transcriptionMapper.selectOne(
+                        new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+                    );
+                    if (latest == null || AiStatus.SUCCESS.name().equals(latest.getStatus())) {
+                        log.info("转写结果复用回填被跳过（记录已丢失或已为SUCCESS），mediaId={}", mediaId);
+                        // 已成功或丢失，直接返回 owner 的文本
+                        rememberTranscript(contentHash, owner.getMediaId());
+                        taskEventService.publishTranscription(mediaId, AiStatus.SUCCESS.name(),
+                            owner.getTranscriptText(), null);
+                        return owner.getTranscriptText();
+                    }
+                    // 基于最新 version 重试一次
+                    latest.setTranscriptText(owner.getTranscriptText());
+                    latest.setStatus(AiStatus.SUCCESS.name());
+                    latest.setProcessAt(LocalDateTime.now());
+                    int retried = transcriptionMapper.updateById(latest);
+                    if (retried == 0) {
+                        log.warn("转写结果复用回填重试仍冲突，放弃本次操作, mediaId={}", mediaId);
+                        return null;
+                    }
+                    currentTranscription = latest;
+                }
             }
 
             rememberTranscript(contentHash, owner.getMediaId());

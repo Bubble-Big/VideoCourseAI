@@ -1,10 +1,16 @@
 # 乐观锁 updateById 返回值巡查与修复计划书
 
-> 状态：**待实施**（创建于 2026-09-21）。
+> 状态：**✅ 已完成**（创建于 2026-09-21，完成于 2026-09-22）。
 >
 > 背景：`MybatisPlusConfig.java` 注册了 `OptimisticLockerInnerInterceptor` 后，所有带 `@Version` 字段实体（`MediaAiAnalysis`、`MediaTranscription`）的 `updateById()` 调用，会自动拼接 `WHERE version=?` 条件——命中则更新并回填新 version，**未命中则静默返回 0，不抛异常**。插件注册前，`updateById` 总是按主键精确命中，忽略返回值是安全的；插件注册后，任何未检查返回值的调用点都变成了潜在的"丢失更新"风险：数据库实际未落库，但代码继续走"成功"分支（登记 Redis 归属、推送 SSE、返回结果给调用方）。
 >
 > 本轮巡查由多条代码 review 报告触发（指出 `ContentTaskGate.java`、`AiService.java` 多处 `updateById` 未检查返回值），在此基础上对整个 `server/src/main/java` 做了全量 `updateById` 调用点排查，确认共 14 处调用，其中 5 处已安全，9 处存在不同程度的风险。
+>
+> **实施结果**：
+> - Phase 1 (P0 高危) 4 处修复：ContentTaskGate 归属查询/复用/转写查询 + AiService 转写成功落库
+> - Phase 2 (P1 中危) 3 处修复：AiService 瞬时失败刷新 + asyncTranscribe 失败兜底 + markFailed 同步转写状态
+> - Phase 3 (P2 低危) 2 处修复：asyncTranscribe 超时回滚 + transcribeWithReuse NONE→PROCESSING
+> - **共修复 9 处乐观锁冲突，全部通过编译验证**
 
 ---
 
@@ -29,19 +35,19 @@
 | AiService.java | 115 | asyncAnalyze（置 PROCESSING） | ✅ 已检查 | 安全 |
 | AiService.java | 136 | asyncAnalyze（无语音落 SUCCESS） | ✅ 已检查 | 安全 |
 | AiService.java | 160 | asyncAnalyze（正常落 SUCCESS） | ✅ 已检查 | 安全 |
-| AiService.java | 203 | handleAnalysisException（瞬时失败保持 PROCESSING） | ❌ 未检查 | 中危 |
-| AiService.java | 253 | asyncTranscribe（等待锁超时回滚 NONE） | ❌ 未检查 | 低危 |
-| AiService.java | 272 | asyncTranscribe（异常兜底落 FAILED） | ❌ 未检查 | 中危 |
-| AiService.java | 315 | transcribeWithReuse（NONE→PROCESSING 刷新） | ❌ 未检查 | 低危 |
-| AiService.java | 335 | transcribeWithReuse（真正转写成功落 SUCCESS） | ❌ 未检查 | **高危** |
+| AiService.java | 203 | handleAnalysisException（瞬时失败保持 PROCESSING） | ✅ 已修复 | 安全 |
+| AiService.java | 253 | asyncTranscribe（等待锁超时回滚 NONE） | ✅ 已修复 | 安全 |
+| AiService.java | 272 | asyncTranscribe（异常兜底落 FAILED） | ✅ 已修复 | 安全 |
+| AiService.java | 315 | transcribeWithReuse（NONE→PROCESSING 刷新） | ✅ 已修复 | 安全 |
+| AiService.java | 335 | transcribeWithReuse（真正转写成功落 SUCCESS） | ✅ 已修复 | 安全 |
 | AiService.java | 364 | markFailed（aiAnalysis 落 FAILED） | ✅ 已修复 | 安全 |
 | AiService.java | 380 | markFailed（重试一次落 FAILED） | ✅ 已修复 | 安全 |
-| AiService.java | 393 | markFailed（同步转写记录落 FAILED） | ❌ 未检查 | 中危 |
-| ContentTaskGate.java | 237 | resolveAnalysis（分析结果复用回填） | ❌ 未检查 | **高危** |
-| ContentTaskGate.java | 263 | resolveAnalysis（一并回填转写文本） | ❌ 未检查 | **高危** |
-| ContentTaskGate.java | 375 | resolveTranscript（转写结果复用回填） | ❌ 未检查 | **高危** |
+| AiService.java | 393 | markFailed（同步转写记录落 FAILED） | ✅ 已修复 | 安全 |
+| ContentTaskGate.java | 237 | resolveAnalysis（分析结果复用回填） | ✅ 已修复 | 安全 |
+| ContentTaskGate.java | 263 | resolveAnalysis（一并回填转写文本） | ✅ 已修复 | 安全 |
+| ContentTaskGate.java | 375 | resolveTranscript（转写结果复用回填） | ✅ 已修复 | 安全 |
 
-共 **9 处待修复**：4 处高危、3 处中危、2 处低危。
+**全部 14 处调用点已安全**：5 处原本已检查 + 9 处本轮修复完成。
 
 ---
 

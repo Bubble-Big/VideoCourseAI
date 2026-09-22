@@ -1,7 +1,7 @@
 # VideoCourseAI — 智能视频内容理解平台 架构分析文档
 
 > 分析日期：2026-08-15  
-> 最后更新：2026-09-18  
+> 最后更新：2026-09-22  
 > 项目仓库：https://github.com/Bubble-Big/VideoCourseAI
 
 ---
@@ -933,6 +933,58 @@ rocketmq.producer.group=video-analysis-group
 
 **详见**：`plan/COMPENSATION_SCHEDULER_CHILD_TABLE_FIX_PLAN.md`
 
+### 14.4 乐观锁 updateById 返回值全量巡查与修复（已完成）
+
+**背景**：`MybatisPlusConfig.java` 注册了 `OptimisticLockerInnerInterceptor` 后，所有带 `@Version` 字段实体（`MediaAiAnalysis`、`MediaTranscription`）的 `updateById()` 调用会自动拼接 `WHERE version=?` 条件——命中则更新并回填新 version，**未命中则静默返回 0，不抛异常**。补偿调度器在锁外使用原生 SQL 更新 `process_at`/`compensation_attempts`/`status` 字段时会推高 version，导致持锁中的 `updateById` 静默失败，未检查返回值的调用点会误以为落库成功，继续执行"宣布成功"动作（登记 Redis 归属、推送 SSE、返回结果）。
+
+**排查结果**：
+- 全量排查 `server/src/main/java` 目录下所有 `updateById` 调用，共 14 处
+- 5 处原本已安全（已检查返回值）
+- **9 处待修复**：4 处高危、3 处中危、2 处低危
+
+**修复范式**（统一采用）：
+```java
+int updated = mapper.updateById(entity);
+if (updated == 0) {
+    log.warn("乐观锁冲突，重新查询最新记录...");
+    Entity fresh = mapper.selectById(entity.getId());
+    if (fresh != null && !isTerminalState(fresh.getStatus())) {
+        fresh.setXxx(...);
+        int retryUpdated = mapper.updateById(fresh);
+        if (retryUpdated == 0) {
+            log.error("重试仍失败，放弃更新 id={}", entity.getId());
+        }
+    }
+}
+```
+
+**已修复 9 处**：
+- **Phase 1 (P0 高危，4 处)**：
+  - `ContentTaskGate.java:237` — resolveAnalysis 分析结果复用回填
+  - `ContentTaskGate.java:263` — resolveAnalysis 转写文本回填
+  - `ContentTaskGate.java:375` — resolveTranscript 转写结果复用回填
+  - `AiService.java:335` — transcribeWithReuse 真正转写成功落库
+- **Phase 2 (P1 中危，3 处)**：
+  - `AiService.java:203` — handleAnalysisException 瞬时失败分支
+  - `AiService.java:272` — asyncTranscribe 异常兜底落 FAILED
+  - `AiService.java:393` — markFailed 同步转写状态为 FAILED
+- **Phase 3 (P2 低危，2 处)**：
+  - `AiService.java:253` — asyncTranscribe 等待锁超时回滚 NONE
+  - `AiService.java:315` — transcribeWithReuse NONE→PROCESSING 刷新
+
+**编译验证**：
+- ✅ Phase 1 编译通过
+- ✅ Phase 2 编译通过
+- ✅ Phase 3 编译通过
+
+**成果**：
+- 全部 14 处 `updateById` 调用点已安全
+- 消除归属复用链污染风险（高危）
+- 消除向前端播报虚假成功的风险（高危）
+- 中危/低危问题加固，补偿容错性增强
+
+**详见**：`plan/OPTIMISTIC_LOCK_UPDATE_AUDIT_PLAN.md`
+
 ---
 
 ## 十五、文件清单
@@ -956,8 +1008,8 @@ rocketmq.producer.group=video-analysis-group
 | `controller/ApiExceptionHandler.java` | 105 | 全局异常处理 |
 | `service/MediaService.java` | 99 | 媒体处理服务（+calculateMd5/contentHash） |
 | `service/ChunkUploadService.java` | 449 | 分片上传核心逻辑（本地合并） |
-| `service/AiService.java` | 341 | 异步 AI 分析（状态机 + 内容复用 + force 支持） |
-| `service/ContentTaskGate.java` | 349 | 内容级串行原语统一收敛（锁语义+提交标记+归属复用） |
+| `service/AiService.java` | 479 | 异步 AI 分析（状态机 + 内容复用 + force 支持 + 乐观锁防冲突） |
+| `service/ContentTaskGate.java` | 491 | 内容级串行原语统一收敛（锁语义+提交标记+归属复用 + 乐观锁防冲突） |
 | `service/TaskEventService.java` | 187 | SSE 实时推送服务（连接管理 + Redis Pub/Sub） |
 | `service/RateLimitService.java` | 71 | 双层令牌桶限流 |
 | `service/FailedAnalysisTaskService.java` | 44 | 失败台账服务（record） |

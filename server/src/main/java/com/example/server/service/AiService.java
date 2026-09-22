@@ -200,7 +200,10 @@ public class AiService {
         // 瞬时失败 / 未预期异常：保持 PROCESSING + 刷新时间戳，等定时补偿重试
         aiAnalysis.setStatus(AiStatus.PROCESSING.name());
         aiAnalysis.setProcessAt(LocalDateTime.now());
-        aiAnalysisMapper.updateById(aiAnalysis);
+        int updated = aiAnalysisMapper.updateById(aiAnalysis);
+        if (updated == 0) {
+            log.info("瞬时失败刷新 processAt 被跳过（版本冲突，记录已被并发路径更新），mediaId={}", mediaId);
+        }
 
         // SSE 推送：PROCESSING（瞬时失败，等待重试）
         taskEventService.publishAnalysis(mediaId, AiStatus.PROCESSING.name(), null, null);
@@ -250,7 +253,10 @@ public class AiService {
                 if (transcription != null) {
                     transcription.setStatus(AiStatus.NONE.name());
                     transcription.setProcessAt(null);
-                    transcriptionMapper.updateById(transcription);
+                    int updated = transcriptionMapper.updateById(transcription);
+                    if (updated == 0) {
+                        log.info("等待锁超时回滚 NONE 被跳过（版本冲突），mediaId={}", mediaId);
+                    }
                 }
                 evictCache(mediaFile);
                 log.info("等待转写锁超时，回滚待重试, mediaId={} contentHash={}", mediaId, contentHash);
@@ -269,7 +275,25 @@ public class AiService {
                 transcription.setStatus(AiStatus.FAILED.name());
                 transcription.setTranscriptText(null);
                 transcription.setProcessAt(LocalDateTime.now());
-                transcriptionMapper.updateById(transcription);
+                int updated = transcriptionMapper.updateById(transcription);
+                if (updated == 0) {
+                    // 乐观锁冲突：重新查询最新记录
+                    MediaTranscription latest = transcriptionMapper.selectOne(
+                        new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+                    );
+                    if (latest == null || AiStatus.FAILED.name().equals(latest.getStatus())) {
+                        log.info("转写失败落库被跳过（记录已丢失或已为FAILED），mediaId={}", mediaId);
+                    } else {
+                        // 基于最新 version 重试一次
+                        latest.setStatus(AiStatus.FAILED.name());
+                        latest.setTranscriptText(null);
+                        latest.setProcessAt(LocalDateTime.now());
+                        int retried = transcriptionMapper.updateById(latest);
+                        if (retried == 0) {
+                            log.warn("转写失败落库重试仍冲突，放弃本次操作, mediaId={}", mediaId);
+                        }
+                    }
+                }
             }
             evictCache(mediaFile);
 
@@ -312,7 +336,10 @@ public class AiService {
                 // 重试时刷新 process_at
                 transcription.setStatus(AiStatus.PROCESSING.name());
                 transcription.setProcessAt(LocalDateTime.now());
-                transcriptionMapper.updateById(transcription);
+                int updated = transcriptionMapper.updateById(transcription);
+                if (updated == 0) {
+                    log.info("NONE→PROCESSING 刷新被跳过（版本冲突），mediaId={}", mediaFile.getId());
+                }
             }
 
             // 锁内先查复用（force=true 时跳过复用）
@@ -332,7 +359,28 @@ public class AiService {
             transcription.setTranscriptText(text);
             transcription.setStatus(AiStatus.SUCCESS.name());
             transcription.setProcessAt(LocalDateTime.now());
-            transcriptionMapper.updateById(transcription);
+            int updated = transcriptionMapper.updateById(transcription);
+            if (updated == 0) {
+                // 乐观锁冲突：重新查询最新记录
+                MediaTranscription latest = transcriptionMapper.selectOne(
+                    new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaFile.getId())
+                );
+                if (latest == null || AiStatus.SUCCESS.name().equals(latest.getStatus())) {
+                    log.info("转写结果落库被跳过（记录已丢失或已为SUCCESS），mediaId={}", mediaFile.getId());
+                    // 已成功，继续后续流程
+                } else {
+                    // 基于最新 version 重试一次
+                    latest.setTranscriptText(text);
+                    latest.setStatus(AiStatus.SUCCESS.name());
+                    latest.setProcessAt(LocalDateTime.now());
+                    int retried = transcriptionMapper.updateById(latest);
+                    if (retried == 0) {
+                        log.warn("转写结果落库重试仍冲突，放弃本次操作, mediaId={}", mediaFile.getId());
+                        return GateOutcome.DEFER;
+                    }
+                    transcription = latest;
+                }
+            }
 
             // force=true 时不登记归属，避免污染复用链
             if (!Boolean.TRUE.equals(force)) {
@@ -390,7 +438,24 @@ public class AiService {
         );
         if (transcription != null && !AiStatus.SUCCESS.name().equals(transcription.getStatus())) {
             transcription.setStatus(AiStatus.FAILED.name());
-            transcriptionMapper.updateById(transcription);
+            int updatedTrans = transcriptionMapper.updateById(transcription);
+            if (updatedTrans == 0) {
+                // 乐观锁冲突：重新查询最新记录
+                MediaTranscription latestTrans = transcriptionMapper.selectOne(
+                    new LambdaQueryWrapper<MediaTranscription>().eq(MediaTranscription::getMediaId, mediaId)
+                );
+                if (latestTrans == null || AiStatus.SUCCESS.name().equals(latestTrans.getStatus())
+                        || AiStatus.FAILED.name().equals(latestTrans.getStatus())) {
+                    log.info("转写同步 FAILED 被跳过（记录已丢失或已为最终态），mediaId={}", mediaId);
+                } else {
+                    // 基于最新 version 重试一次
+                    latestTrans.setStatus(AiStatus.FAILED.name());
+                    int retriedTrans = transcriptionMapper.updateById(latestTrans);
+                    if (retriedTrans == 0) {
+                        log.warn("转写同步 FAILED 重试仍冲突，放弃本次操作, mediaId={}", mediaId);
+                    }
+                }
+            }
         }
 
         MediaFile mediaFile = mediaFileMapper.selectById(mediaId);
