@@ -44,9 +44,10 @@ String contentHash = AnalysisTaskKeys.normalizeContentHash(
 VideoContext reused = reuseContentContext(mediaFile, userGoal, traceId, contentHash);
 ```
 - **触发条件**：不同 mediaId 但 MD5 相同（重复上传）
-- **Redis 键**：`context:owner:{contentHash}` → 归属 mediaId
-- **有效期**：7 天
+- **Redis 键**：`analysis:context-owner:{contentHash}`（`AnalysisTaskKeys.contextOwner()`）→ 归属 mediaId
+- **有效期**：需结合归属键实际写入逻辑确认（本文未独立核实该 TTL 数字）
 - **适用场景**：多用户上传同一视频，或同一用户重复上传
+- **兜底**：`AnalysisTaskKeys.normalizeContentHash()` 在 `mediaService.contentHash()` 返回值不是合法 32 位十六进制 MD5 时，会退化为 `"media-" + mediaId`。此时 contentHash 与 mediaId 一一绑定，不会产生真正的内容级复用命中
 
 #### 第三级：内容级分布式锁
 ```java
@@ -90,33 +91,35 @@ Future<BranchResult<FramePart>> frameFuture = submitBranch(
 **执行服务**：`SegmentedTranscriptionService.transcribe()`
 
 **处理流程**：
-1. **音频提取**：FFmpeg 从视频中提取音频（MP3 格式）
-   ```bash
-   ffmpeg -i <视频路径> -vn -acodec mp3 -ar 16000 -ac 1 <输出.mp3>
-   ```
-
-2. **时长检测**：获取音频时长，超过阈值则分段处理
+1. **固定按 60 秒切片**：不做时长判断，一律用 FFmpeg `segment` 滤镜强制切片（`SegmentedTranscriptionService.java:82-90`）
    ```java
-   double durationSeconds = detectDuration(audioPath);
-   if (durationSeconds > SEGMENT_DURATION_SECONDS) {
-       return transcribeSegmented(audioPath, durationSeconds, traceId);
-   }
+   new ProcessBuilder(
+           "ffmpeg", "-y", "-i", videoPath,
+           "-vn", "-acodec", "libmp3lame",
+           "-f", "segment", "-segment_time", "60", "-reset_timestamps", "1",
+           outputPattern.toString())
    ```
+   输出为 `audio_%03d.mp3` 序列文件，每段固定 60 秒（最后一段可能不足 60 秒）。
 
-3. **语音识别**：调用第三方 ASR API（SiliconFlow / 阿里云）
+2. **逐片段调用阿里云 ASR**：按文件名排序后逐个识别，单片失败不影响其他片段
    ```java
-   // 短视频：一次性识别
-   String transcriptText = asrUtils.recognize(audioPath.toFile());
-   
-   // 长视频：分段识别后合并
-   List<TranscriptSegment> segments = new ArrayList<>();
-   for (SegmentJob job : segmentJobs) {
-       String text = asrUtils.recognize(job.audioFile());
-       segments.add(new TranscriptSegment(job.startMs(), job.endMs(), text));
+   // SegmentedTranscriptionService.java:44-58
+   for (int i = 0; i < audioFiles.size(); i++) {
+       try {
+           String text = aliyunAsrUtils.audioToText(audioFile.toString());
+           if (text != null && !text.isBlank()) {
+               result.add(new TranscriptSegment(i * SEGMENT_MS, (i + 1) * SEGMENT_MS, text));
+           }
+       } catch (RuntimeException e) {
+           failedSegments++;
+           // 记录失败，继续处理下一片段
+       }
    }
+   // 只有全部片段都失败时才抛异常，单片失败允许整体继续
    ```
+   实际 ASR 调用方法是 `AliyunAsrUtils.audioToText(String filePath)`，不是通用的 `asrUtils.recognize(File)`。
 
-4. **返回结构**：
+3. **返回结构**：`TranscriptSegment` 是独立 DTO（`com.example.server.dto.TranscriptSegment`），不是 `SegmentedTranscriptionService` 内部定义的 record：
    ```java
    record TranscriptSegment(long startMs, long endMs, String text) {}
    ```
@@ -165,7 +168,7 @@ telemetry.increment(traceId, "ocrCalls", 1);
 ocrText = ocrUtils.recognize(frameFiles.get(i).toFile());
 ```
 
-**调用链**：`OcrUtils` → 百度 OCR / 阿里云 OCR → 返回文字
+**调用链**：`OcrUtils` 通过 `ProcessBuilder` 调用本地命令行工具 **Tesseract**（默认命令 `tesseract`，可通过 `tool.ocr.command` 配置），以 `chi_sim+eng` 双语言参数识别图片文字后返回结果，并非调用百度/阿里云等云端 OCR API
 
 ##### 3.4 证据帧上传
 ```java
@@ -281,30 +284,34 @@ try {
 
 #### 输入
 ```java
-// AgentLoopService.java:154-166
+// AgentLoopService.java:109（selectRelevant）与 164（plan() 调用，位于 resolvePlan 内部）
 VideoContext relevantContext = longVideoContextService.selectRelevant(mediaId, context);
-AgentState.AgentPlan plan = deepSeekUtils.plan(context, planInstruction(profile));
+...
+plan = deepSeekUtils.plan(context, planInstruction(profile));
 ```
+注：`selectRelevant` 和 `plan()` 调用并不在同一处代码块，前者在 `runWithinBudget` 方法第109行，后者在 `resolvePlan` 方法第164行。
 
 #### Planner Prompt 结构
-```text
-你是一个视频内容分析的任务规划师。用户目标：{userGoal}
-
-视频上下文摘要：
-[00:00-01:00] ASR: {transcript} | OCR: {ocrTexts}
-[01:00-02:00] ASR: {transcript} | OCR: {ocrTexts}
-...
-
-请将用户目标拆解为 2-5 个具体子任务，返回 JSON：
+实际 Prompt（`DeepSeekUtils.plan()`）并非人工格式化的时间轴文本，而是把整个 `VideoContext` 对象直接序列化为 JSON 拼接进去：
+```java
+// DeepSeekUtils.java:98-109
+你是 Video Agent 的 Planner。理解用户目标，并拆成 1 到 5 个可执行任务。
+任务必须能够仅依靠 VideoContext 中的 ASR、OCR 和时间戳证据完成。
+任务按执行顺序排列，每项只描述一个可验证的分析动作。
+只返回 JSON：
 {
-  "understoodGoal": "对用户目标的理解",
-  "tasks": ["子任务1", "子任务2", ...]
+  "understoodGoal": "对用户目标的明确理解",
+  "tasks": ["任务1", "任务2", "任务3"]
 }
+VideoContext:
+{ /* objectMapper.writeValueAsString(context) 序列化的完整 VideoContext JSON */ }
 ```
+- 任务数量下限是 **1**，不是 2（即"1 到 5 个"，非"2-5 个"）。
+- 模式相关的额外拆解要求通过 `modeSuffix()` 追加在末尾，GENERAL 模式下为空串。
 
 #### 输出验证
 ```java
-// AgentLoopService.java:250-257
+// AgentLoopService.java:251-257
 private boolean isPlanValid(AgentState.AgentPlan plan) {
     return plan != null 
         && plan.understoodGoal() != null && !plan.understoodGoal().isBlank()
@@ -320,7 +327,14 @@ private boolean isPlanValid(AgentState.AgentPlan plan) {
 // AgentLoopService.java:174
 checkpointService.savePlan(mediaId, context.userGoal(), modeOf(profile), plan);
 ```
-- **Redis 键**：`checkpoint:plan:{mediaId}:{goalDigest}:{mode}`
+- **Redis 键格式**：实际前缀是 `agent:checkpoint:`，不是 `checkpoint:`。`AgentCheckpointService` 中真实的 key 拼接逻辑（`AgentCheckpointService.java:291-321`）：
+  ```java
+  private String checkpointKey(Long mediaId) { return "agent:checkpoint:" + mediaId; }
+  private String goalKey(Long mediaId, String goal, AnalysisMode mode) {
+      return checkpointKey(mediaId) + ":goal:" + AnalysisTaskKeys.goalDigest(goal, mode);
+  }
+  ```
+  即最终 key 形如 `agent:checkpoint:{mediaId}:goal:{goalDigest}`，`mode` 并非明文拼接的独立段，而是被编码进 `goalDigest`（`AnalysisTaskKeys.goalDigest(goal, mode)` 对模式名和目标文本一起做 SHA-256）。`"plan"`/`"criticState"` 等字段名是传给 `AgentCheckpointRepository` 的字段标识符，而不是 Redis key 的一部分。
 - **作用**：MQ 重投时直接复用，避免重复调用 LLM
 
 ---
@@ -335,55 +349,52 @@ AnalysisResult result = deepSeekUtils.execute(
 ```
 
 #### Executor Prompt 结构
+实际 Prompt（`DeepSeekUtils.execute()`，`DeepSeekUtils.java:260-286`）也是把 Plan/PreviousCritique/VideoContext 直接序列化为 JSON 拼接，输出字段名与文档此前版本不同：
 ```text
-你是视频内容分析执行器。根据以下任务计划生成结构化分析报告：
+你是 Video Agent 的 Executor。按照计划分析 VideoContext 并生成结构化产物。
+逐项执行 Plan 中的任务，最终产物必须覆盖全部任务。
+conclusions 中的每条结论都必须至少绑定一条真实证据。
+evidence.claim 必须原样复制它所支持的 conclusion，timestampMs 必须落在原始片段内，source 只能是 ASR、OCR 或 ASR+OCR。
+不得使用视频上下文之外的事实。
+如果存在 Critic 反馈，只修正被指出的问题，并保留已经核验通过的结论和证据。
 
-任务计划：
-1. {task1}
-2. {task2}
-...
-
-视频完整上下文：
-[00:00-01:00] ASR: {transcript} | OCR: {ocrTexts} | 证据帧: {frameUrls}
-[01:00-02:00] ...
-
-{如果有 previousCritique，追加：}
-上一轮 Critic 反馈：
-- 缺失要求：{missingRequirements}
-- 无证据支撑的结论：{unsupportedClaims}
-- 需补充的时间戳：{requiredTimestamps}
-
-请生成 JSON 格式结果：
+只返回 JSON：
 {
-  "title": "报告标题",
-  "sections": [
-    {"key": "段落标识", "items": ["要点1", "要点2"]},
-    ...
-  ],
-  "conclusions": ["核心结论1", "核心结论2", ...],
+  "title": "产物标题",
+  "conclusions": ["结论"],
   "evidence": [
-    {"timestampMs": 12000, "text": "证据原文", "type": "ASR/OCR"},
-    ...
-  ]
+    {"timestampMs": 120000, "source": "ASR", "content": "原始证据内容", "claim": "结论"}
+  ],
+  "suggestions": ["建议"]
 }
-```
 
-#### 模式自定义（ModeProfile）
-```java
-// 不同模式追加不同指令
-- GENERAL：空指令（默认行为）
-- LEARNING：追加 "生成知识点清单 + 难度分级"
-- REVIEW：追加 "生成优缺点对比 + 改进建议"
-- CREATION：追加 "提取创作灵感 + 脚本结构"
+Plan: {...}
+PreviousCritique: {...}
+VideoContext: {...}
 ```
+关键差异：
+- 证据字段名是 **`content`/`source`/`claim`**，不是 `text`/`type`。`claim` 字段用于把该条证据绑定到它所支持的具体结论（`conclusion` 原文）。
+- 顶层还有一个 **`suggestions`** 字段（改进建议），文档此前的版本没有提到。
+- `sections` **不是** GENERAL 模式下的默认字段，只有在模式指令非空时（见下）才会追加要求。
+
+#### 模式自定义（ModeProfile / executeSuffix）
+```java
+// DeepSeekUtils.java:357-363，executeSuffix()
+- GENERAL：modeInstruction 为空串，不追加任何内容，产物结构与上面通用 JSON 完全一致
+- 非 GENERAL 模式：追加"本次分析模式的额外产物要求：{modeInstruction}"，
+  并要求额外输出一个 "sections" 数组：
+  {"key": "英文标识", "title": "面向用户的标题", "items": ["要点"]}
+  同时仍需保留 title/conclusions/evidence/suggestions
+```
+各模式具体的 `planInstruction`/`executeInstruction`/`criticInstruction` 文本定义在 `service/mode/ModeProfile` 及其实现类中，本文未展开核实其具体文案。
 
 #### 草稿持久化
 ```java
-// AgentLoopService.java:190-192
+// AgentLoopService.java:189-191
 AgentState draft = new AgentState(context.userGoal(), plan, result, null, round);
 checkpointService.saveExecutionState(mediaId, draft, modeOf(profile));
 ```
-- **Redis 键**：`checkpoint:execution:{mediaId}:{goalDigest}:{mode}`
+- **Redis 键**：`saveExecutionState` 实际写入的字段是 **`criticState`**（`AgentCheckpointService.java:165-172`），最终 key 同样是 `agent:checkpoint:{mediaId}:goal:{goalDigest}` 结构，草稿状态被标记为阶段 `EXECUTOR_COMPLETED` 存入这个字段位置，并不存在独立的 `checkpoint:execution:...` 格式。
 - **作用**：Critic 前持久化，避免 Critic 失败后重新生成整份产物
 
 ---
@@ -398,37 +409,35 @@ AgentState.CriticResult critique = normalizeCritique(
 ```
 
 #### Critic Prompt 结构
+实际 Prompt（`DeepSeekUtils.critique()`，`DeepSeekUtils.java:305-336`）：
 ```text
-你是视频分析结果的质量校验器。请核验以下产物是否满足要求：
+你是 Video Agent 的 Critic，只负责检查，不负责改写产物。
+检查标准：
+1. 是否覆盖用户目标和 Planner 的全部任务；
+2. conclusions 中的每条结论是否都有 evidence.claim 的明确绑定；
+3. 每条绑定证据的时间戳、来源和原文是否能在 VideoContext 中核验；
+4. 是否存在上下文不支持的结论；
+5. title、conclusions、evidence、suggestions 是否完整。
 
-任务计划：
-{plan.tasks}
-
-生成的结果：
-{result.title}
-段落：{result.sections}
-结论：{result.conclusions}
-证据：{result.evidence}
-
-原始视频上下文（用于证据核验）：
-[00:00-01:00] ASR: {transcript} | OCR: {ocrTexts}
-...
-
-校验维度：
-1. 目标覆盖：所有任务是否都有对应内容？
-2. 结构完整：title、sections、conclusions、evidence 是否齐全？
-3. 证据绑定：每条结论是否有时间戳证据支撑？
-4. 证据真实：所有时间戳是否真实存在于 ASR/OCR 中？
-
-返回 JSON：
+只有全部满足时 passed 才能为 true。
+feedback 只填写能够基于当前 VideoContext 直接重写的修改动作。
+missingRequirements 填写未覆盖的用户目标或 Planner 任务。
+unsupportedClaims 填写当前 VideoContext 无法支持、需要重新检索证据的结论。
+requiredTimestamps 只填写需要定向加载原始证据的时间戳；无需补充证据时返回空数组。
+只返回 JSON：
 {
-  "passed": true/false,
-  "feedback": ["改进建议1", "改进建议2"],
-  "missingRequirements": ["缺失的任务要求"],
-  "unsupportedClaims": ["无证据支撑的结论"],
-  "requiredTimestamps": [12000, 34000]  // 需补充的时间戳
+  "passed": false,
+  "feedback": ["具体修改建议"],
+  "missingRequirements": ["遗漏要求"],
+  "unsupportedClaims": ["无证据结论"],
+  "requiredTimestamps": [120000]
 }
+
+Plan: {...}
+Draft: {...}
+VideoContext: {...}
 ```
+实际是 **5 条**校验标准，不是 4 条：文档此前版本遗漏了"是否存在上下文不支持的结论"这一条；第5条完整性检查的字段是 `title/conclusions/evidence/suggestions`，不含 `sections`（`sections` 只在特定模式下才是必需字段）。
 
 #### 后处理增强
 
@@ -495,28 +504,25 @@ private AgentState.CriticResult enforceEvidenceBounds(
 }
 ```
 
-**证据验证逻辑**：
+**证据验证逻辑**（`EvidenceVerificationService.java:17-25`，实际代码，非伪代码简化版）：
 ```java
-// EvidenceVerificationService.supported()
-boolean supported(VideoContext context, AnalysisResult.Evidence evidence) {
-    long timestampMs = evidence.timestampMs();
-    String evidenceText = evidence.text();
-    
-    // 查找该时间戳所在的 60 秒窗口
-    VideoContext.VideoSegment segment = context.segments().stream()
-        .filter(seg -> timestampMs >= seg.startMs() && timestampMs < seg.endMs())
-        .findFirst()
-        .orElse(null);
-    
-    if (segment == null) return false;
-    
-    // 检查证据文本是否在 ASR 或 OCR 中出现
-    boolean inASR = segment.transcript().contains(evidenceText);
-    boolean inOCR = segment.ocrTexts().stream().anyMatch(ocr -> ocr.contains(evidenceText));
-    
-    return inASR || inOCR;
+public boolean supported(VideoContext context, AnalysisResult.Evidence evidence) {
+    if (context == null || evidence == null || evidence.content().isBlank()) return false;
+    String source = evidence.source().toUpperCase(Locale.ROOT);
+    if (!source.contains("ASR") && !source.contains("OCR")) return false;
+
+    return context.segments().stream()
+            .filter(segment -> containsTimestamp(segment, evidence.timestampMs()))
+            .map(segment -> sourceText(segment, source))
+            .anyMatch(candidate -> textMatches(evidence.content(), candidate));
 }
 ```
+与简单的原文 `contains` 判断相比，实际实现有三点关键差异：
+1. **先校验来源字段**：`evidence.source()` 必须包含 "ASR" 或 "OCR"，否则直接判定不支持。
+2. **规范化匹配**：`textMatches()` 会先对证据文本和候选文本做 `normalize()`（转小写 + 去除标点符号和空白），再判断包含关系（`EvidenceVerificationService.java:49-61`），不是原始字符串直接 `contains`。
+3. **遍历所有匹配时间戳的片段**：用 `anyMatch` 而非只取第一个片段（`findFirst()`），只要任意一个落在该时间戳范围内的片段命中即算支持。
+
+字段名同样是 `evidence.content()`（不是 `evidence.text()`），`evidence.source()`（不是 `evidence.type()`）。此外还有配套的 `supportsClaim()` 方法（`EvidenceVerificationService.java:28-35`），用于校验某条结论文本是否与某条证据的 `claim` 字段规范化后完全一致，且该证据本身通过 `supported()` 校验。
 
 ---
 
@@ -563,34 +569,41 @@ private VideoContext contextForRetry(
 }
 ```
 
-**`refineForCritique` 实现**：
+**`refineForCritique` 实现**（`LongVideoContextService.java:58-75`，实际逻辑比按时间戳精确截取要复杂得多）：
 ```java
-// LongVideoContextService.refineForCritique()
-VideoContext refineForCritique(
-        Long mediaId,
-        VideoContext fullContext,
-        VideoContext currentContext,
-        AgentState.CriticResult critique) {
-    
-    List<Long> requiredTimestamps = critique.requiredTimestamps();
-    
-    // 从完整上下文中提取 Critic 要求的时间戳片段
-    List<VideoContext.VideoSegment> additionalSegments = fullContext.segments().stream()
-        .filter(segment -> requiredTimestamps.stream().anyMatch(
-            ts -> ts >= segment.startMs() && ts < segment.endMs()))
-        .toList();
-    
-    // 合并现有上下文 + 补充片段
-    List<VideoContext.VideoSegment> merged = Stream.concat(
-            currentContext.segments().stream(),
-            additionalSegments.stream())
-        .distinct()
-        .sorted(Comparator.comparingLong(VideoContext.VideoSegment::startMs))
-        .toList();
-    
-    return new VideoContext(currentContext.source(), currentContext.userGoal(), merged);
+public VideoContext refineForCritique(Long mediaId,
+                                      VideoContext fullContext,
+                                      VideoContext selectedContext,
+                                      AgentState.CriticResult critique) {
+    Map<String, VideoContext.VideoSegment> segments = new LinkedHashMap<>();
+    List<Long> requiredTimestamps = critique == null ? List.of() : critique.requiredTimestamps();
+
+    // 1. 按时间戳 + margin 扩展窗口，从完整上下文中提取相邻片段
+    fullContext.segments().stream()
+            .filter(segment -> requiredTimestamps.stream().anyMatch(timestamp ->
+                    nearSegment(timestamp, segment)))
+            .forEach(segment -> segments.put(segmentKey(segment), segment));
+
+    // 2. 基于 Critic 反馈文本（feedback/missingRequirements/unsupportedClaims）
+    //    做一次语义检索，作为二次补充来源
+    String critiqueQuery = critiqueQuery(fullContext.userGoal(), critique);
+    VideoContext retryContext = selectRelevant(mediaId,
+            new VideoContext(fullContext.source(), critiqueQuery, fullContext.segments()));
+    retryContext.segments().forEach(segment -> segments.putIfAbsent(segmentKey(segment), segment));
+
+    // 3. 保留原有已选片段
+    selectedContext.segments().forEach(segment -> segments.putIfAbsent(segmentKey(segment), segment));
+
+    // 4. 按字符预算裁剪，返回最终上下文
+    return withinBudget(fullContext, new ArrayList<>(segments.values()));
 }
 ```
+与"简单按时间戳区间截取片段再去重合并"的描述相比，实际实现包含三处文档此前遗漏的机制：
+1. **Margin 扩展窗口**：`nearSegment()`（`LongVideoContextService.java:107-111`）判断时间戳是否落在片段前后各扩展 `Math.max(60_000L, 片段时长)` 的缓冲区内，不是精确的 `startMs <= ts < endMs` 判断，会额外拉取时间戳附近的相邻片段。
+2. **二次语义检索**：还会把 Critic 的 `feedback`/`missingRequirements`/`unsupportedClaims` 拼成一段查询文本，调用 `selectRelevant()` 做一次基于语义相关性的检索补充，不只是按时间戳硬性截取。
+3. **字符预算裁剪**：最终通过 `withinBudget()`（`MAX_CONTEXT_CHARS = 24_000`）按字符数上限裁剪片段集合，避免上下文无限增长。
+
+去重是用 `LinkedHashMap<String, VideoSegment>` 以 `"startMs:endMs"` 为 key（`segmentKey()`），效果类似 `distinct()` 但保序且按 key 去重，而不是走 `Stream.distinct()`。
 
 #### 计划修订策略
 ```java
@@ -664,9 +677,13 @@ private void checkBudget(long startedNanos, String completedStage) {
 ```
 
 #### 调用时机
-- Planner 完成后
-- 每轮 Executor 完成后
-- 每轮 Critic 完成后
+实际 `checkBudget()` 调用点（`AgentLoopService.java`）：
+- 第111行：Planner 完成后
+- 第129行：从 Critic checkpoint 恢复执行时（MQ 重投场景下的"Executor Checkpoint"检查点）
+- 第139行：每轮循环**开始前**（"Agent Round N"），不是"Critic 完成后"
+- 第195行：Executor 完成后
+
+`critiqueRound()` 方法内部**没有**单独调用 `checkBudget`，即"每轮 Critic 完成后检查预算"的说法在源码中找不到对应调用点，实际预算检查落在轮次开始前和 Executor 完成后。
 
 ---
 
@@ -693,40 +710,43 @@ private void checkBudget(long startedNanos, String completedStage) {
                                │
                     ┌──────────▼──────────────┐
                     │ RocketMQ (异步解耦)      │
-                    │ Topic: video-analysis   │
+                    │ Topic: video-analysis-  │
+                    │        topic（默认值）  │
                     └──────────┬──────────────┘
                                │
                     ┌──────────▼─────────────┐
                     │ VideoAnalysisConsumer  │
-                    │ - 内容级分布式锁       │
-                    │ - 结果复用（3级检查）  │
+                    │ - 任务级锁（内容+目标） │
+                    │ - 完成结果复用（1层）  │
                     │ - 重试控制（最多3次）  │
                     └──────────┬─────────────┘
                                │
         ┌──────────────────────┴───────────────────────┐
         │                                               │
 ┌───────▼────────┐                            ┌────────▼────────┐
-│   AiService    │                            │  已有结果复用    │
-│ asyncAnalyze() │                            │ - Checkpoint    │
-└───────┬────────┘                            │ - 内容级归属    │
-        │                                     └─────────────────┘
+│   AiService    │                            │ completedKey 命中│
+│ asyncAnalyze() │                            │ 直接复用返回     │
+│ (内含三级复用  │                            │（Consumer 层，  │
+│  检查，见下）  │                            │ 单层判断）       │
+└───────┬────────┘                            └─────────────────┘
         │
 ┌───────▼─────────────────────────────────────────────────┐
 │          VideoContextService.build()                    │
 │          （视频信息提取 - 并行分支）                     │
 └────────┬─────────────────────────┬────────────────────┘
          │                         │
-┌────────▼──────────┐     ┌───────▼──────────┐
-│  ASR 分支          │     │  OCR 分支         │
-│ (asrExecutor)     │     │ (ocrExecutor)    │
-├───────────────────┤     ├──────────────────┤
-│ 1. FFmpeg 提取音频│     │ 1. FFmpeg 关键帧 │
-│ 2. 检测时长       │     │ 2. dHash 去重    │
-│ 3. 分段/一次识别  │     │ 3. OCR 识别      │
-│ 4. ASR API 调用   │     │ 4. MinIO 上传    │
-└────────┬──────────┘     └───────┬──────────┘
-         │                        │
-         └────────┬───────────────┘
+┌────────▼──────────┐     ┌────────▼──────────┐
+│  ASR 分支          │     │  OCR 分支          │
+│ (asrExecutor)     │     │ (ocrExecutor)     │
+├───────────────────┤     ├───────────────────┤
+│ 1. FFmpeg 固定60秒 │     │ 1. FFmpeg 关键帧   │
+│    分段切片        │     │ 2. dHash 去重      │
+│ 2. 逐段阿里云ASR   │     │ 3. 本地Tesseract   │
+│    (单段失败不中断)│     │    OCR识别         │
+│                   │     │ 4. MinIO 上传      │
+└────────┬──────────┘     └────────┬──────────┘
+         │                         │
+         └────────┬────────────────┘
                   │
          ┌────────▼──────────┐
          │ 时间窗口合并       │
@@ -741,22 +761,24 @@ private void checkBudget(long startedNanos, String completedStage) {
                   │
          ┌────────▼────────────────────────────────┐
          │ 阶段 1: Planner (任务拆解)               │
-         │ - LLM 拆解用户目标为 2-5 个子任务        │
+         │ - LLM 拆解用户目标为 1-5 个子任务        │
          │ - Checkpoint 持久化                     │
          │ - 预算检查                              │
          └────────┬────────────────────────────────┘
                   │
          ┌────────▼────────────────────────────────┐
          │ 阶段 2: Executor (生成结构化结果)        │
-         │ - 按计划生成 title/sections/conclusions │
-         │ - 绑定时间戳证据                        │
+         │ - 按计划生成 title/conclusions/evidence/ │
+         │   suggestions（含sections需模式指定）    │
+         │ - 绑定时间戳证据（source/content/claim） │
          │ - 草稿持久化                            │
          │ - 预算检查                              │
          └────────┬────────────────────────────────┘
                   │
          ┌────────▼────────────────────────────────┐
          │ 阶段 3: Critic (质量校验)                │
-         │ - LLM 校验目标覆盖 + 结构完整 + 证据绑定│
+         │ - LLM 校验目标覆盖+结构完整+证据绑定    │
+         │   +上下文支持性（共5条标准）            │
          │ - 代码强制验证时间戳真实性               │
          │ - 生成反馈（feedback/missing/unsupported）│
          │ - 预算检查                              │
@@ -782,9 +804,10 @@ private void checkBudget(long startedNanos, String completedStage) {
 ## 五、关键设计亮点
 
 ### 5.1 内容级复用（降本增效）
-- **三级缓存**：本地 Checkpoint → Redis 归属索引 → 内容锁等待
+- **三级检查**（发生在 `AiService`/`VideoContextService` 内部，非 Consumer 层）：本 mediaId 检查点复用 → Redis 内容归属索引（`analysis:context-owner:{contentHash}`）→ 内容级锁等待（`contextLock`，5分钟）
 - **节省成本**：同一视频重复上传无需重新 ASR/OCR/LLM
 - **分布式协调**：Redisson 锁确保同一内容只处理一次
+- 注意与 `VideoAnalysisConsumer` 自身的"内容+目标摘要"任务锁（`AnalysisTaskKeys.lock()`，非阻塞 `tryLock()`）和完成结果复用（`completedKey`，7天TTL）区分，两者是不同层级、不同粒度的机制
 
 ### 5.2 并行容错架构
 - **ASR 和 OCR 独立线程池**：互不阻塞
@@ -797,7 +820,7 @@ private void checkBudget(long startedNanos, String completedStage) {
 - **定向证据补充**：按 Critic 反馈精准检索，避免全量重传
 
 ### 5.4 Checkpoint 断点续传
-- **每阶段持久化**：Plan / Execution / Critic 独立保存
+- **分阶段持久化**：Plan 独立保存（`plan` 字段）；Executor 草稿与 Critic 校验结果共用 `criticState` 字段（草稿落盘时阶段标记为 `EXECUTOR_COMPLETED`，Critic 完成后更新阶段为 `CRITIC_PASSED`/`CRITIC_RETRY_REQUIRED`）
 - **MQ 重试友好**：重投时直接跳到上次失败点
 - **减少重复计算**：Plan 复用率高，LLM 调用次数大幅降低
 
@@ -828,7 +851,7 @@ private void checkBudget(long startedNanos, String completedStage) {
 
 若要将 VideoCourseAI 升级为 DOVideo 级别，需要：
 
-1. **引入 OCR 能力**：集成百度/阿里云 OCR API
+1. **引入 OCR 能力**：DOVideo-AI 实际用的是本地 Tesseract 命令行工具（非云端 OCR API），可视成本/部署环境权衡选择本地 Tesseract 或接入百度/阿里云 OCR API
 2. **实现 Agent 闭环**：增加 Planner/Executor/Critic 三阶段编排
 3. **增强证据机制**：
    - 时间戳精准绑定
